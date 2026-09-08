@@ -69,7 +69,12 @@ if [ -f .planning/config.json ]; then
     echo "gsd-validate-commit.sh: could not read .planning/config.json (opt-in check) — validator disabled for this call. $(cat "$ENABLED_ERR")" >&2
     exit 0
   fi
-  ENABLED=$(printf '%s\n' "$CONFIG_OUT" | head -1)
+  # First line, without a pipe (#4429). Under `set -euo pipefail` a
+  # `... | head -1` pipeline reports 141 if the writer takes SIGPIPE when head
+  # closes the read end early, and `set -e` then aborts the hook with 141
+  # instead of the 0/2 it computed. Parameter expansion has no second process
+  # to race and no pipeline status to inherit.
+  ENABLED=${CONFIG_OUT%%$'\n'*}
   if [ "$ENABLED" != "1" ]; then exit 0; fi
   # Remaining lines (if any) are the sanitized, deduped configured commit
   # types beyond the 10 built-ins (#3811). Read into a bash-3.2-safe array —
@@ -521,9 +526,9 @@ if [ "$CLASSIFY_STATUS" = "0" ]; then
       SUBJECT=$(GIT_CMD_LIB="$HOOK_DIR/lib/git-cmd.js" MSG="$MSG" node -e "
         const {resolveCommitSubject}=require(process.env.GIT_CMD_LIB);
         process.stdout.write(resolveCommitSubject(process.env.MSG));
-      " 2>/dev/null) || SUBJECT=$(echo "$MSG" | head -1)
+      " 2>/dev/null) || SUBJECT=${MSG%%$'\n'*}
     else
-      SUBJECT=$(echo "$MSG" | head -1)
+      SUBJECT=${MSG%%$'\n'*}
     fi
     # Single source of truth for the accepted commit-type list (#3811): the
     # 10 built-ins plus whatever passed the safe-token filter above. Both the
