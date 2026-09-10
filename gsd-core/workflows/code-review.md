@@ -416,7 +416,7 @@ Determine review depth via the path-scoped depth resolver (`code-review-depth.cj
 
 ```bash
 CONFIG_DEPTH=$(gsd_run query config-get workflow.code_review_depth --raw 2>/dev/null || echo "")
-DEPTH_OVERRIDES=$(gsd_run query config-get workflow.code_review_depth_overrides --default '[]' 2>/dev/null || echo '[]')
+DEPTH_OVERRIDES=$(gsd_run query config-get workflow.code_review_depth_overrides --raw --default '[]' 2>/dev/null || echo '[]')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 
 # Files travel on stdin, never argv — a 50+-file scope with long paths approaches the

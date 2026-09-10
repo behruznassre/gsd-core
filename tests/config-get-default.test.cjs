@@ -1525,3 +1525,265 @@ describe('#2702: workstream config-get inherits from root config', () => {
     }
   });
 });
+
+// ────────────────────────────────────────────────────────────────────────
+// #4382 — a structured `--default` literal reached the non-raw path as TEXT.
+//
+// `--default <value>` arrives as untyped argv text and was emitted verbatim,
+// so the non-raw path — which JSON-encodes whatever it is handed — turned
+// `--default '[]'` into the 4-character JSON string `"[]"` instead of the
+// empty array. `workflows/code-review.md` read its depth overrides that way,
+// `resolveCodeReviewDepth` correctly rejected the string as `not_an_array`,
+// and `/gsd-code-review` hard-stopped before spawning the reviewer — on every
+// project that left `workflow.code_review_depth_overrides` unconfigured, i.e.
+// nearly all of them.
+//
+// The coverage gap that let it ship: every existing `--default` test above
+// passes a SCALAR through the non-raw path (`'json-test'`), where
+// single-encoding and double-encoding are indistinguishable. The rows below
+// pass structured defaults, and assert the non-raw result against the RAW
+// result — the two paths describing the same value is the invariant that was
+// broken.
+// ────────────────────────────────────────────────────────────────────────
+describe('#4382 regression: a structured --default reaches consumers as structure, not text', () => {
+  let tmpDir;
+  let planningDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-config-4382-'));
+    planningDir = path.join(tmpDir, '.planning');
+    fs.mkdirSync(planningDir, { recursive: true });
+    fs.writeFileSync(path.join(planningDir, 'config.json'), '{}');
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  function emit(keyPath, raw, defaultValue) {
+    return captureFdWrite(1, () => {
+      config.cmdConfigGet(tmpDir, keyPath, raw, defaultValue);
+    }).trim();
+  }
+
+  for (const literal of ['[]', '["codex","gemini"]', '{"php":"deep"}', '  ["padded"]  ']) {
+    test(`non-raw and --raw agree on the structure for --default ${literal.trim()}`, () => {
+      const nonRaw = emit('missing.key', false, literal);
+      const raw = emit('missing.key', true, literal);
+
+      // The invariant: both paths describe the SAME value. Pre-fix, non-raw
+      // parsed to a string and raw parsed to a structure.
+      assert.deepEqual(
+        JSON.parse(nonRaw),
+        JSON.parse(literal),
+        `non-raw output must reconstruct the structure, not a string containing its text (got ${nonRaw})`,
+      );
+      assert.deepEqual(JSON.parse(raw), JSON.parse(literal));
+      assert.deepEqual(JSON.parse(nonRaw), JSON.parse(raw));
+
+      // Pin the specific pre-fix shape rather than only the post-fix one: a
+      // future change that re-introduces double-encoding makes JSON.parse
+      // return a string, and `deepEqual` against an object would still catch
+      // it, but this says WHY in the failure message.
+      assert.notEqual(
+        typeof JSON.parse(nonRaw),
+        'string',
+        'non-raw output must not be a JSON string containing JSON text (#4382 double-encoding)',
+      );
+    });
+  }
+
+  test('--raw echoes the caller\'s literal, not String(structure)', () => {
+    // Guards the rawText carry-through: without it `--raw` would print
+    // `codex,gemini` (String of the parsed array) instead of the literal the
+    // caller passed, silently breaking every raw consumer to fix the non-raw one.
+    assert.equal(emit('missing.key', true, '["codex","gemini"]'), '["codex","gemini"]');
+    assert.equal(emit('missing.key', true, '[]'), '[]');
+  });
+
+  test('the code-review depth-override read now resolves instead of hard-stopping', () => {
+    // The user-visible failure, end to end: workflows/code-review.md's
+    // DEPTH_OVERRIDES read, its JSON.parse, and the fail-closed guard that
+    // rejected it. This is the row that would have caught the bug in CI.
+    const { resolveCodeReviewDepth } = require(
+      path.join(__dirname, '..', 'gsd-core', 'bin', 'lib', 'code-review-depth.cjs'),
+    );
+    // Drive the flag the EDITED workflow line actually passes (`--raw`), not the
+    // pre-fix non-raw form — a row that tests the other flag proves nothing about
+    // the shipped call site. (Codex review round 1.)
+    const overrides = JSON.parse(emit('workflow.code_review_depth_overrides', true, '[]'));
+    assert.ok(Array.isArray(overrides), 'the workflow parses this value and requires an array');
+
+    const resolved = resolveCodeReviewDepth({
+      flagDepth: '',
+      configDepth: 'standard',
+      overrides,
+      files: ['a.php'],
+      repoRoot: '/repo',
+    });
+    assert.equal(resolved.ok, true, `depth resolution must succeed: ${JSON.stringify(resolved.errors)}`);
+
+    // And the pre-fix value is still rejected — proving the guard that
+    // hard-stopped the workflow is intact and this row is not vacuous.
+    const preFix = resolveCodeReviewDepth({
+      flagDepth: '',
+      configDepth: 'standard',
+      overrides: JSON.parse('"[]"'),
+      files: ['a.php'],
+      repoRoot: '/repo',
+    });
+    assert.equal(preFix.ok, false, 'the fail-closed not_an_array guard must still reject a string');
+  });
+
+  for (const [literal, expected] of [['standard', 'standard'], ['5', '5'], ['true', 'true'], ['', '']]) {
+    test(`scalar --default '${literal}' is untouched (still emitted as a JSON string)`, () => {
+      // Only `[`/`{` text is reinterpreted. If this ever changes, `--default '5'`
+      // becomes the NUMBER 5 and every `[ "$X" = "5" ]` comparison in shipped
+      // workflow bash keeps working only by accident.
+      assert.equal(JSON.parse(emit('missing.key', false, literal)), expected);
+      assert.equal(emit('missing.key', true, literal), expected);
+    });
+  }
+
+  test('bracket-shaped text that is not valid JSON stays the string the user typed', () => {
+    // A default is the user's literal, not ours to reject: unparseable text
+    // falls back rather than erroring or emitting a partial structure.
+    assert.equal(JSON.parse(emit('missing.key', false, '[not json')), '[not json');
+    assert.equal(emit('missing.key', true, '[not json'), '[not json');
+  });
+
+  test('a CONFIGURED structured value is unaffected by the default coercion', () => {
+    // The found-key path never reads --default; pin that the new coercion did
+    // not leak into it. (This is also why #4382's report was refuted for the
+    // two call sites that read configured values rather than defaults.)
+    fs.writeFileSync(
+      path.join(planningDir, 'config.json'),
+      JSON.stringify({ review: { default_reviewers: ['codex', 'gemini'] } }),
+    );
+    const out = emit('review.default_reviewers', false, '["ignored"]');
+    assert.deepEqual(JSON.parse(out), ['codex', 'gemini'], 'a present key wins over --default (#1893)');
+  });
+
+  test('secret masking still wins over the carried raw text', () => {
+    // emitResolvedDefault masks BEFORE it considers rawText. A structured
+    // default on a secret key must not reach the wire through the new path.
+    const masked = emit('brave_search', true, '["sk-not-a-real-key-1234567890"]');
+    assert.ok(
+      !masked.includes('sk-not-a-real-key'),
+      `a secret key must never emit its default in plaintext (got ${masked})`,
+    );
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// #4382, Codex review round 1 — the `--raw` additions at the two workflow call
+// sites had a defect the first cut of this fix missed entirely.
+//
+// Those reads resolve a CONFIGURED array whenever the key is set, and the
+// found-key path emitted `String(current)` under `--raw`: `codex,gemini` for an
+// array of strings, `[object Object]` for the array of objects that
+// `workflow.code_review_depth_overrides` actually holds. Adding the flag would
+// have fixed the unconfigured case and broken the configured one — trading one
+// hard stop for another that only hits the users who adopted the feature.
+//
+// A structure's raw form is its JSON (see rawTextFor). These rows pin that, and
+// pin the secret-masking path that the coercion also disturbed.
+// ────────────────────────────────────────────────────────────────────────
+describe('#4382 regression: --raw on a structured value emits JSON, not String(value)', () => {
+  let tmpDir;
+  let planningDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-config-4382-raw-'));
+    planningDir = path.join(tmpDir, '.planning');
+    fs.mkdirSync(planningDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  function emit(keyPath, raw, defaultValue) {
+    return captureFdWrite(1, () => {
+      config.cmdConfigGet(tmpDir, keyPath, raw, defaultValue);
+    }).trim();
+  }
+
+  function writeConfig(obj) {
+    fs.writeFileSync(path.join(planningDir, 'config.json'), JSON.stringify(obj));
+  }
+
+  test('a CONFIGURED array of objects survives --raw as parseable JSON', () => {
+    // The exact shape workflow.code_review_depth_overrides holds, through the
+    // exact flags gsd-core/workflows/code-review.md now passes. Pre-fix this
+    // emitted `[object Object]` and the workflow's JSON.parse threw.
+    const overrides = [{ paths: ['src/auth'], depth: 'deep' }];
+    writeConfig({ workflow: { code_review_depth_overrides: overrides } });
+
+    const out = emit('workflow.code_review_depth_overrides', true, '[]');
+    assert.notEqual(out, '[object Object]', 'String(array-of-objects) is not a parseable payload');
+    assert.deepEqual(JSON.parse(out), overrides);
+  });
+
+  test('a CONFIGURED array of strings survives --raw as parseable JSON', () => {
+    // The `codex,gemini` shape: lossy in a subtler way — it parses as nothing,
+    // and a consumer splitting on comma would silently mangle any value
+    // containing one.
+    writeConfig({ review: { default_reviewers: ['codex', 'gemini'] } });
+
+    const out = emit('review.default_reviewers', true, '[]');
+    assert.notEqual(out, 'codex,gemini');
+    assert.deepEqual(JSON.parse(out), ['codex', 'gemini']);
+  });
+
+  test('the ship pr_body_sections read survives --raw with configured sections', () => {
+    // Criterion 3's call site, same shape. It has no live consumer today, which
+    // is exactly why a break here would have gone unnoticed until it did.
+    const sections = [{ title: 'Risks & Dependencies', enabled: true }];
+    writeConfig({ ship: { pr_body_sections: sections } });
+
+    assert.deepEqual(JSON.parse(emit('ship.pr_body_sections', true, '[]')), sections);
+  });
+
+  test('--raw on a configured SCALAR is unchanged — no quotes, no JSON', () => {
+    // The property --raw exists for in the first place (#3763): a string value
+    // must not arrive wearing JSON quotes. rawTextFor must not have widened.
+    writeConfig({ workflow: { discuss_mode: 'quick' } });
+
+    assert.equal(emit('workflow.discuss_mode', true, 'ignored'), 'quick');
+    writeConfig({ workflow: { use_worktrees: true } });
+    assert.equal(emit('workflow.use_worktrees', true, 'ignored'), 'true');
+  });
+
+  test('a secret key with a structured default is masked from the caller literal', () => {
+    // maskSecret does String(value) internally. Handing it the PARSED object
+    // threw outright for an object carrying its own non-callable `toString`,
+    // and silently changed the masked tail for an array. Masking the text the
+    // caller typed keeps this byte-identical to pre-fix behavior.
+    const masked = emit('brave_search', true, '["sk-not-a-real-key-1234567890"]');
+    assert.equal(masked, '****90"]', 'the masked tail must match the pre-#4382 output exactly');
+
+    assert.doesNotThrow(
+      () => emit('brave_search', true, '{"toString":null}'),
+      'an object default whose own toString is not callable must not crash the CLI',
+    );
+    assert.ok(!emit('brave_search', true, '["sk-not-a-real-key-1234567890"]').includes('sk-not-a-real'));
+  });
+
+  for (const [label, setup] of [
+    // beforeEach creates .planning/ but never writes config.json, so "absent" is
+    // simply the untouched state — no rmSync (the repo bans raw rmSync in tests).
+    ['no config.json at all', () => {}],
+    ['a missing FINAL key', (dir) => { fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ workflow: {} })); }],
+    ['a non-object mid-traversal', (dir) => { fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ workflow: 'scalar' })); }],
+  ]) {
+    test(`the structured default resolves identically for ${label}`, () => {
+      // cmdConfigGet has three separate absent-key branches. The first cut of
+      // these tests only ever exercised one of them (mid-traversal), so two of
+      // the three fallback sites were unpinned. (Codex review round 1.)
+      setup(planningDir);
+      assert.deepEqual(JSON.parse(emit('workflow.code_review_depth_overrides', false, '["a"]')), ['a']);
+      assert.equal(emit('workflow.code_review_depth_overrides', true, '["a"]'), '["a"]');
+    });
+  }
+});

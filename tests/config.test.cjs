@@ -2292,7 +2292,10 @@ describe('ship.pr_body_sections config (#3167)', () => {
   test('ship workflow composes configured sections as append-only extensions', () => {
     const workflow = readRepoFile('gsd-core/workflows/ship.md');
 
-    assert.match(workflow, /config-get ship\.pr_body_sections --default '\[\]'/);
+    // #4382: this read carries a JSON-array default and now requires --raw. Without
+    // it, config-get JSON-encoded the default a second time and the workflow received
+    // the 4-character string `"[]"` instead of an empty array.
+    assert.match(workflow, /config-get ship\.pr_body_sections --raw --default '\[\]'/);
     assert.match(workflow, /append-only/i);
     assert.match(workflow, /enabled.*false/i);
     assert.match(workflow, /cannot replace/i);

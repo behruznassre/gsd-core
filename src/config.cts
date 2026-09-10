@@ -175,13 +175,80 @@ function resolveSchemaDefault(cwd: string, kp: string): { found: boolean; value:
  * collision with a secret key must not leak a declared default in plaintext.
  * Centralizing emission here means masking can't be missed at a call site.
  */
-function emitResolvedDefault(kp: string, value: unknown, raw: boolean): void {
+function emitResolvedDefault(kp: string, value: unknown, raw: boolean, rawText?: string): void {
   if (isSecretKey(kp)) {
-    const masked = maskSecret(value as Parameters<typeof maskSecret>[0]);
+    // #4382: mask the caller's ORIGINAL text when the default was reinterpreted.
+    // maskSecret does String(value) internally, which throws outright on a parsed
+    // object carrying its own non-callable `toString`, and silently changes the
+    // masked tail for an array. Masking what the caller actually typed keeps this
+    // path byte-identical to its pre-fix behavior.
+    const toMask = rawText !== undefined ? rawText : value;
+    const masked = maskSecret(toMask as Parameters<typeof maskSecret>[0]);
     output(masked, raw, masked);
     return;
   }
-  output(value, raw, String(value));
+  // #4382: `rawText` is the caller's original `--default` text, carried past a
+  // structured reinterpretation (see coerceStructuredDefault), so `--raw` echoes
+  // the literal the caller passed rather than a re-serialization of it.
+  output(value, raw, rawText !== undefined ? rawText : rawTextFor(value));
+}
+
+/**
+ * The `--raw` payload for a resolved value (#4382).
+ *
+ * `--raw` exists so a STRING value does not reach bash wearing the quotes
+ * `JSON.stringify` would add (`RUNTIME='"claude"'`), which is why every
+ * `[ "$X" = "y" ]` comparison silently failed without it. An array or object has
+ * no such unquoted form: `String(value)` yields `codex,gemini` for an array of
+ * strings and the useless `[object Object]` for an array of objects, neither of
+ * which any consumer can parse. A structure's raw form IS its JSON.
+ *
+ * This matters because #4382 puts `--raw` on two reads that resolve a CONFIGURED
+ * array whenever the key is set. Without this, adding the flag would fix the
+ * unconfigured case and break the configured one — `code-review.md`'s own
+ * `JSON.parse` throws on `[object Object]` — trading one hard stop for another
+ * that only hits the users who adopted the feature.
+ */
+function rawTextFor(value: unknown): string {
+  if (typeof value === 'object' && value !== null) return JSON.stringify(value);
+  return String(value);
+}
+
+/**
+ * Reinterpret a `--default` argv literal as the structure it denotes (#4382).
+ *
+ * `--default <value>` reaches us as untyped argv text and was emitted as-is, so
+ * the non-raw path — which JSON-encodes whatever it is handed — turned
+ * `--default '[]'` into the four-character JSON string `"[]"` rather than the
+ * empty array. Every JSON-consuming caller then received a string where it
+ * expected an array; `workflows/code-review.md`'s depth-override read hit
+ * `resolveCodeReviewDepth`'s fail-closed `not_an_array` guard and hard-stopped
+ * `/gsd-code-review` before the reviewer agent was ever spawned, on every
+ * project that left the override key unconfigured.
+ *
+ * Only text opening with `[` or `{` is reinterpreted. Scalars are deliberately
+ * untouched: `--default 'standard'` still emits `"standard"`, and `--default
+ * '5'` still emits the string it always did, so no existing scalar consumer
+ * changes shape. Text that opens like a structure but does not parse (a literal
+ * default that merely begins with a bracket) falls back to the string, since a
+ * default the user typed is not ours to reject.
+ *
+ * The original text rides along as `rawText` so `--raw` keeps echoing the
+ * literal the caller passed — the raw and non-raw paths now round-trip to the
+ * same structure instead of disagreeing.
+ */
+function coerceStructuredDefault(defaultValue: unknown): { value: unknown; rawText?: string } {
+  if (typeof defaultValue !== 'string') return { value: defaultValue };
+  const trimmed = defaultValue.trim();
+  if (trimmed === '' || (trimmed[0] !== '[' && trimmed[0] !== '{')) return { value: defaultValue };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { value: defaultValue };
+  }
+  if (typeof parsed !== 'object' || parsed === null) return { value: defaultValue };
+  return { value: parsed, rawText: defaultValue };
 }
 
 // ─── Validation helpers ───────────────────────────────────────────────────────
@@ -1170,6 +1237,12 @@ function cmdConfigGet(cwd: string, keyPath: string | undefined, raw: boolean, de
   // After the error() guard, keyPath is narrowed to string.
   const kp = keyPath!;
 
+  // #4382: a JSON array/object `--default` literal denotes a STRUCTURE, and the
+  // non-raw path must emit that structure rather than its text — see
+  // coerceStructuredDefault. `hasDefault` still keys off the original argv
+  // value, so whether a default was supplied is unchanged.
+  const { value: defaultResolved, rawText: defaultRawText } = coerceStructuredDefault(defaultValue);
+
   let config: Record<string, unknown> = {};
   try {
     if (fs.existsSync(configPath)) {
@@ -1182,7 +1255,7 @@ function cmdConfigGet(cwd: string, keyPath: string | undefined, raw: boolean, de
       // (When no workstream is active, resolveFromRootConfig is a no-op: same file.)
       const rootVal = resolveFromRootConfig(cwd, kp);
       if (rootVal.found) { emitResolvedDefault(kp, rootVal.value, raw); return; }
-      if (hasDefault) { emitResolvedDefault(kp, defaultValue, raw); return; }
+      if (hasDefault) { emitResolvedDefault(kp, defaultResolved, raw, defaultRawText); return; }
       const sd = resolveSchemaDefault(cwd, kp);
       if (sd.found) { emitResolvedDefault(kp, sd.value, raw); return; }
       error('No config.json found at ' + configPath, ERROR_REASON.CONFIG_NO_FILE);
@@ -1209,7 +1282,7 @@ function cmdConfigGet(cwd: string, keyPath: string | undefined, raw: boolean, de
       // #2702: root-config inheritance before --default / schema default (see above).
       const rootVal = resolveFromRootConfig(cwd, kp);
       if (rootVal.found) { emitResolvedDefault(kp, rootVal.value, raw); return; }
-      if (hasDefault) { emitResolvedDefault(kp, defaultValue, raw); return; }
+      if (hasDefault) { emitResolvedDefault(kp, defaultResolved, raw, defaultRawText); return; }
       const sd = resolveSchemaDefault(cwd, kp);
       if (sd.found) { emitResolvedDefault(kp, sd.value, raw); return; }
       error(`Key not found: ${kp}`, ERROR_REASON.CONFIG_KEY_NOT_FOUND);
@@ -1232,7 +1305,7 @@ function cmdConfigGet(cwd: string, keyPath: string | undefined, raw: boolean, de
     // #2702: root-config inheritance before --default / schema default (see above).
     const rootVal = resolveFromRootConfig(cwd, kp);
     if (rootVal.found) { emitResolvedDefault(kp, rootVal.value, raw); return; }
-    if (hasDefault) { emitResolvedDefault(kp, defaultValue, raw); return; }
+    if (hasDefault) { emitResolvedDefault(kp, defaultResolved, raw, defaultRawText); return; }
     const sd = resolveSchemaDefault(cwd, kp);
     if (sd.found) { emitResolvedDefault(kp, sd.value, raw); return; }
     error(`Key not found: ${kp}`, ERROR_REASON.CONFIG_KEY_NOT_FOUND);
@@ -1246,7 +1319,8 @@ function cmdConfigGet(cwd: string, keyPath: string | undefined, raw: boolean, de
     return;
   }
 
-  output(current, raw, String(current));
+  // #4382: a configured array/object must survive `--raw` as JSON — see rawTextFor.
+  output(current, raw, rawTextFor(current));
 }
 
 /**

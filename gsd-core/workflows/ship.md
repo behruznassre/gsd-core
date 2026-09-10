@@ -262,7 +262,7 @@ For each SUMMARY.md in the phase directory:
 Read append-only project-specific PRD/PR body sections from config:
 
 ```bash
-CUSTOM_PR_SECTIONS=$(gsd_run query config-get ship.pr_body_sections --default '[]' 2>/dev/null || echo '[]')
+CUSTOM_PR_SECTIONS=$(gsd_run query config-get ship.pr_body_sections --raw --default '[]' 2>/dev/null || echo '[]')
 ```
 
 `ship.pr_body_sections` is an onboarding-time extension point for teams that need extra PRD-style sections such as `User Stories & Acceptance Criteria`, `Risks & Dependencies`, `Success Metrics`, `Release Criteria`, or `Stakeholder Review & Approval`.
