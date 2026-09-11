@@ -2413,11 +2413,28 @@ describe('executeWorktreeWaveCleanupPlan', () => {
       });
 
       assert.ok(probed.length > 0, 'the presence probe must actually run');
+      // Build the expectation with path.resolve, not path.join: on win32 resolve
+      // prepends the current drive to a drive-less absolute path (`/repo/main` ->
+      // `D:\repo\main`) and join does not, so a join-built expectation fails on
+      // Windows against correct behavior. The assertion below is not circular —
+      // the two notEqual rows are what give it teeth, by ruling out the bare
+      // relative path and a process-cwd resolution.
+      const expected = path.resolve('/repo/main', '.claude/worktrees/agent-a1');
       for (const probePath of probed) {
         assert.equal(
           probePath,
-          path.join('/repo/main', '.claude', 'worktrees', 'agent-a1'),
+          expected,
           'the probe must resolve against plan.repoRoot, not the process cwd',
+        );
+        assert.notEqual(
+          probePath,
+          relEntry.worktree_path,
+          'the probe must not receive the raw relative path — git would resolve it against repoRoot',
+        );
+        assert.notEqual(
+          probePath,
+          path.resolve(relEntry.worktree_path),
+          'the probe must not resolve against the process working directory',
         );
       }
     });
