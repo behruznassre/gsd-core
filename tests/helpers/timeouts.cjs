@@ -224,6 +224,47 @@ const SCAN_USAGE_ERROR_TIMEOUT_MS = 5000;
  */
 const MALFORMED_INPUT_HOOK_TIMEOUT_MS = 5000;
 
+/**
+ * A single `scripts/*.cjs` generator or lint script (gen-adr-index.cjs,
+ * check-glossary-refs.cjs, gen-context-index.cjs, and siblings), spawned
+ * directly and once against a small temp fixture repo -- no fan-out.
+ *
+ * Deliberately NOT `BUILD_TIMEOUT_MS`, despite the coincidentally-matching
+ * value: that constant's own doc comment scopes it specifically to
+ * `scripts/build-hooks.js` ("not a full project build"), and none of this
+ * norm's sites run that script. Reusing a constant for its number while
+ * ignoring what its comment actually describes is exactly the trap this
+ * migration exists to avoid -- see `SEAM_DEFAULT_TIMEOUT_MS` and
+ * `SCAN_USAGE_ERROR_TIMEOUT_MS` for the same reasoning applied elsewhere in
+ * this file.
+ *
+ * Shared across 7 files in batch #4520 of the ad hoc timeout literal
+ * migration, epic #4445 -- every site independently arrived at this exact
+ * value -- that is why it lives here rather than as a file-local constant.
+ */
+const GENERATOR_SCRIPT_TIMEOUT_MS = 30000;
+
+/**
+ * A git plumbing command (or a short scratch-index sequence of them) run
+ * against the REAL, current repo tree -- never a throwaway mkdtemp fixture.
+ * Distinct from `GIT_TIMEOUT_MS` (15000ms, plumbing reads against a small
+ * fixture repo) and `GIT_FIXTURE_TIMEOUT_MS` (60000ms, the shared helper's
+ * own multi-spawn fixture-CONSTRUCTION sequence) -- this norm's sites
+ * either read the real object database directly (`git ls-files`) or build a
+ * synthetic commit on a scratch index against it, which is heavier than a
+ * tiny-fixture read but not the shared helper's own six-spawn construction
+ * class. Explicitly NOT for fixture-repo CONSTRUCTION (init/config/add/commit
+ * against a throwaway mkdtemp repo) -- tests/emitted-attribution.test.cjs's
+ * own file-local `FRESH_FIXTURE_GIT_TIMEOUT_MS` covers that shape instead,
+ * after an earlier pass conflated the two and a Standards-axis review caught
+ * it.
+ *
+ * Shared across 2 files in batch #4520 of the ad hoc timeout literal
+ * migration, epic #4445 -- every site independently arrived at this exact
+ * value -- that is why it lives here rather than as a file-local constant.
+ */
+const REAL_REPO_GIT_TIMEOUT_MS = 30000;
+
 module.exports = {
   PROBE_TIMEOUT_MS,
   HOOK_FANOUT_TIMEOUT_MS,
@@ -238,4 +279,6 @@ module.exports = {
   LOOP_HOOK_POINT_CLI_TIMEOUT_MS,
   SCAN_USAGE_ERROR_TIMEOUT_MS,
   MALFORMED_INPUT_HOOK_TIMEOUT_MS,
+  GENERATOR_SCRIPT_TIMEOUT_MS,
+  REAL_REPO_GIT_TIMEOUT_MS,
 };
