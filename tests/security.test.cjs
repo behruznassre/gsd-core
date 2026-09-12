@@ -9,7 +9,8 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
-const { cleanup } = require('./helpers.cjs');
+const { runGsdTools, createTempProject, cleanup } = require('./helpers.cjs');
+const fc = require('./helpers/fast-check-setup.cjs');
 
 const {
   validatePath,
@@ -1209,3 +1210,139 @@ describe('SECURE: ASVS level scaling (#1627)', () => {
 });
   });
 }
+
+// ─── #4652: validatePath property tests (both directions) ────────────────────
+//
+// PR1: any relative path with `..` segments that resolves OUTSIDE the root is
+// ALWAYS rejected. PR2: any path that resolves INSIDE the root is ALWAYS
+// accepted. Both directions are required — a predicate rejecting everything
+// would vacuously satisfy PR1 alone.
+
+describe('validatePath — containment properties (#4652)', () => {
+  // A path SEGMENT: letters/digits/dash/underscore, non-empty, never '.' or '..'
+  // by construction so every generated escaping path is escaping ONLY via the
+  // deliberately-injected `..` components below (never an accidental one).
+  const segmentArb = fc
+    .stringMatching(/^[A-Za-z0-9_-]+$/)
+    .filter((s) => s.length > 0 && s !== '.' && s !== '..');
+
+  test('PR1: a relative path with enough leading ".." segments to resolve OUTSIDE the root is ALWAYS rejected', () => {
+    fc.assert(fc.property(
+      fc.array(segmentArb, { minLength: 1, maxLength: 4 }), // base depth below an anchor
+      fc.integer({ min: 1, max: 8 }), // extra ".." beyond the base depth
+      fc.array(segmentArb, { minLength: 0, maxLength: 3 }), // trailing segments after escaping
+      (baseSegments, extraUp, tailSegments) => {
+        // Root sits `baseSegments.length` levels below a stable anchor.
+        const anchor = path.resolve('/gsd-root-anchor');
+        const root = path.join(anchor, ...baseSegments);
+        // Enough ".." to exit past the anchor itself, guaranteeing the resolved
+        // path is OUTSIDE root (and outside the anchor) regardless of anchor
+        // depth on this OS.
+        const upCount = baseSegments.length + extraUp;
+        const traversal = path.join(...Array(upCount).fill('..'), ...tailSegments, 'target');
+
+        const result = validatePath(traversal, root);
+        assert.strictEqual(
+          result.safe,
+          false,
+          `traversal ${JSON.stringify(traversal)} against root ${root} must be rejected, got: ${JSON.stringify(result)}`,
+        );
+      },
+    ), { seed: 4652, numRuns: 200 });
+  });
+
+  test('PR2: a path that resolves INSIDE the root (no traversal beyond it) is ALWAYS accepted', () => {
+    fc.assert(fc.property(
+      fc.array(segmentArb, { minLength: 1, maxLength: 5 }),
+      (segments) => {
+        const root = path.resolve('/gsd-root-anchor-in');
+        const relPath = path.join(...segments);
+
+        const result = validatePath(relPath, root);
+        assert.strictEqual(
+          result.safe,
+          true,
+          `in-root path ${JSON.stringify(relPath)} against root ${root} must be accepted, got: ${JSON.stringify(result)}`,
+        );
+        assert.strictEqual(result.resolved, path.resolve(root, relPath));
+      },
+    ), { seed: 4652, numRuns: 200 });
+  });
+});
+
+// ─── #4652: cross-boundary containment — same escaping inputs, all four
+// boundaries, same rejection shape ────────────────────────────────────────────
+//
+// One shared list of escaping inputs is driven through all four containment
+// boundaries named in #4652 (todo complete, check predicate --phase-dir,
+// check decision-coverage-plan's resolvePath, check gap-analysis.plan-post).
+// Each boundary is asserted to reject with the SAME error shape:
+// `{ ok: false, reason: 'usage', message }` (ERROR_REASON.USAGE) under
+// `--json-errors`. None of these boundaries validate today, so every row is
+// expected to FAIL until the fix lands (RED).
+
+describe('cross-boundary containment — shared escaping inputs, same rejection shape (#4652)', () => {
+  const ESCAPING_INPUTS = ['../../escaped', '../sibling', 'a/../../b'];
+
+  function setupProject() {
+    const tmpDir = createTempProject();
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '05-x');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    const pendingDir = path.join(tmpDir, '.planning', 'todos', 'pending');
+    fs.mkdirSync(pendingDir, { recursive: true });
+    return { tmpDir, phaseDir, pendingDir };
+  }
+
+  function assertUsageRejection(result, label) {
+    assert.strictEqual(
+      result.success,
+      false,
+      `${label} must be rejected (currently: ${result.success ? `SUCCEEDED with output ${result.output}` : 'failed for an unrelated reason'})`,
+    );
+    let parsed = null;
+    try { parsed = JSON.parse(result.error); } catch (_) { /* not JSON — also a failure to fix */ }
+    assert.ok(parsed, `${label}: stderr must be JSON under --json-errors, got: ${result.error}`);
+    assert.strictEqual(parsed.ok, false, `${label}: parsed.ok must be false`);
+    assert.strictEqual(parsed.reason, 'usage', `${label}: reason must be ERROR_REASON.USAGE ("usage"), got: ${parsed.reason}`);
+  }
+
+  for (const escaping of ESCAPING_INPUTS) {
+    test(`[RED #4652] "${escaping}" is rejected identically (reason: usage) at all four boundaries`, () => {
+      const { tmpDir } = setupProject();
+      try {
+        // Boundary 1: todo complete <name>
+        const todoResult = runGsdTools(['--json-errors', 'todo', 'complete', escaping], tmpDir);
+        assertUsageRejection(todoResult, `todo complete "${escaping}"`);
+
+        // Boundary 2: check predicate --phase-dir <dir>
+        const predicate = JSON.stringify({
+          kind: 'command-exit-zero',
+          command: 'true',
+        });
+        const predicateResult = runGsdTools(
+          ['--json-errors', 'check', 'predicate', '--predicate', predicate, '--phase-dir', escaping, '--raw'],
+          tmpDir,
+        );
+        assertUsageRejection(predicateResult, `check predicate --phase-dir "${escaping}"`);
+
+        // Boundary 3: check decision-coverage-plan <phase-dir> <context-path>
+        const contextPath = path.join(tmpDir, 'CONTEXT.md');
+        fs.writeFileSync(contextPath, '# Context\n\n<decisions>\n## Implementation Decisions\n\n- **D-01:** x\n</decisions>\n');
+        const decisionResult = runGsdTools(
+          ['--json-errors', 'query', 'check.decision-coverage-plan', escaping, contextPath],
+          tmpDir,
+        );
+        assertUsageRejection(decisionResult, `check decision-coverage-plan "${escaping}"`);
+
+        // Boundary 4: check gap-analysis.plan-post <phase-dir>
+        const gapResult = runGsdTools(
+          ['--json-errors', 'check', 'gap-analysis.plan-post', escaping, '--raw'],
+          tmpDir,
+        );
+        assertUsageRejection(gapResult, `check gap-analysis.plan-post "${escaping}"`);
+      } finally {
+        cleanup(tmpDir);
+      }
+    });
+  }
+});
