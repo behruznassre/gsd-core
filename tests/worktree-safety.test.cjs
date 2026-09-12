@@ -2416,9 +2416,15 @@ describe('executeWorktreeWaveCleanupPlan', () => {
       // Build the expectation with path.resolve, not path.join: on win32 resolve
       // prepends the current drive to a drive-less absolute path (`/repo/main` ->
       // `D:\repo\main`) and join does not, so a join-built expectation fails on
-      // Windows against correct behavior. The assertion below is not circular —
-      // the two notEqual rows are what give it teeth, by ruling out the bare
-      // relative path and a process-cwd resolution.
+      // Windows against correct behavior. Scope of that claim (Codex review
+      // round 3): computing the expectation the way production computes it does
+      // NOT give this row an independent oracle for win32 or git semantics — it
+      // cannot catch `path.resolve` being the wrong choice, only a drift between
+      // the two. What it does still catch is the mutation that matters here,
+      // dropping the repoRoot anchoring, which the equality below rejects
+      // whenever the fixture paths differ. The two notEqual rows state that
+      // difference explicitly rather than leaving it to the reader — ruling out
+      // the bare relative path and a process-cwd resolution.
       const expected = path.resolve('/repo/main', '.claude/worktrees/agent-a1');
       for (const probePath of probed) {
         assert.equal(
@@ -2465,16 +2471,23 @@ describe('executeWorktreeWaveCleanupPlan', () => {
       );
     });
 
-    test('an entry accepted as ABSENT never force-removes a checkout that reappeared', () => {
+    test('an entry accepted as ABSENT tears down by prune, never by force-remove', () => {
       // Codex review round 2, P2. An absent entry is merged WITHOUT the rescue
       // and dirty checks, on the evidence that it had no checkout. If one is
       // recreated at that path before teardown, `worktree remove --force` would
       // delete contents that never passed either check — strictly worse than the
       // bug this PR fixes. Teardown for such an entry must prune, never force.
+      //
+      // Scope (Codex review round 3, P3): this row proves the UNCONDITIONAL
+      // contract — no force-remove is ever issued for an absent-accepted entry —
+      // which is what makes a reappearance harmless. It does NOT model the
+      // reappearance transition itself: on this path production probes presence
+      // once, at identification, so a stub that flips on a later call would never
+      // be asked. The row was previously named for a transition it does not
+      // exercise; the assertions below are unchanged and still meaningful.
       const calls = [];
       executeWorktreeWaveCleanupPlan(plan([entry]), {
-        // Absent at identification; present again by teardown.
-        existsSync: () => { calls.push('probe'); return calls.filter((c) => c === 'probe').length > 1; },
+        existsSync: () => { calls.push('probe'); return false; },
         execGit: (args) => {
           const key = args.join(' ');
           calls.push(key);
@@ -2487,6 +2500,51 @@ describe('executeWorktreeWaveCleanupPlan', () => {
         'a forced removal must never run for an entry accepted as absent',
       );
       assert.ok(calls.includes('worktree prune'), 'teardown still clears stale admin state');
+    });
+
+    test('an UNREADABLE worktree is not accepted as absent — it still blocks', () => {
+      // Codex review round 3, P2. Absence is what lets an entry skip the rescue
+      // and dirty checks, so it must be CONFIRMED, never inferred. `fs.existsSync`
+      // answers false for a genuinely missing path AND for one it cannot traverse
+      // (EACCES on a parent, an unreachable mount) — verified out-of-band: with a
+      // parent at mode 000, existsSync returns false while statSync throws EACCES.
+      // Taking that false at face value would merge over uncommitted work that
+      // the dirty check exists to refuse. Pre-fix behavior for an unreadable
+      // checkout was to block, and it must stay blocked.
+      const calls = [];
+      const eacces = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      const result = executeWorktreeWaveCleanupPlan(plan([entry]), {
+        // The probe cannot answer: it throws rather than returning false.
+        existsSync: () => { throw eacces; },
+        execGit: (args) => { calls.push(args.join(' ')); return absentWorktreeGit()(args); },
+      });
+
+      assert.equal(result.entries[0].status, 'blocked');
+      assert.equal(result.entries[0].reason, 'branch_mismatch');
+      assert.equal(result.ok, false);
+      assert.equal(
+        calls.some((k) => k.startsWith(`merge ${BR}`)), false,
+        'an unreadable worktree must not be merged — the dirty check never ran',
+      );
+      assert.equal(
+        calls.some((k) => k === 'worktree prune' || k === `worktree remove ${WT} --force`), false,
+        'no teardown may run for an entry that was never accepted',
+      );
+    });
+
+    test('a genuinely absent path (probe reports ENOENT) is still accepted as absent', () => {
+      // The other side of the row above: the discrimination must not over-block.
+      // A probe that throws ENOENT states confirmed absence, which is exactly the
+      // case this PR exists to handle, so the entry must still merge and tear down.
+      const enoent = Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+      const result = executeWorktreeWaveCleanupPlan(plan([entry]), {
+        existsSync: () => { throw enoent; },
+        execGit: absentWorktreeGit(),
+      });
+
+      assert.equal(result.entries[0].status, 'merged_removed');
+      assert.equal(result.entries[0].reason, 'ok');
+      assert.equal(result.ok, true);
     });
   });
   test('#1265 accepts a merge-base listed in allowed_bases even when expected_base is the plan commit', () => {

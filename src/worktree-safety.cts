@@ -1009,7 +1009,8 @@ interface WaveCleanupResult {
 
 function executeWorktreeWaveCleanupPlan(plan: WaveCleanupPlan | null, deps: WorktreeDeps = {}): WaveCleanupResult {
   const execGit = deps.execGit || execGitDefault;
-  const existsSyncRaw = deps.existsSync || fs.existsSync;
+  const existsSyncRaw = deps.existsSync;
+  const statSyncRaw = deps.statSync || fs.statSync;
   const entries = Array.isArray(plan?.entries) ? plan.entries : [];
   if (!plan || plan.action !== 'cleanup_wave' || entries.length === 0) {
     return {
@@ -1037,8 +1038,36 @@ function executeWorktreeWaveCleanupPlan(plan: WaveCleanupPlan | null, deps: Work
   // mismatch reads both ways: a present checkout reported absent (skipping the
   // dirty check that would have blocked it) or an absent one reported present.
   // `path.resolve` is a no-op for the absolute paths the orchestrator writes.
-  const worktreeExists = (worktreePath: string): boolean =>
-    existsSyncRaw(path.resolve(plan.repoRoot, worktreePath));
+  //
+  // #4415 (Codex review round 3): absence must be CONFIRMED, never inferred from
+  // a bare `existsSync`. `fs.existsSync` answers false for a genuinely missing
+  // path AND for one it merely cannot traverse (EACCES on a parent directory, an
+  // unreachable mount) — verified: on a parent at mode 000, `existsSync` returns
+  // false while `statSync` throws EACCES. That distinction carries real weight
+  // here, because "absent" is what lets an entry SKIP the rescue and dirty
+  // checks: an unreadable-but-present worktree would have merged over
+  // uncommitted work that the dirty check exists to refuse. Before this PR a
+  // failed git read blocked unconditionally, so treating unreadable as present
+  // is not a new safety rule — it is the one that was already there.
+  //
+  // Only ENOENT is absence. Anything else — EACCES, EIO — reads as present, and
+  // the caller blocks exactly as before. The default probe is `statSync`, which
+  // reports WHY it failed; `existsSync` cannot and so cannot be the default. An
+  // injected probe stays authoritative (tests state presence directly, with no
+  // hidden dependency on the real filesystem) and may throw to state that the
+  // path is unreadable.
+  const presenceProbe = existsSyncRaw || ((p: string): boolean => {
+    statSyncRaw(p);
+    return true;
+  });
+  const worktreeExists = (worktreePath: string): boolean => {
+    const resolved = path.resolve(plan.repoRoot, worktreePath);
+    try {
+      return presenceProbe(resolved);
+    } catch (err) {
+      return (err as NodeJS.ErrnoException)?.code !== 'ENOENT';
+    }
+  };
 
   // #2852: every per-entry failure site marks the SAME shape — status='blocked',
   // a reason code, the captured stderr, push to results, flip the overall `ok`
@@ -1081,8 +1110,10 @@ function executeWorktreeWaveCleanupPlan(plan: WaveCleanupPlan | null, deps: Work
     if (!gitResultOk(branchCheck)) {
       worktreeAbsent = !worktreeExists(entry.worktree_path);
       if (!worktreeAbsent) {
-        // The directory is there and git still could not read it — a real
-        // failure, blocked exactly as before.
+        // The directory is there — or could not be proven gone — and git still
+        // could not read it. Either way a real failure, blocked exactly as
+        // before. (`worktreeExists` returns true for an unreadable path, so an
+        // EACCES parent lands here rather than on the absent path.)
         blockEntry(result, 'branch_mismatch', branchCheck?.stderr || '');
         // #2852: isolate — this entry's problem does not touch repoRoot's git state,
         // so every remaining entry is still independently evaluated.
