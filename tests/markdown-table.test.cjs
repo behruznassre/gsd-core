@@ -247,6 +247,218 @@ describe('parseMarkdownTable: property-based round-trip', () => {
   });
 });
 
+// ─── Property test: the writer/reader invariant (#4736) ───────────────────────
+
+// The round-trip property above deliberately generates SAFE cells — "no '|' or
+// newline" — so it cannot see this class of defect at all. The inverse invariant
+// was untested, and that gap is how quick.md's Step 7c shipped writing raw,
+// unescaped `${DESCRIPTION}` into the table for long enough to corrupt real
+// projects' STATE.md: a description containing a Jinja filter, a shell pipeline or
+// an Ansible task name produced a permanently ragged row that parseMarkdownTable
+// then refused to read, blocking every later append.
+//
+// The invariant: NO WRITER MAY EMIT A ROW THIS READER REJECTS. It is asserted here
+// against the writer every caller is supposed to use, over exactly the hostile
+// characters the other property test excludes.
+describe('appendQuickTaskRow: writer/reader invariant over hostile prose (#4736)', () => {
+  // Descriptions built to contain the two characters that matter — '|' (the cell
+  // delimiter) and '\\' (the escape character itself, which must be escaped FIRST
+  // or the escaping is self-corrupting) — plus ordinary text around them.
+  const hostileDescription = fc
+    .array(
+      fc.oneof(
+        fc.constant('|'),
+        fc.constant('\\'),
+        fc.constant('\\|'),
+        fc.constant('`x | y`'),
+        fc.constant('dict2items|selectattr'),
+        fc.string({ minLength: 1, maxLength: 6 }).filter((t) => !t.includes('\n') && !t.includes('\r')),
+      ),
+      { minLength: 1, maxLength: 6 },
+    )
+    .map((parts) => parts.join(' '))
+    .filter((d) => d.trim().length > 0);
+
+  const CANONICAL = [
+    '## Quick Tasks Completed',
+    '',
+    '| # | Description | Date | Commit | Directory |',
+    '|---|-------------|------|--------|-----------|',
+    '',
+  ].join('\n');
+
+  test('property: a row written by appendQuickTaskRow is always readable by parseMarkdownTable', () => {
+    fc.assert(
+      fc.property(hostileDescription, (description) => {
+        const appended = appendQuickTaskRow(CANONICAL, {
+          description,
+          date: '2026-09-14',
+          commit: 'abc1234',
+          quickId: 'q1',
+          directory: '[q1-slug](./quick/q1-slug/)',
+        });
+        assert.equal(appended.ok, true, `writer refused its own input: ${JSON.stringify(appended)}`);
+
+        // The reader must accept what the writer just produced. Before the fix this
+        // held only because the writer escapes; the point of the property is that it
+        // must KEEP holding for every future change to either side.
+        const section = appended.value.content.split('## Quick Tasks Completed')[1];
+        const reparsed = parseMarkdownTable(section);
+        assert.equal(
+          reparsed.ok, true,
+          `reader rejected a row the writer emitted for ${JSON.stringify(description)}: ${JSON.stringify(reparsed)}`
+        );
+        assert.equal(reparsed.value.rows.length, 1);
+
+        // And the description must survive intact — escaping may not silently
+        // mangle the operator's text. The round trip is lossless on BOTH sides:
+        // `escapeCell` escapes `\\` before `|` (the incomplete-sanitization order),
+        // and `splitTableRow` splits on unescaped delimiters via negative lookbehind
+        // and then unescapes (`src/markdown-table.cts:119`). So the reader returns
+        // the original text and no unescaping belongs in this assertion — an earlier
+        // draft that unescaped here double-unescaped, and this property caught it
+        // with the counterexample `\\| |`. `escapeCell` still collapses newlines and
+        // trims, so compare against that normalisation rather than the raw input.
+        const expected = description.replace(/\r?\n+/g, ' ').trim();
+        const stored = reparsed.value.rows[0]['Description'];
+        assert.equal(
+          stored, expected,
+          `description did not survive the round trip: stored ${JSON.stringify(stored)}`
+        );
+      }),
+    );
+  });
+
+  test('the Step 7c shape that caused #4736 is exactly what this invariant forbids', () => {
+    // A concrete, non-generated control naming the real defect: the row quick.md
+    // used to hand-render. Kept alongside the property so a reader can see the
+    // failure the property generalises, without running a generator.
+    const description = 'Fix `smokeping_extra_packages | length > 0` guard';
+    const handRendered = `${CANONICAL}| q42 | ${description} | 2026-09-14 | abc1234 | [q42-g](./quick/q42-g/) |\n`;
+    const handSection = handRendered.split('## Quick Tasks Completed')[1];
+    const handParsed = parseMarkdownTable(handSection);
+    assert.equal(handParsed.ok, false, 'the hand-rendered row must be the thing that fails');
+    assert.match(handParsed.reason, /cells, expected/);
+
+    const viaHelper = appendQuickTaskRow(CANONICAL, {
+      description, date: '2026-09-14', commit: 'abc1234', quickId: 'q42',
+      directory: '[q42-g](./quick/q42-g/)',
+    });
+    assert.equal(viaHelper.ok, true);
+    const helperParsed = parseMarkdownTable(viaHelper.value.content.split('## Quick Tasks Completed')[1]);
+    assert.equal(helperParsed.ok, true, 'the same description through the helper must read back cleanly');
+  });
+});
+
+// ─── The workflow-side guard for #4736 ────────────────────────────────────────
+
+// The property above constrains the HELPER. Nothing constrained the WORKFLOW, and
+// the workflow is where the defect actually lived: quick.md Step 7c hand-rendered
+// `| ${quick_id} | ${DESCRIPTION} | ... |` as raw markdown, so every escaping
+// guarantee in this module was bypassed at the one call site that matters most.
+//
+// Prose cannot be fixed by prose — an instruction to "escape the description"
+// would be one more line for a model to skip. This asserts the structural
+// property instead: no workflow renders a Quick Tasks row by hand.
+describe('workflow guard: no hand-rendered Quick Tasks rows (#4736)', () => {
+  const WORKFLOWS_DIR = path.join(ROOT, 'gsd-core', 'workflows');
+
+  function* walk(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) yield* walk(full);
+      else if (entry.name.endsWith('.md')) yield full;
+    }
+  }
+
+  test('no workflow interpolates a description into a raw markdown table row', () => {
+    const offenders = [];
+    for (const file of walk(WORKFLOWS_DIR)) {
+      const lines = fs.readFileSync(file, 'utf-8').split(/\r?\n/);
+      lines.forEach((line, i) => {
+        const trimmed = line.trim();
+        // A table row that interpolates a DESCRIPTION-shaped variable. Narrow on
+        // purpose: `${...}` inside a pipe row is the shape that corrupts, and the
+        // description is the field that carries free prose.
+        if (!trimmed.startsWith('|') || !trimmed.endsWith('|')) return;
+        if (!/\$\{[A-Za-z_]*(DESCRIPTION|description)[A-Za-z_]*\}/.test(trimmed)) return;
+        offenders.push(`${path.relative(ROOT, file)}:${i + 1}: ${trimmed}`);
+      });
+    }
+
+    assert.deepEqual(
+      offenders, [],
+      'a workflow is hand-rendering a table row containing free prose. Use '
+        + '`gsd_run quick-tasks-append` (or the appendQuickTaskRow helper) instead — '
+        + 'a literal `|` in the description makes the row permanently unreadable '
+        + `(#4736):\n${offenders.join('\n')}`
+    );
+  });
+
+  test('quick.md Step 7c routes through the schema-backed command', () => {
+    // The positive half: the guard above proves the bad shape is gone, this proves
+    // the good shape replaced it rather than the step being deleted.
+    const quickMd = fs.readFileSync(path.join(WORKFLOWS_DIR, 'quick.md'), 'utf-8');
+    assert.match(
+      quickMd, /gsd_run quick-tasks-append --task "\$\{DESCRIPTION\}"/,
+      'Step 7c must append through quick-tasks-append'
+    );
+    assert.match(
+      quickMd, /--status "\$\{VERIFICATION_STATUS\}"/,
+      'the $VALIDATE_MODE branch must still carry a real verification status, not the — placeholder'
+    );
+  });
+});
+
+// ─── D2: a ragged row must not mask an unrecognized schema (#4736) ────────────
+
+describe('appendQuickTaskRow: ragged rows do not mask schema errors (#4736)', () => {
+  const LEGACY_RAGGED = [
+    '## Quick Tasks Completed',
+    '',
+    '| Date | Slug | Scope | Artifacts |',
+    '|------|------|-------|-----------|',
+    '| 2026-01-01 | a | uses a `x | y` pipe | path/ |',
+    '',
+  ].join('\n');
+
+  test('a table that is BOTH ragged and on an unregistered schema reports both', () => {
+    // Before this fix only the cell-count error surfaced, so an operator repaired
+    // prose in a historical record file and was then blocked by a second,
+    // previously invisible error. That misdiagnosis happened twice, the second time
+    // to someone who had read a write-up warning about the first — which is the
+    // argument for fixing the message rather than documenting around it.
+    const result = appendQuickTaskRow(LEGACY_RAGGED, { description: 'probe' });
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /cells, expected/, 'the ragged row must still be reported');
+    assert.match(
+      result.reason, /unrecognized Quick Tasks schema/,
+      `the schema blocker underneath must be reported too: ${result.reason}`
+    );
+  });
+
+  test('a ragged row on a RECOGNIZED schema reports only the ragged row', () => {
+    // The control that keeps the above from being satisfied by always appending a
+    // schema complaint: when the schema is fine, saying so would be noise.
+    const canonicalRagged = [
+      '## Quick Tasks Completed',
+      '',
+      '| # | Description | Date | Commit | Directory |',
+      '|---|-------------|------|--------|-----------|',
+      '| 1 | a | b | c | d | e |',
+      '',
+    ].join('\n');
+
+    const result = appendQuickTaskRow(canonicalRagged, { description: 'probe' });
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /cells, expected/);
+    assert.equal(
+      /unrecognized Quick Tasks schema/.test(result.reason), false,
+      `the schema is registered, so it must not be blamed: ${result.reason}`
+    );
+  });
+});
+
 // ─── appendQuickTaskRow (#2133) ────────────────────────────────────────────────
 
 describe('appendQuickTaskRow (#2133)', () => {

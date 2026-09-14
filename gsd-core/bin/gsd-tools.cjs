@@ -33,7 +33,7 @@
  *   quick-tasks-migrate                Migrate STATE.md's "Quick Tasks Completed"
  *                                      table onto the canonical schema (#3730).
  *                                      No-op when absent or already canonical.
- *   quick-tasks-append --task <text>   Append a row to STATE.md's "Quick Tasks
+ *   quick-tasks-append --task <text> [--status <s>]  Append a row to STATE.md's "Quick Tasks
  *                                      Completed" table (schema-backed via
  *                                      markdown-table.cjs; #2133/ADR-2143).
  *                                      Fails loud (non-zero exit) on a missing
@@ -1254,7 +1254,7 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
           // canonical permalink the same way `workflows/quick.md` renders it.
           const qtaParsed = parseNamedArgsOrExit(
             qtaArgs,
-            { valueFlags: ['task', 'quick-id', 'slug', 'directory'], positionals: 'rest' },
+            { valueFlags: ['task', 'quick-id', 'slug', 'directory', 'status'], positionals: 'rest' },
             error,
           );
           const qtaTask = qtaParsed.task || args[1];
@@ -1303,6 +1303,13 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
               date,
               commit,
               quickId: qtaQuickId,
+              // #4736: without this the Status-column variant silently wrote the
+              // `—` placeholder, so `quick.md`'s `$VALIDATE_MODE` branch could not
+              // route through this command without losing its real
+              // `${VERIFICATION_STATUS}`. That gap is why Step 7c was still
+              // hand-rendering raw markdown — and hand-rendered markdown is
+              // unescaped markdown.
+              status: qtaParsed['status'] || undefined,
               directory: qtaDirectory,
             });
             if (!result.ok) {

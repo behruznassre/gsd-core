@@ -640,19 +640,25 @@ Insert after `### Blockers/Concerns` section:
 
 **7c. Append new row to table:**
 
-Use `date` from init:
+Append through the helper. Do NOT hand-render this row as markdown:
 
 **If `$VALIDATE_MODE` (or table has Status column):**
-```markdown
-| ${quick_id} | ${DESCRIPTION} | ${date} | ${commit_hash} | ${VERIFICATION_STATUS} | [${quick_id}-${slug}](./quick/${quick_id}-${slug}/) |
+```bash
+gsd_run quick-tasks-append --task "${DESCRIPTION}" --quick-id "${quick_id}" --slug "${slug}" --status "${VERIFICATION_STATUS}"
 ```
 
 **If NOT `$VALIDATE_MODE` (and table has no Status column):**
-```markdown
-| ${quick_id} | ${DESCRIPTION} | ${date} | ${commit_hash} | [${quick_id}-${slug}](./quick/${quick_id}-${slug}/) |
+```bash
+gsd_run quick-tasks-append --task "${DESCRIPTION}" --quick-id "${quick_id}" --slug "${slug}"
 ```
 
-For a schema-safe append outside this workflow (e.g. from fast.md, which has neither a quick id nor a task directory), `gsd_run quick-tasks-append --task <text>` performs an equivalent-shape write via the shared, schema-backed `appendQuickTaskRow` helper (#2133, ADR-2143 §3/§7) — the `#` cell is a positional ordinal and `Directory` reads `—`, since no id/directory was supplied. A caller that DOES have a real `${quick_id}` and task directory can pass `--quick-id <id> --slug <slug>` (or `--directory <link>` directly) to get the byte-identical row this step renders above (#3356).
+The command selects the variant from the table's own header, so the same call is correct for either shape; `--status` is simply ignored by a table with no Status column. `Date` and `Commit` are filled by the command (today's date; `git rev-parse --short HEAD`). `Directory` is derived from `--quick-id` + `--slug` as `[${quick_id}-${slug}](./quick/${quick_id}-${slug}/)`, or pass `--directory <link>` to set it outright (#3356).
+
+**Why a command and not a markdown row (#4736):** `${DESCRIPTION}` is free prose, and prose contains `|` — a Jinja filter, a command pipeline, an Ansible task name. GFM requires `|` to be escaped inside a table cell **even within a code span**, so interpolating a description straight into a row produces a permanently ragged table that `parseMarkdownTable` then refuses to read, blocking every later append. The helper escapes `\` and `|` per cell (`escapeCell`), so the one writer and the one reader agree by construction. This is also why the row must not be assembled by hand and then written with Edit: hand-rendered markdown is unescaped markdown.
+
+If the command fails, it prints the reason and changes nothing — read the reason rather than falling back to writing the row by hand. An `unrecognized Quick Tasks schema` reason means step 7b's `quick-tasks-migrate` has not run on a legacy table yet; a `row N has M cells` reason means the table is already ragged from a previous hand-written row and needs that row repaired first. Both can be reported together.
+
+The same command serves callers outside this workflow (e.g. fast.md, which has neither a quick id nor a task directory): `gsd_run quick-tasks-append --task <text>` alone renders `#` as a positional ordinal and `Directory` as `—` (#2133, ADR-2143 §3/§7).
 
 **7d. Update "Last activity" line:**
 
@@ -661,7 +667,7 @@ Use `date` from init:
 Last activity: ${date} - Completed quick task ${quick_id}: ${DESCRIPTION}
 ```
 
-Use Edit tool to make these changes atomically
+**Order and tooling (#4736):** 7b and 7d are Edit-tool changes to STATE.md; 7c is not. Run them in order — 7b (create the section, or migrate a legacy table) with Edit, then 7c as its own command, then 7d with Edit. 7c writes STATE.md itself, under the same lockfile every other STATE.md writer uses, so it must not be folded into an Edit of the surrounding text: an Edit that also carried the row would be writing the row by hand, which is the unescaped path this step exists to avoid.
 
 ---
 
