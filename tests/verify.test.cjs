@@ -1643,6 +1643,70 @@ describe('verify artifacts command', () => {
     );
   });
 
+  // #4685: a directory-valued artifact path used to abort the WHOLE command.
+  // `safeReadFile`/`platformReadSync` rethrows every errno except ENOENT, so
+  // `fs.readFileSync` on a directory threw EISDIR out of the per-artifact loop and
+  // the command printed `Error: EISDIR: illegal operation on a directory, read`
+  // with no results at all — not for the directory entry, and not for the plan's
+  // other, perfectly checkable artifacts. Reproduced against a real plan before
+  // the fix; these rows are the contract that replaced it.
+  test('#4685: a directory artifact fails as its own entry and does not abort the others', () => {
+    fs.mkdirSync(path.join(tmpDir, 'src', 'snapshots'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'src', 'snapshots', 'a.snap'), 'snap\n');
+    fs.writeFileSync(path.join(tmpDir, 'src', 'app.js'), 'hello world\n');
+    writePlanWithArtifacts(tmpDir, [
+      '- path: src/snapshots',
+      '  provides: "a directory of snapshots"',
+      '- path: src/app.js',
+      '  contains: "hello"',
+    ]);
+
+    const result = runGsdTools('verify artifacts .planning/phases/01-test/01-01-PLAN.md', tmpDir);
+    assert.ok(result.success, `Command crashed instead of reporting: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.total, 2, `both artifacts must be checked: ${JSON.stringify(output)}`);
+    assert.strictEqual(output.passed, 1, `the file artifact must still pass: ${JSON.stringify(output)}`);
+    assert.strictEqual(output.all_passed, false);
+
+    const dirCheck = output.artifacts.find((a) => a.path === 'src/snapshots');
+    assert.ok(dirCheck, 'the directory entry must be reported, not swallowed');
+    assert.strictEqual(dirCheck.passed, false);
+    assert.strictEqual(dirCheck.exists, true, 'the path does resolve — this is not "not found"');
+    assert.ok(
+      dirCheck.issues.some((i) => /directory/i.test(i)),
+      `the directory entry needs its own distinct issue, not "File not found": ${JSON.stringify(dirCheck.issues)}`
+    );
+    assert.equal(
+      dirCheck.issues.some((i) => /not found/i.test(i)), false,
+      'a directory that exists must not be reported as missing'
+    );
+
+    // The point of the fix: the OTHER artifact is still independently checked.
+    const fileCheck = output.artifacts.find((a) => a.path === 'src/app.js');
+    assert.ok(fileCheck, 'the file artifact must still be reported');
+    assert.strictEqual(fileCheck.passed, true, `the file artifact is fine and must say so: ${JSON.stringify(fileCheck)}`);
+    assert.deepStrictEqual(fileCheck.issues, []);
+  });
+
+  // The degenerate shape: nothing else in the plan can carry the result, so a
+  // crash here would leave the caller with no verdict at all.
+  test('#4685: a plan whose only artifact is a directory still returns a structured verdict', () => {
+    fs.mkdirSync(path.join(tmpDir, 'src', 'snapshots'), { recursive: true });
+    writePlanWithArtifacts(tmpDir, [
+      '- path: src/snapshots',
+      '  provides: "a directory of snapshots"',
+    ]);
+
+    const result = runGsdTools('verify artifacts .planning/phases/01-test/01-01-PLAN.md', tmpDir);
+    assert.ok(result.success, `Command crashed instead of reporting: ${result.error}`);
+
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.total, 1);
+    assert.strictEqual(output.passed, 0);
+    assert.strictEqual(output.all_passed, false, 'a directory-only block must never read as a pass');
+  });
+
   // A MIXED artifacts block (one bare-string prose bullet + one well-formed
   // `path:` entry) must not be disturbed by the positive-evidence floor: the
   // string is item-skipped, the real entry is checked, results.length === 1 > 0,
