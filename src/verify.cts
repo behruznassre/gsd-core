@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { textEncodingError } from './validate.cjs';
+import { tryWithinRootLexical } from './security.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- planning-workspace.cjs is an export= CommonJS module
 import planningWorkspace = require('./planning-workspace.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- frontmatter.cjs is an export= CommonJS module
@@ -34,7 +35,7 @@ import worktreeSafetyMod = require('./worktree-safety.cjs');
 // codebase-drift --name-status parse loop).
 const { decodeGitQuotedPath } = worktreeSafetyMod;
 import { execGit, platformReadSync as safeReadFile } from './shell-command-projection.cjs';
-import { validatePath } from './security.cjs';
+import { tryWithinRoot } from './security.cjs';
 import { formatGsdSlash, resolveRuntime } from './runtime-slash.cjs';
 import { detectSchemaFiles, checkSchemaDrift } from './schema-detect.cjs';
 import { extractTaggedBlocks } from './markdown-sectionizer.cjs';
@@ -173,9 +174,12 @@ function verifySummaryCore(
     const firstSegment = candidate.split('/')[0] || '';
     if (firstSegment.indexOf('.') > 0) return false;
     // Containment guard: a `../`-bearing reference must not turn this advisory
-    // into a filesystem existence probe outside the project.
-    const resolved = path.resolve(projectRoot, candidate);
-    if (resolved !== projectRoot && !resolved.startsWith(projectRoot + path.sep)) return false;
+    // into a filesystem existence probe outside the project. Lexical (ADR-4650
+    // decision 6): the candidate is a string pulled from a SUMMARY document and
+    // by construction may not exist yet — existence is what gets probed
+    // downstream — and this is a pure string-heuristic filter with no other fs
+    // access, so a realpath call would also change its cost profile.
+    if (tryWithinRootLexical(candidate, projectRoot) === null) return false;
     return true;
   };
 
@@ -1549,11 +1553,11 @@ function cmdVerifyKeyLinks(cwd: string, planFilePath: string, raw: boolean): voi
       // project. Leave sourceContent as null so the existing not-found /
       // pending classification below runs unchanged. Note this guard is
       // narrower than it may look: `from: "."` is a non-empty string, so it
-      // still reaches validatePath and safeReadFile below, and DOES read the
+      // still reaches tryWithinRoot and safeReadFile below, and DOES read the
       // cwd directory (yielding "Source read failed: EISDIR") — this branch
       // only short-circuits the true empty-string case.
-      const fromCheck = validatePath(fromPath, cwd);
-      if (!fromCheck.safe) {
+      const fromContained = tryWithinRoot(fromPath, cwd);
+      if (fromContained === null) {
         // Do not echo result.error — it embeds absolute host paths.
         check['path_rejected'] = 'from';
         check['detail'] = 'Source path rejected — resolves outside the project directory';
@@ -1561,7 +1565,7 @@ function cmdVerifyKeyLinks(cwd: string, planFilePath: string, raw: boolean): voi
         continue;
       }
       try {
-        sourceContent = safeReadFile(fromCheck.resolved);
+        sourceContent = safeReadFile(fromContained);
       } catch (err) {
         // Report the errno only — never the message or path (untrusted `from:`
         // can trigger EISDIR/EACCES, which platformReadSync re-throws for any
@@ -1624,15 +1628,15 @@ function cmdVerifyKeyLinks(cwd: string, planFilePath: string, raw: boolean): voi
               // An empty/missing `to:` is a malformed plan, not a
               // path-confinement violation — only a non-empty path that
               // actually resolves outside the project is path_rejected.
-              const toCheck = validatePath(toPath, cwd);
-              if (!toCheck.safe) {
+              const toContained = tryWithinRoot(toPath, cwd);
+              if (toContained === null) {
                 // Do not read a rejected `to:` — treat as no target content
                 // and do not echo result.error, which embeds absolute host
                 // paths.
                 check['path_rejected'] = 'to';
                 check['detail'] = `Pattern "${link['pattern'] as string}" not found in source; target path rejected — resolves outside the project directory`;
               } else {
-                targetContent = safeReadFile(toCheck.resolved);
+                targetContent = safeReadFile(toContained);
               }
             }
             if (targetContent && pat.test(targetContent)) {
@@ -2022,8 +2026,8 @@ function resolvePhaseDirByToken(phasesDir: string, phaseArg: string): string | n
   const dirNames = dirEntries.filter((e) => e.isDirectory()).map((e) => e.name);
   const matched = matchPhaseDirs(dirNames, normalizedPhase).matches[0];
   if (matched) return path.join(phasesDir, matched);
-  const check = validatePath(phaseArg, phasesDir);
-  if (check.safe && fs.existsSync(check.resolved)) return check.resolved;
+  const contained = tryWithinRoot(phaseArg, phasesDir);
+  if (contained !== null && fs.existsSync(contained)) return contained;
   return null;
 }
 

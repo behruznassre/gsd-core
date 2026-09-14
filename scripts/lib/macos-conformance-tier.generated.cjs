@@ -6,6 +6,7 @@
 
 module.exports = {
   MACOS_CONFORMANCE_TIER_FILES: [
+  "tests/adr-612-bracket-phase-counting.test.cjs",
   "tests/adr-index-gate.test.cjs",
   "tests/adr-parser.property.test.cjs",
   "tests/adr-parser.unit.test.cjs",
@@ -82,6 +83,7 @@ module.exports = {
   "tests/gsd-statusline.test.cjs",
   "tests/gsd-tools-path-refs.test.cjs",
   "tests/gsd-validate-commit-crash-policy.test.cjs",
+  "tests/gsd-validate-commit-sigpipe.test.cjs",
   "tests/gsd-write-guard.test.cjs",
   "tests/health-diagnostic-rules/worktree-health.test.cjs",
   "tests/health-diagnostic.test.cjs",

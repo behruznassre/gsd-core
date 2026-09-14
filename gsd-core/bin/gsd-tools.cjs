@@ -438,8 +438,9 @@ function dispatchCapabilityCommand({ command, args, cwd, raw, error, registry, r
     // Step 2: confinement check — belt-and-suspenders even after the basename
     // validation above. Resolved path must be inside libDir (not equal to it,
     // and must start with libDir + sep so "libDir-suffix" can't sneak through).
-    const resolved = path.resolve(libDir, m);
-    if (resolved === libDir || !resolved.startsWith(libDir + path.sep)) {
+    const { tryWithinRootLexical } = require('./lib/security.cjs');
+    const resolved = tryWithinRootLexical(m, libDir);
+    if (resolved === null || resolved === path.resolve(libDir)) {
       throw new Error('capability module path escapes bin/lib/: ' + JSON.stringify(m));
     }
     // Step 3: require the resolved absolute path — the SAME representation that
@@ -515,18 +516,19 @@ function defaultRequireFromInstallRoot(installRoot, m) {
   if (typeof m !== 'string' || !/^[A-Za-z0-9._-]+\.cjs$/.test(m)) {
     throw new Error('capability module must be a bare .cjs basename: ' + JSON.stringify(m));
   }
-  // Realpath the root so a symlinked ancestor can't widen confinement.
-  const realRoot = fs.realpathSync(installRoot);
-  const resolved = path.resolve(realRoot, m);
-  if (resolved === realRoot || !resolved.startsWith(realRoot + path.sep)) {
+  const { tryWithinRoot, tryWithinRootLexical, PathAcceptance } = require('./lib/security.cjs');
+  // Lexical containment check: a symlinked ancestor can't widen confinement.
+  const lexical = tryWithinRootLexical(m, installRoot);
+  if (lexical === null || lexical === path.resolve(installRoot)) {
     throw new Error('capability module path escapes its install root: ' + JSON.stringify(m));
   }
-  // The module file itself must not be a symlink pointing outside the root.
-  const realResolved = fs.realpathSync(resolved);
-  if (realResolved !== realRoot && !realResolved.startsWith(realRoot + path.sep)) {
+  // Realpath/symlink check: the module file itself must not be a symlink
+  // pointing outside the root.
+  const real = tryWithinRoot(m, installRoot, PathAcceptance.RelativeOnly);
+  if (real === null) {
     throw new Error('capability module resolves outside its install root (symlink): ' + JSON.stringify(m));
   }
-  return require(realResolved);
+  return require(real);
 }
 
 /**
@@ -3293,6 +3295,7 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
   const RESTORE_OUTCOME = Object.freeze({
     ELIGIBLE: 'eligible',
     RESTORED: 'restored',
+    ALREADY_PRESENT: 'already_present',
     SKIPPED_DESTINATION_MANAGED: 'skipped_destination_managed',
     SKIPPED_DESTINATION_EXISTS: 'skipped_destination_exists',
     SKIPPED_COPY_FAILED: 'skipped_copy_failed',
@@ -3351,18 +3354,30 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
     return out;
   }
 
-  // Why these three checks rather than security.cjs's `validatePath`: that seam
-  // resolves symlinks with realpathSync and then tests containment, so a link
-  // whose target sits inside the config dir passes. For a restore that is still
-  // wrong — writing through any link overwrites whatever it points at instead
-  // of materializing a regular file at the backed-up path. These checks reject
-  // links outright, which is strictly stricter than validatePath, not a
-  // reimplementation of it. Do not "simplify" this to validatePath.
+  // Why these three checks rather than security.cjs's `assertWithinRoot` /
+  // `tryWithinRoot`: that seam resolves symlinks with realpathSync and then
+  // tests containment, so a link whose target sits inside the config dir
+  // passes. For a restore that is still wrong — writing through any link
+  // overwrites whatever it points at instead of materializing a regular file
+  // at the backed-up path. These checks reject links outright, which is
+  // strictly stricter than assertWithinRoot/tryWithinRoot, not a
+  // reimplementation of them. Do not "simplify" this to assertWithinRoot or
+  // tryWithinRoot. Reviewed under epic #4636 Phase 3: the containment
+  // DECISION now routes through the canonical lexical predicate
+  // (`tryWithinRootLexical`, ADR-4650 decision 6); isInsideDir below still
+  // treats target === root as NOT contained via its own extra `!==` check
+  // (unlike every other containment implementation in this repo, which
+  // treats target === root as contained) — that condition is this gate's
+  // own and is layered on top of the shared predicate, not folded into it.
 
   /** True when `target` resolves strictly inside `root`. */
   function isInsideDir(root, target) {
-    const rel = path.relative(path.resolve(root), path.resolve(target));
-    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+    // Containment decision: canonical lexical predicate (ADR-4650 decision 6).
+    // The extra `!==` condition is this gate's own: a restore must never
+    // target the config directory itself, only something strictly inside it.
+    if (path.resolve(target) === path.resolve(root)) return false;
+    const { tryWithinRootLexical } = require('./lib/security.cjs');
+    return tryWithinRootLexical(target, root) !== null;
   }
 
   /**
@@ -3560,9 +3575,13 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
       }
 
       // An identical destination is a no-op restore, not a conflict: re-running
-      // the restore after a successful one must stay quiet and idempotent.
+      // the restore after a successful one must stay quiet and idempotent. It
+      // gets its own outcome so it is excluded from eligible_count — the update
+      // workflow drives its restore question off that count (#4558).
+      let destExists = false;
       let destDiffers = false;
       if (fs.existsSync(destPath)) {
+        destExists = true;
         try {
           destDiffers = !fs.readFileSync(destPath).equals(fs.readFileSync(srcPath));
         } catch {
@@ -3575,6 +3594,10 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
           detail: 'a different file already exists at this path — restoring would overwrite it',
         });
         entries.push({ path: relPath, outcome: RESTORE_OUTCOME.SKIPPED_DESTINATION_EXISTS, warnings });
+        continue;
+      }
+      if (destExists) {
+        entries.push({ path: relPath, outcome: RESTORE_OUTCOME.ALREADY_PRESENT, warnings });
         continue;
       }
 
