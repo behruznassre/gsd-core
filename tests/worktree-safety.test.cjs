@@ -4606,8 +4606,16 @@ describe('bug-3707: executeWorktreeWaveCleanupPlan unlocks and retries on locked
     addWorktree(repoDir, wtDir, branchName);
     commitInWorktree(wtDir);
 
+    // git reports porcelain paths with FORWARD slashes on every platform, while
+    // path.join gives backslashes on win32 — compare on a normalised form, or this
+    // asserts nothing but the separator style. (Caught by the Windows conformance
+    // shard on the first push of these rows.)
+    const asGitPath = (p) => p.replace(/\\/g, '/');
     const before = git(['worktree', 'list', '--porcelain'], repoDir);
-    assert.ok(before.includes(`worktree ${wtDir}`), 'the worktree is registered before removal');
+    assert.ok(
+      asGitPath(before).includes(`worktree ${asGitPath(wtDir)}`),
+      'the worktree is registered before removal',
+    );
 
     // The harness's own behaviour: the directory is deleted, the admin entry is not.
     // `cleanup` rather than a raw rmSync — it carries the Windows-EBUSY retry budget,
@@ -4615,7 +4623,7 @@ describe('bug-3707: executeWorktreeWaveCleanupPlan unlocks and retries on locked
     cleanup(wtDir);
 
     const after = git(['worktree', 'list', '--porcelain'], repoDir);
-    const block = after.split('\n\n').find((b) => b.includes(`worktree ${wtDir}`));
+    const block = asGitPath(after).split('\n\n').find((b) => b.includes(`worktree ${asGitPath(wtDir)}`));
     assert.ok(block, 'git must still list the removed worktree — this is what identity is sourced from');
     assert.match(block, new RegExp(`^branch refs/heads/${branchName}$`, 'm'),
       'the path -> branch binding must survive rm -rf; the fix depends on it');
@@ -4627,6 +4635,15 @@ describe('bug-3707: executeWorktreeWaveCleanupPlan unlocks and retries on locked
   // removal test: an UNREADABLE parent produces the same `prunable` line for a
   // checkout that is still present. Skipped as root, where the mode bits do not bite.
   test('real git also reports prunable for an UNREADABLE worktree, so prunable is not absence (#4415)', (t) => {
+    // The premise is "git cannot traverse the parent". Two environments cannot
+    // establish it, and in both the test would assert `prunable` against a perfectly
+    // readable worktree and fail for a reason unrelated to the behaviour under test:
+    //   - root, which bypasses the mode bits entirely
+    //   - win32, where POSIX mode bits do not govern directory traversal at all
+    if (process.platform === 'win32') {
+      t.skip('win32: POSIX mode bits do not deny traversal, so the premise cannot be set up');
+      return;
+    }
     if (typeof process.getuid === 'function' && process.getuid() === 0) {
       t.skip('runs as root: mode 000 does not deny traversal, so the premise cannot be set up');
       return;
@@ -4643,8 +4660,9 @@ describe('bug-3707: executeWorktreeWaveCleanupPlan unlocks and retries on locked
 
     fs.chmodSync(holder, 0o000);
     try {
+      const toGitPath = (p) => p.replace(/\\/g, '/');
       const out = git(['worktree', 'list', '--porcelain'], repoDir);
-      const block = out.split('\n\n').find((b) => b.includes(`worktree ${wtDir}`));
+      const block = toGitPath(out).split('\n\n').find((b) => b.includes(`worktree ${toGitPath(wtDir)}`));
       assert.ok(block, 'the entry is still registered');
       assert.match(block, /^prunable /m,
         'git cannot traverse the parent, so it reports the entry prunable even though the '
