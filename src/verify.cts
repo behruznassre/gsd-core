@@ -1427,10 +1427,13 @@ function cmdVerifyArtifacts(cwd: string, planFilePath: string, raw: boolean): vo
     // artifacts either. A check that disappears is worse than a check that fails,
     // because a failure is visible.
     //
-    // Scope of this guard: it covers what the stat and read below actually throw.
-    // A path `fs.existsSync` already rejected never reaches here — that is the
-    // `File not found` branch — so this is not a claim to catch every way a path
-    // can be unusable.
+    // Scope of this guard, stated precisely (review nit): the `try` encloses the
+    // whole per-artifact body, but the only statements in it that can throw are the
+    // `statSync` and the read — the `min_lines`/`contains`/`exports` checks below
+    // are pure string operations. So this catches I/O, and nothing here is a
+    // deliberate guard around those criteria checks. A path `fs.existsSync` already
+    // rejected never reaches here either (that is the `File not found` branch), so
+    // this is not a claim to catch every way a path can be unusable.
     try {
       if (exists) {
         // A directory is reported as its own kind of failure, distinct from
