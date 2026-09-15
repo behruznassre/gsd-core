@@ -2968,6 +2968,21 @@ describe('#1912 — init.progress fails safe in workstream mode with no active w
     assert.match(result.error || '', /workstream|--ws/i, 'error should name the workstream requirement');
   });
 
+  test('treats a whitespace environment workstream as unset and refuses root progress', (t) => {
+    seedWs('alpha', 'v9.0');
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'milestone: v7.1\nstatus: executing\n');
+    const previous = process.env.GSD_WORKSTREAM;
+    t.after(() => {
+      if (previous === undefined) delete process.env.GSD_WORKSTREAM;
+      else process.env.GSD_WORKSTREAM = previous;
+    });
+    process.env.GSD_WORKSTREAM = '  ';
+
+    const result = runGsdTools('init progress', tmpDir);
+    assert.equal(result.success, false, 'a whitespace workstream must not bypass the root-write guard');
+    assert.match(result.error || '', /workstream|--ws/i);
+  });
+
   test('succeeds with --ws (reads the named workstream, not root)', () => {
     seedWs('alpha', 'v9.0');
     fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'milestone: v7.1\nstatus: executing\n');
