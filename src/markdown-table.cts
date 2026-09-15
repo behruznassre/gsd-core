@@ -870,9 +870,20 @@ export function appendQuickTaskRow(
     // observed twice, the second time by someone who had read a write-up warning
     // about the first. The error message beats the documentation, so the error
     // message has to be right.
-    const header = locateTableHeader(section.body.split(/\r?\n/));
-    const schemaAlso = header && !isQuickTasksSchema(header.columns)
-      ? `; additionally, ${unrecognizedQuickTasksReason(header.columns)}`
+    // Only speak to the schema when a header/delimiter PAIR was actually
+    // established (Codex review round 1, P3). A parse can fail before any table
+    // exists — a stray `| prose |` line above the real table yields "missing
+    // delimiter row", and its lone cell is not a header. Blaming the schema there
+    // invents a second repair the operator does not need: removing the stray line
+    // exposes a perfectly recognized table.
+    const lines = section.body.split(/\r?\n/);
+    const header = locateTableHeader(lines);
+    const delimiterCells = header ? splitTableRow(lines[header.headerIdx + 1] ?? '') : [];
+    const headerIsReal = Boolean(header)
+      && isDelimiterRow(delimiterCells)
+      && delimiterCells.length === header!.columns.length;
+    const schemaAlso = headerIsReal && !isQuickTasksSchema(header!.columns)
+      ? `; additionally, ${unrecognizedQuickTasksReason(header!.columns)}`
       : '';
     return { ok: false, reason: `quick-tasks table: ${parsed.reason}${schemaAlso}` };
   }

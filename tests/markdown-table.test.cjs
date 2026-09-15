@@ -437,6 +437,30 @@ describe('appendQuickTaskRow: ragged rows do not mask schema errors (#4736)', ()
     );
   });
 
+  test('a parse failure with no real header does not invent a schema blocker', () => {
+    // Codex review round 1, P3. The schema verdict must only speak when a
+    // header/delimiter PAIR was established. A stray `| prose |` line above the real
+    // table fails the parse at "missing delimiter row", and its lone cell is not a
+    // header — blaming the schema there sends the operator to repair a table that is
+    // perfectly canonical once the stray line is gone.
+    const strayLineAboveTable = [
+      '## Quick Tasks Completed',
+      '',
+      '| stray prose |',
+      '',
+      '| # | Description | Date | Commit | Directory |',
+      '|---|-------------|------|--------|-----------|',
+      '',
+    ].join('\n');
+
+    const result = appendQuickTaskRow(strayLineAboveTable, { description: 'probe' });
+    assert.equal(result.ok, false);
+    assert.equal(
+      /unrecognized Quick Tasks schema/.test(result.reason), false,
+      `no header/delimiter pair was established, so the schema must not be blamed: ${result.reason}`
+    );
+  });
+
   test('a ragged row on a RECOGNIZED schema reports only the ragged row', () => {
     // The control that keeps the above from being satisfied by always appending a
     // schema complaint: when the schema is fine, saying so would be noise.
@@ -792,6 +816,49 @@ describe('CLI: quick-tasks-append (#3356)', () => {
     assert.ok(r.success, `quick-tasks-append should succeed: ${r.error}`);
     const out = JSON.parse(r.output);
     assert.ok(/^\| 1 \| Fix thing \| .* \| — \|$/.test(out.row), `expected the ordinal + em-dash fallback, got: ${out.row}`);
+  });
+
+  test('#4736: --status/--date/--commit are forwarded, not recomputed', (t) => {
+    // Codex review round 1 flagged this as the gap that let the new workflow text
+    // and the helper property both stay green while the CLI forwarded nothing.
+    //
+    // All three matter for quick.md's row specifically:
+    //   --status  without it the Status variant writes the `—` placeholder over a
+    //             real ${VERIFICATION_STATUS}
+    //   --date    the fallback is UTC; operator-facing date-only fields must name
+    //             the LOCAL calendar day (src/clock.cts), so an evening task in a
+    //             negative-offset zone would otherwise file under tomorrow
+    //   --commit  the fallback is current HEAD, which is this task's commit only if
+    //             nothing landed in between (#4466 refuses HEAD for review scope
+    //             for exactly that reason)
+    const tmpDir = createTempProject();
+    t.after(() => cleanup(tmpDir));
+    fs.mkdirSync(path.join(tmpDir, '.planning'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), [
+      '# STATE',
+      '',
+      '### Quick Tasks Completed',
+      '',
+      '| # | Description | Date | Commit | Status | Directory |',
+      '|---|-------------|------|--------|--------|-----------|',
+      '',
+    ].join('\n'));
+
+    const r = runGsdTools(
+      ['quick-tasks-append', '--task', 'Guard `a | b` chain', '--quick-id', 'q42', '--slug', 'guard',
+       '--date', '2019-07-04', '--commit', 'deadbee', '--status', 'Needs Review'],
+      tmpDir,
+    );
+    assert.ok(r.success, `quick-tasks-append should succeed: ${r.error}`);
+    const out = JSON.parse(r.output);
+
+    // A date far in the past cannot be produced by the fallback, so this pins
+    // forwarding rather than coincidence.
+    assert.ok(out.row.includes('| 2019-07-04 |'), `--date must be forwarded verbatim, got: ${out.row}`);
+    assert.ok(out.row.includes('| deadbee |'), `--commit must be forwarded verbatim, got: ${out.row}`);
+    assert.ok(out.row.includes('| Needs Review |'), `--status must be forwarded, not the — placeholder, got: ${out.row}`);
+    // And the escaping that is the whole point of routing through this command:
+    assert.ok(out.row.includes('Guard `a \\| b` chain'), `the pipe must be escaped, got: ${out.row}`);
   });
 
   test('defect 2: a body-only append does not force a full progress re-derive — a curated total_phases divergent from disk survives', (t) => {
