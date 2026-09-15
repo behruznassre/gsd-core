@@ -21,7 +21,7 @@ const { CONFIG_DEFAULTS } = configLoader;
 import { platformWriteSync, platformEnsureDir } from './shell-command-projection.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import planningWorkspace = require('./planning-workspace.cjs');
-const { planningDir, planningRoot, withPlanningLock } = planningWorkspace;
+const { planningDir, planningRoot, resolveEnvWorkstream, withPlanningLock } = planningWorkspace;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import modelProfiles = require('./model-profiles.cjs');
 const { VALID_PROFILES, getAgentToModelMapForProfile, formatAgentToModelMapAsTable } = modelProfiles;
@@ -1269,7 +1269,7 @@ function resolveFromRootConfig(cwd: string, kp: string): { found: boolean; value
   // diverges from planningRoot without a workstream and loadConfigResolved does NOT
   // inherit root — matching the runtime's own `if (ws)` gate keeps the two surfaces
   // from diverging on the project-scoped (non-workstream) case.
-  if (!process.env['GSD_WORKSTREAM']) return { found: false, value: undefined };
+  if (!resolveEnvWorkstream()) return { found: false, value: undefined };
   const root = planningRoot(cwd);
   const rootConfigPath = path.join(root, 'config.json');
   let rootConfig: Record<string, unknown>;
@@ -1388,7 +1388,7 @@ function cmdConfigPath(cwd: string, _raw: boolean, workstreamContext: Workstream
  * (caller uses `await` which is safe on a sync return value).
  */
 function cmdMigrateConfig(cwd: string, raw: boolean): void {
-  const ws = process.env['GSD_WORKSTREAM'] || null;
+  const ws = resolveEnvWorkstream();
   // #3749: resolve the migration target through the project-aware resolver so
   // GSD_PROJECT scopes the write; migrateOnDisk itself cannot (see its
   // configPathOverride note).

@@ -107,6 +107,7 @@ const {
   todosDir,
   listAvailableWorkstreams,
   peekActiveWorkstream,
+  resolveEnvWorkstream,
   diagnoseUnresolvedActiveWorkstream,
   describeUnresolvedWorkstreamReason,
   findContextMdIn,
@@ -1552,7 +1553,7 @@ function cmdInitNewMilestone(cwd: string, raw: boolean, options: Record<string, 
   // would otherwise silently delete a stale/invalid pointer as a side effect
   // of building a JSON report field, and (per #3579) could change what a
   // LATER resolution in the same process observes.
-  const resolvedWorkstream = process.env['GSD_WORKSTREAM'] || peekActiveWorkstream(cwd);
+  const resolvedWorkstream = resolveEnvWorkstream() ?? peekActiveWorkstream(cwd);
   const workstreamActive = !!resolvedWorkstream;
   const flatMode = !workstreamActive;
 
@@ -3370,7 +3371,7 @@ function cmdInitUpdate(cwd: string, raw: boolean, options: Record<string, unknow
 function cmdInitTransition(cwd: string, raw: boolean, options: Record<string, unknown> = {}): void {
   // #3579 root-cause fix: read-only informational field — peek, don't
   // self-heal (see cmdInitNewMilestone's identical rationale above).
-  const resolvedWorkstream = process.env['GSD_WORKSTREAM'] || peekActiveWorkstream(cwd);
+  const resolvedWorkstream = resolveEnvWorkstream() ?? peekActiveWorkstream(cwd);
   const workstreamActive = !!resolvedWorkstream;
 
   const result: Record<string, unknown> = {
@@ -3470,7 +3471,7 @@ function cmdInitProgress(cwd: string, raw: boolean, options: Record<string, unkn
   // non-mutating peek so an unresolvable pointer isn't self-healed (cleared)
   // here and then found "absent" by diagnoseUnresolvedActiveWorkstream below,
   // which would misreport a present-but-bad marker as no marker at all.
-  const _resolvedWorkstream = process.env['GSD_WORKSTREAM'] || peekActiveWorkstream(cwd);
+  const _resolvedWorkstream = resolveEnvWorkstream() ?? peekActiveWorkstream(cwd);
   if (_availableWorkstreams.length > 0 && !_resolvedWorkstream) {
     // #3579: getActiveWorkstream now inherits a pointer-less session's read
     // from the shared .planning/active-workstream marker, so reaching this
