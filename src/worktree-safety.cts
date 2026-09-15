@@ -1372,11 +1372,27 @@ function executeWorktreeWaveCleanupPlan(plan: WaveCleanupPlan | null, deps: Work
       // `worktree remove --force` for it. If a registered checkout has since
       // reappeared at that path — recreated between the checks and here — a
       // forced removal would delete contents that never passed either check,
-      // which is strictly worse than the bug this PR fixes. Prune only: it
-      // clears the admin entry when the directory really is gone, and leaves a
-      // reappeared checkout untouched (its branch then stays checked out, so the
-      // branch delete below reports `branch_delete_failed` — visible, and not
-      // destructive).
+      // which is strictly worse than the bug this PR fixes.
+      //
+      // Re-confirm absence immediately before tearing down (maintainer review,
+      // Major). Presence was classified once, at identification, and everything
+      // between then and here — the base, deletion and scope gates, and the merge
+      // itself — is a window in which a worktree can reappear. "Prune only" was
+      // offered as sufficient on its own, on the argument that prune leaves a live
+      // checkout alone and the `branch -D` below would then fail visibly. That
+      // argument holds only while prune's own staleness check is not fooled by the
+      // same filesystem-visibility gap that produced the false absence one call
+      // earlier. If it is, prune clears the admin entry, `branch -D` then SUCCEEDS,
+      // and a live, unreviewed, un-rescued worktree loses its branch — destroying
+      // state, where the pre-fix bug only ever blocked. That asymmetry is why this
+      // check is worth a `statSync`: the failure it prevents is unrecoverable, and
+      // the check costs no subprocess.
+      if (!confirmedGone(entry.worktree_path)) {
+        blockEntry(result, 'worktree_remove_failed',
+          `worktree ${entry.worktree_path} reappeared after being accepted as absent; refusing to prune or delete its branch`);
+        continue; // #2852: isolate — the merge already landed on repoRoot
+      }
+      // Prune only: it clears the admin entry when the directory really is gone.
       const prune = execGit(['worktree', 'prune'], { cwd: plan.repoRoot });
       if (!gitResultOk(prune)) {
         blockEntry(result, 'worktree_remove_failed', prune?.stderr || '');

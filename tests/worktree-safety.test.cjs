@@ -2558,6 +2558,48 @@ describe('executeWorktreeWaveCleanupPlan', () => {
       );
     });
 
+    test('#4612 Major: a worktree that REAPPEARS before teardown blocks instead of losing its branch', () => {
+      // Maintainer review on #4612. Presence is classified once, at identification,
+      // and the base/deletion/scope gates plus the merge all run before teardown —
+      // a window in which a worktree can come back. The previous defence was
+      // "prune only, and a live checkout would make `branch -D` fail visibly",
+      // which holds only while prune's staleness check is not fooled by the same
+      // visibility gap that produced the false absence. If it is, prune succeeds,
+      // `branch -D` succeeds, and a live worktree loses its branch — destroying
+      // state where the original bug merely blocked.
+      //
+      // This is the transition the older row could not model: the stat answers
+      // "gone" at identification and "present" at teardown, which is exactly the
+      // race. Both teardown verbs must be withheld.
+      const calls = [];
+      let statCalls = 0;
+      const result = executeWorktreeWaveCleanupPlan(plan([entry]), {
+        statSync: () => {
+          statCalls += 1;
+          // First call (identification): gone. Later (teardown): back.
+          if (statCalls === 1) throw ENOENT;
+          return { isDirectory: () => true };
+        },
+        execGit: (args) => { calls.push(args.join(' ')); return absentWorktreeGit()(args); },
+      });
+
+      assert.equal(result.entries[0].status, 'blocked');
+      assert.equal(result.entries[0].reason, 'worktree_remove_failed');
+      assert.match(result.entries[0].stderr || '', /reappeared/i);
+      assert.equal(
+        calls.includes('worktree prune'), false,
+        'a reappeared worktree must not be pruned — prune may clear the admin entry and unblock branch -D',
+      );
+      assert.equal(
+        calls.includes(`branch -D ${BR}`), false,
+        'and its branch must never be deleted: that is the unrecoverable outcome this guards',
+      );
+      assert.equal(
+        calls.some((k) => k === `worktree remove ${WT} --force`), false,
+        'nor may it be force-removed',
+      );
+    });
+
     test('an entry accepted as ABSENT tears down by prune, never by force-remove', () => {
       // Codex review round 2, P2. An absent entry is merged WITHOUT the rescue
       // and dirty checks, on the evidence that it had no checkout. If one is
@@ -4547,6 +4589,69 @@ describe('bug-3707: executeWorktreeWaveCleanupPlan unlocks and retries on locked
 
   afterEach(() => {
     cleanup(tmpBase);
+  });
+
+  // #4612 Minor (maintainer review): the #4415 rows are mock-based, so the factual
+  // claim the whole identity mechanism rests on — that git KEEPS the path -> branch
+  // binding after the checkout is deleted, and says `prunable` — was asserted in
+  // comments and measured out of band, but never proved executably by this suite.
+  // This proves it against the real git binary, and pins the end-to-end behavior the
+  // mocked rows model.
+  test('real git keeps the path -> branch binding after rm -rf, and says prunable (#4415)', () => {
+    const repoDir = path.join(tmpBase, 'repo');
+    const wtDir = path.join(tmpBase, 'wt-gone');
+    const branchName = 'worktree-agent-gone';
+
+    initRepo(repoDir);
+    addWorktree(repoDir, wtDir, branchName);
+    commitInWorktree(wtDir);
+
+    const before = git(['worktree', 'list', '--porcelain'], repoDir);
+    assert.ok(before.includes(`worktree ${wtDir}`), 'the worktree is registered before removal');
+
+    // The harness's own behaviour: the directory is deleted, the admin entry is not.
+    // `cleanup` rather than a raw rmSync — it carries the Windows-EBUSY retry budget,
+    // which matters here because the path being deleted is a live git worktree.
+    cleanup(wtDir);
+
+    const after = git(['worktree', 'list', '--porcelain'], repoDir);
+    const block = after.split('\n\n').find((b) => b.includes(`worktree ${wtDir}`));
+    assert.ok(block, 'git must still list the removed worktree — this is what identity is sourced from');
+    assert.match(block, new RegExp(`^branch refs/heads/${branchName}$`, 'm'),
+      'the path -> branch binding must survive rm -rf; the fix depends on it');
+    assert.match(block, /^prunable /m,
+      'and git must mark the entry prunable, which is how "removed" is distinguished');
+  });
+
+  // The other half of the same claim, and the reason `prunable` alone is not the
+  // removal test: an UNREADABLE parent produces the same `prunable` line for a
+  // checkout that is still present. Skipped as root, where the mode bits do not bite.
+  test('real git also reports prunable for an UNREADABLE worktree, so prunable is not absence (#4415)', (t) => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      t.skip('runs as root: mode 000 does not deny traversal, so the premise cannot be set up');
+      return;
+    }
+    const repoDir = path.join(tmpBase, 'repo2');
+    const holder = path.join(tmpBase, 'holder');
+    const wtDir = path.join(holder, 'wt-unreadable');
+    const branchName = 'worktree-agent-unreadable';
+
+    initRepo(repoDir);
+    fs.mkdirSync(holder, { recursive: true });
+    addWorktree(repoDir, wtDir, branchName);
+    commitInWorktree(wtDir);
+
+    fs.chmodSync(holder, 0o000);
+    try {
+      const out = git(['worktree', 'list', '--porcelain'], repoDir);
+      const block = out.split('\n\n').find((b) => b.includes(`worktree ${wtDir}`));
+      assert.ok(block, 'the entry is still registered');
+      assert.match(block, /^prunable /m,
+        'git cannot traverse the parent, so it reports the entry prunable even though the '
+          + 'checkout is STILL THERE — which is why removal is confirmed by errno, not by prunable');
+    } finally {
+      fs.chmodSync(holder, 0o755);
+    }
   });
 
   test('removes a locked worktree after unlock-retry (real-fs)', () => {
