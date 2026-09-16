@@ -25,7 +25,7 @@ const fc = require('fast-check');
 
 const roadmapParser = require('../gsd-core/bin/lib/roadmap-parser.cjs');
 const { SCOPE } = require('../gsd-core/bin/lib/planning-scope.cjs');
-const { createTempProject, cleanup, runGsdTools } = require('./helpers.cjs');
+const { createTempProject, createTempGitProject, cleanup, runGsdTools } = require('./helpers.cjs');
 
 const {
   stripShippedMilestones,
@@ -3816,3 +3816,257 @@ describe('#1881 unreadable ROADMAP vs absent ROADMAP', () => {
     });
   });
 }
+
+// ─── #4731: wrapped Goal / Requirements fields ────────────────────────────────
+
+// The roadmapper hard-wraps prose at ~85 characters. Every reader of these fields
+// captured `([^\n]+)` — the label's own line and nothing more — so a wrapped field
+// was silently truncated: `phase_req_ids` returned only the IDs that fit on line
+// one, `roadmap.get-phase` returned a goal cut off mid-sentence, and
+// `phase complete` marked the visible IDs Complete, left the rest Pending, and
+// returned `"warnings": []`. Nothing measured the loss, so nothing could report it.
+//
+// The five single-line readers are consolidated into one continuation-aware
+// extractor, following the approach Success Criteria already used (#2522), where
+// the identical bug was fixed for numbered lists and never for these scalars.
+describe('#4731 extractPhaseField: wrapped Goal / Requirements', () => {
+  const { extractPhaseField } = roadmapParser;
+
+  // The issue's own fixture, verbatim.
+  const WRAPPED = [
+    '### Phase 1: Demo',
+    '',
+    '**Goal:** Deliver a small demo feature that exercises the planning pipeline end to end with a',
+    'goal sentence long enough to wrap onto a second line',
+    '**Requirements**: REQ-01, REQ-02, REQ-03, REQ-04, REQ-05, REQ-06, REQ-07, REQ-08, REQ-09,',
+    'REQ-10, REQ-11',
+    '**Plans:** 1 plans',
+    '',
+    'Plans:',
+    '- [ ] TBD',
+    '',
+  ].join('\n');
+
+  test('a wrapped Requirements line yields every ID, not just the first line\'s', () => {
+    const value = extractPhaseField(WRAPPED, 'Requirements');
+    const ids = value.split(',').map((s) => s.trim()).filter(Boolean);
+    assert.equal(ids.length, 11, `expected all 11 IDs, got ${ids.length}: ${value}`);
+    assert.ok(ids.includes('REQ-10'), 'REQ-10 is on the wrapped continuation line');
+    assert.ok(ids.includes('REQ-11'), 'REQ-11 is on the wrapped continuation line');
+  });
+
+  test('a wrapped Goal keeps its second line, folded to one line', () => {
+    const value = extractPhaseField(WRAPPED, 'Goal');
+    assert.ok(value.endsWith('wrap onto a second line'), `goal was truncated: ${value}`);
+    assert.equal(/\n/.test(value), false, 'the folded value stays single-line for existing callers');
+  });
+
+  test('the next **Field** heading terminates a wrapped value', () => {
+    // The boundary that matters: without it, a wrapped Goal would swallow
+    // `**Requirements**` and `**Plans:**` and report them as part of the goal.
+    const goal = extractPhaseField(WRAPPED, 'Goal');
+    assert.equal(/Requirements/i.test(goal), false, `goal absorbed the next field: ${goal}`);
+    assert.equal(/Plans/i.test(goal), false, `goal absorbed the next field: ${goal}`);
+    assert.equal(extractPhaseField(WRAPPED, 'Plans'), '1 plans');
+  });
+
+  test('a blank line terminates a value', () => {
+    const section = '**Goal:** just this\n\nnot this prose\n';
+    assert.equal(extractPhaseField(section, 'Goal'), 'just this');
+  });
+
+  test('single-line fields are unchanged, in both label spellings', () => {
+    // The regression risk of consolidating five readers into one: every
+    // already-working single-line roadmap must parse byte-identically.
+    assert.equal(extractPhaseField('**Goal:** one line only\n**Plans:** 2 plans\n', 'Goal'), 'one line only');
+    assert.equal(extractPhaseField('**Requirements**: REQ-01, REQ-02\n**Plans:** 1 plans\n', 'Requirements'), 'REQ-01, REQ-02');
+    assert.equal(extractPhaseField('**Goal**: colon-outside spelling\n', 'Goal'), 'colon-outside spelling');
+    // `**Requirements** :` — a space before the colon. Covered by existing init
+    // tests, and dropped by a first cut of this consolidation: narrowing five
+    // readers into one is exactly where a tolerated spelling goes missing, so it
+    // is pinned here rather than only where it was caught.
+    assert.equal(extractPhaseField('**Requirements** : REQ-01, REQ-02\n', 'Requirements'), 'REQ-01, REQ-02');
+    assert.equal(extractPhaseField('**Goal** no colon at all\n', 'Goal'), 'no colon at all');
+  });
+
+  // Review round 1, P1 — the boundary that matters most, because this value feeds a
+  // MUTATION path: `phase complete` advances every REQ-ID it is handed to Complete
+  // without re-checking which phase owns it. A greedy fold turns prose that merely
+  // MENTIONS an ID into a completion instruction, which is worse than the
+  // truncation this fix set out to repair.
+  test('a following list item is NOT folded in — it would complete a foreign REQ', () => {
+    const section = [
+      '**Requirements**: REQ-01',
+      '- Deferred to Phase 2: REQ-99',
+      '**Plans:** 1 plans',
+    ].join('\n');
+    const value = extractPhaseField(section, 'Requirements');
+    assert.equal(value, 'REQ-01', `a list line must end the value, not join it: ${value}`);
+    assert.equal(/REQ-99/.test(value), false, 'REQ-99 belongs to another phase and must never reach completion');
+  });
+
+  test('a fenced block after the field is not folded in', () => {
+    const section = '**Requirements**: REQ-01\n```\nREQ-99\n```\n';
+    const value = extractPhaseField(section, 'Requirements');
+    assert.equal(value, 'REQ-01', `a fence must end the value: ${value}`);
+  });
+
+  // Review round 1, P2 — the init readers were `^`-anchored under /m. An unanchored
+  // search lets an inline mention shadow the real field, which would BREAK an
+  // entirely single-line roadmap that works today.
+  test('an inline **Requirements** mention in a Goal does not shadow the real field', () => {
+    const section = [
+      '**Goal:** Document **Requirements** handling.',
+      '**Requirements**: REQ-01, REQ-02',
+      '**Plans:** 1 plans',
+    ].join('\n');
+    assert.equal(extractPhaseField(section, 'Requirements'), 'REQ-01, REQ-02');
+  });
+
+  // Review round 1, P3 — fold LINE BOUNDARIES, never interior text. A goal's
+  // doubled space inside a code span is substantive, not formatting.
+  test('interior whitespace is preserved; only line boundaries fold', () => {
+    assert.equal(
+      extractPhaseField('**Goal:** Preserve the literal `a  b`.\n', 'Goal'),
+      'Preserve the literal `a  b`.',
+    );
+    assert.equal(
+      extractPhaseField('**Requirements**: REQ-01  REQ-02\n', 'Requirements'),
+      'REQ-01  REQ-02',
+    );
+  });
+
+  // Review round 1 — the old Goal readers' `\s*` crossed newlines, so a label
+  // followed by a blank line still found its value. Preserved deliberately rather
+  // than changed silently.
+  test('a label followed by a blank line still finds its value on the next line', () => {
+    assert.equal(extractPhaseField('**Goal:**\n\nDeliver feature\n', 'Goal'), 'Deliver feature');
+  });
+
+  test('an absent field is null, not an empty string', () => {
+    // Callers branch on the value; '' and null are not interchangeable for them.
+    assert.equal(extractPhaseField('### Phase 1: Demo\n\n**Plans:** 1 plans\n', 'Goal'), null);
+    assert.equal(extractPhaseField('', 'Goal'), null);
+  });
+});
+
+// The unit rows above pin the extractor. These pin the QUERY flow end-to-end
+// against the real CLI — a truncation invisible at the extractor level is still
+// invisible to an operator unless the query path carries the full value through.
+// The completion flow is covered separately below; an earlier version of this
+// block claimed both in its title while exercising only these two, which review
+// round 1 rightly called out.
+describe('#4731 wrapped fields survive the plan-phase query path', () => {
+  let tmpDir;
+
+  const WRAPPED_ROADMAP = [
+    '# Roadmap',
+    '',
+    '## Phase Details',
+    '',
+    '### Phase 1: Demo',
+    '',
+    '**Goal:** Deliver a small demo feature that exercises the planning pipeline end to end with a',
+    'goal sentence long enough to wrap onto a second line',
+    '**Requirements**: REQ-01, REQ-02, REQ-03, REQ-04, REQ-05, REQ-06, REQ-07, REQ-08, REQ-09,',
+    'REQ-10, REQ-11',
+    '**Plans:** 1 plans',
+    '',
+    'Plans:',
+    '- [ ] TBD',
+    '',
+  ].join('\n');
+
+  beforeEach(() => {
+    tmpDir = createTempProject();
+    fs.mkdirSync(path.join(tmpDir, '.planning'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), WRAPPED_ROADMAP);
+  });
+
+  afterEach(() => cleanup(tmpDir));
+
+  test('init.plan-phase reports every requirement ID from a wrapped line', () => {
+    const r = runGsdTools('query init.plan-phase 1 --pick phase_req_ids', tmpDir);
+    assert.ok(r.success, `command failed: ${r.error}`);
+    const ids = r.output.trim().split(',').map((s) => s.trim()).filter(Boolean);
+    assert.equal(ids.length, 11, `the coverage gate iterates these — a missing ID cannot be flagged uncovered: ${r.output}`);
+    assert.ok(ids.includes('REQ-11'), `REQ-11 is on the wrapped line: ${r.output}`);
+  });
+
+  test('roadmap.get-phase returns the whole goal, not a sentence cut mid-clause', () => {
+    const r = runGsdTools('query roadmap.get-phase 1 --pick goal', tmpDir);
+    assert.ok(r.success, `command failed: ${r.error}`);
+    assert.ok(
+      r.output.trim().endsWith('wrap onto a second line'),
+      `the goal feeds the plan-checker prompt; a truncated one silently narrows it: ${r.output}`,
+    );
+  });
+});
+
+// Review round 1, P3: the completion flow was verified by hand against a real
+// repository and reported in the PR, but never committed as a regression test —
+// so nothing would catch a re-truncation on the path where the damage is worst.
+// `phase complete` marks requirement rows Complete; a truncated Requirements line
+// silently leaves the wrapped-away IDs Pending and reports `"warnings": []`.
+describe('#4731 wrapped Requirements survive the phase-completion path', () => {
+  let tmpDir;
+
+  const IDS = ['REQ-01', 'REQ-02', 'REQ-03', 'REQ-04', 'REQ-05', 'REQ-06',
+    'REQ-07', 'REQ-08', 'REQ-09', 'REQ-10', 'REQ-11'];
+
+  beforeEach(() => {
+    // git-backed: `phase complete` inspects repository state, so the non-git
+    // fixture silently completes nothing and the assertion below would pass for
+    // the wrong reason on a truncating build.
+    tmpDir = createTempGitProject();
+    const planning = path.join(tmpDir, '.planning');
+    fs.mkdirSync(path.join(planning, 'phases', '01-demo'), { recursive: true });
+
+    // The Requirements line wraps: REQ-10 and REQ-11 sit on the continuation.
+    fs.writeFileSync(path.join(planning, 'ROADMAP.md'), [
+      '# Roadmap', '', '## Phase Details', '', '### Phase 1: Demo', '',
+      '**Goal:** A demo phase.',
+      '**Requirements**: REQ-01, REQ-02, REQ-03, REQ-04, REQ-05, REQ-06, REQ-07, REQ-08, REQ-09,',
+      'REQ-10, REQ-11',
+      '**Plans:** 1 plans', '', 'Plans:', '- [ ] TBD', '',
+    ].join('\n'));
+
+    fs.writeFileSync(path.join(planning, 'REQUIREMENTS.md'), [
+      '# Requirements', '',
+      ...IDS.map((id) => `- [ ] **${id}**: thing`),
+      '', '## Traceability', '',
+      '| Requirement | Phase | Status |', '|---|---|---|',
+      ...IDS.map((id) => `| ${id} | Phase 1 | Pending |`),
+      '',
+    ].join('\n'));
+
+    const phaseDir = path.join(planning, 'phases', '01-demo');
+    fs.writeFileSync(path.join(phaseDir, '01-01-PLAN.md'), '---\nphase: 01-demo\nplan: 01\n---\n\n# Plan\n');
+    fs.writeFileSync(path.join(phaseDir, '01-01-SUMMARY.md'), '---\nphase: 01-demo\nplan: 01\n---\n\n# Summary\n');
+    fs.writeFileSync(path.join(phaseDir, '01-VERIFICATION.md'), '---\nphase: 01-demo\nstatus: passed\n---\n\n# Verification\n');
+  });
+
+  afterEach(() => cleanup(tmpDir));
+
+  test('phase complete marks every wrapped-away requirement, not just the first line\'s', () => {
+    const r = runGsdTools('phase complete 1', tmpDir);
+    assert.ok(r.success, `phase complete failed: ${r.error}`);
+
+    const reqs = fs.readFileSync(path.join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf8');
+    // Plain string rows, not a built RegExp: an earlier cut escaped the pipes
+    // wrongly and produced a pattern with an empty alternative, which matches
+    // everything — the row reported all eleven stranded while the command had in
+    // fact completed them. A test that fails for a reason of its own invention is
+    // as bad as one that passes for one.
+    const pendingRow = (id) => `| ${id} | Phase 1 | Pending |`;
+    const completeRow = (id) => `| ${id} | Phase 1 | Complete |`;
+    const stillPending = IDS.filter((id) => reqs.includes(pendingRow(id)));
+    assert.deepEqual(
+      stillPending, [],
+      `every cited requirement must complete; these were stranded by the truncation: ${stillPending.join(', ')}`,
+    );
+    // The specific IDs the issue reports stranded, named explicitly.
+    assert.ok(reqs.includes(completeRow('REQ-10')), 'REQ-10 sits on the wrapped continuation line');
+    assert.ok(reqs.includes(completeRow('REQ-11')), 'REQ-11 sits on the wrapped continuation line');
+  });
+});

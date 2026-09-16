@@ -3896,9 +3896,11 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
           );
 
           const sectionText = phaseSectionMatch ? phaseSectionMatch[1] : '';
-          const reqMatch = sectionText.match(
-            /\*\*Requirements:?\*\*[^\S\n]*:?[^\S\n]*([^\n]+)/i,
-          );
+          // #4731: continuation-aware. A hard-wrapped Requirements line used to
+          // stop at the first newline, so `phase complete` marked only the IDs
+          // that fit on the label's own line Complete, left the rest Pending, and
+          // returned `"warnings": []` — the truncation was reported nowhere.
+          const reqLine = roadmapParserMod.extractPhaseField(sectionText, 'Requirements');
 
           const originalReqContent = fs.readFileSync(reqPath, 'utf-8');
           let reqContent = originalReqContent;
@@ -3918,18 +3920,18 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
           // `else`, discarding this fact silently instead of surfacing it.
           const traceabilityWriteMisses: string[] = [];
 
-          if (reqMatch) {
+          if (reqLine) {
             // #2334 HIGH 3 + #3697: selection and under-selection detection both
             // live in `analyzeRequirementsLine` (module scope, above), extracted in
             // round 3 so the parser is directly testable — a closure in here is
             // reachable only by spawning the CLI, which no fast-check property test
             // can do. `citedReqIds` is byte-identical to the expression that stood
             // here; nothing about what phase-complete MARKS has changed.
-            const reqLineAnalysis = analyzeRequirementsLine(reqMatch[1]);
+            const reqLineAnalysis = analyzeRequirementsLine(reqLine);
             citedReqIds = reqLineAnalysis.citedReqIds;
             const reqLineWarning = formatRequirementsLineWarning(
               phaseNum,
-              reqMatch[1],
+              reqLine,
               reqLineAnalysis,
             );
             if (reqLineWarning) {

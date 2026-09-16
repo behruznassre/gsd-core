@@ -141,7 +141,6 @@ const { resolveCapabilityRuntimeState } = capabilityStateMod;
 void stripShippedMilestones;
 
 // Accept all bold/colon variants of the Requirements header (#2769)
-const REQUIREMENTS_HEADER_RE = /^\*\*Requirements:?\*\*[^\S\n]*:?[^\S\n]*([^\n]*)$/m;
 
 // #2056/#2104: isForeignPrefixedPhaseQuery is imported from phase-id.cts
 // (the canonical predicate). parsePhasePrefix is no longer needed locally.
@@ -939,9 +938,14 @@ function cmdInitExecutePhase(
       has_reviews: false,
     };
   });
-  const reqMatch = (roadmapPhase?.['section'] as string | undefined)?.match(REQUIREMENTS_HEADER_RE);
-  const reqExtracted = reqMatch
-    ? reqMatch[1].replace(/[\[\]]/g, '').split(',').map((s) => s.trim()).filter(Boolean).join(', ')
+  // #4731: continuation-aware. A hard-wrapped Requirements line used to yield only
+  // the IDs that fit on the label's own line, and the dropped ones were reported
+  // nowhere — the coverage gate iterates the IDs it is given, so an ID it never saw
+  // cannot be flagged uncovered.
+  const reqLine = roadmapParser.extractPhaseField(
+    (roadmapPhase?.['section'] as string | undefined) ?? '', 'Requirements');
+  const reqExtracted = reqLine
+    ? reqLine.replace(/[\[\]]/g, '').split(',').map((s) => s.trim()).filter(Boolean).join(', ')
     : null;
   const phase_req_ids = reqExtracted && reqExtracted !== 'TBD' ? reqExtracted : null;
 
@@ -1109,9 +1113,14 @@ function cmdInitPlanPhase(
       has_reviews: false,
     };
   });
-  const reqMatch = (roadmapPhase?.['section'] as string | undefined)?.match(REQUIREMENTS_HEADER_RE);
-  const reqExtracted = reqMatch
-    ? reqMatch[1].replace(/[\[\]]/g, '').split(',').map((s) => s.trim()).filter(Boolean).join(', ')
+  // #4731: continuation-aware. A hard-wrapped Requirements line used to yield only
+  // the IDs that fit on the label's own line, and the dropped ones were reported
+  // nowhere — the coverage gate iterates the IDs it is given, so an ID it never saw
+  // cannot be flagged uncovered.
+  const reqLine = roadmapParser.extractPhaseField(
+    (roadmapPhase?.['section'] as string | undefined) ?? '', 'Requirements');
+  const reqExtracted = reqLine
+    ? reqLine.replace(/[\[\]]/g, '').split(',').map((s) => s.trim()).filter(Boolean).join(', ')
     : null;
   const phase_req_ids = reqExtracted && reqExtracted !== 'TBD' ? reqExtracted : null;
 
@@ -2841,8 +2850,9 @@ function cmdInitManager(cwd: string, raw: boolean): void {
       : content.length;
     const section = content.slice(sectionStart, sectionEnd);
 
-    const goalMatch = section.match(/\*\*Goal(?::\*\*|\*\*:)\s*([^\n]+)/i);
-    const goal = goalMatch ? goalMatch[1].trim() : null;
+    // #4731: continuation-aware — a hard-wrapped Goal used to truncate at the
+    // first newline, and nothing reported the loss.
+    const goal = roadmapParser.extractPhaseField(section, 'Goal');
 
     const dependsMatch = section.match(/\*\*Depends on(?::\*\*|\*\*:)\s*([^\n]+)/i);
     const depends_on = dependsMatch ? dependsMatch[1].trim() : null;

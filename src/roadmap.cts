@@ -232,8 +232,9 @@ function searchPhaseInContent(content: string, escapedPhase: string, phaseNum: s
   const section = content.slice(headerIndex, sectionEnd).trim();
 
   // Extract goal if present (supports both **Goal:** and **Goal**: formats)
-  const goalMatch = section.match(/\*\*Goal(?::\*\*|\*\*:)\s*([^\n]+)/i);
-  const goal = goalMatch ? goalMatch[1].trim() : null;
+  // #4731: continuation-aware — a hard-wrapped Goal used to truncate at the first
+  // newline, and nothing reported the loss.
+  const goal = roadmapParserModule.extractPhaseField(section, 'Goal');
 
   // Mode: vertical-MVP slice mode flag. Lowercased + trimmed for canonical
   // comparison; unrecognized values are preserved verbatim for forward-compat.
@@ -509,8 +510,9 @@ function collectAnalyzePhases(
     const sectionEnd = nextHeader ? sectionStart + nextHeader.index! : content.length;
     const section = content.slice(sectionStart, sectionEnd);
 
-    const goalMatch = section.match(/\*\*Goal(?::\*\*|\*\*:)\s*([^\n]+)/i);
-    const goal = goalMatch ? goalMatch[1].trim() : null;
+    // #4731: continuation-aware — a hard-wrapped Goal used to truncate at the
+    // first newline, and nothing reported the loss.
+    const goal = roadmapParserModule.extractPhaseField(section, 'Goal');
 
     const modeMatch = section.match(/\*\*Mode(?::\*\*|\*\*:)\s*([^\n]+)/i);
     const mode = modeMatch ? modeMatch[1].trim().toLowerCase() : null;

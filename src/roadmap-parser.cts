@@ -21,6 +21,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { escapeRegex } from './pattern.cjs';
+import { splitLines } from './text-lines.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import phaseIdModule = require('./phase-id.cjs');
 const {
@@ -2217,7 +2218,93 @@ function currentMilestoneRawRanges(
   return { primary: { start: sectionStart, end: sectionEnd }, details };
 }
 
+/**
+ * Read a `**Field:**` value out of a phase section, folding CONTINUATION LINES
+ * into it (#4731).
+ *
+ * The roadmapper hard-wraps prose at ~85 characters, and the readers replaced here
+ * captured only the label's own line (`([^\n]+)` in roadmap.cts and phase.cts,
+ * `([^\n]*)` in init.cts). A wrapped `**Requirements**:` therefore yielded only the
+ * IDs that fit on line one, and the rest were reported missing nowhere: the
+ * plan-phase coverage gate iterates the IDs it was given, so IDs it never saw
+ * cannot be flagged uncovered, and `phase complete` marked the visible ones
+ * Complete and returned `"warnings": []`.
+ *
+ * The boundaries are deliberately structural, because this value feeds a MUTATION
+ * path — `phase complete` advances every REQ-ID it is handed to Complete, without
+ * re-checking which phase owns it (src/phase.cts). A greedy fold would therefore
+ * turn prose that merely MENTIONS an ID into a completion instruction. Review
+ * round 1 caught exactly that: a following `- Deferred to Phase 2: REQ-99` line
+ * folded in and REQ-99 was advanced. So a value ends at the first of:
+ *
+ *   - a blank line
+ *   - the next `**Field**` heading (this is what `**Plans:**` does)
+ *   - a markdown heading (`###`)
+ *   - a list item (`-`, `*`, `+`, `1.`) — prose continuations are never list items
+ *   - a fence (``` or ~~~)
+ *
+ * The label must start its line. The init readers were `^`-anchored under `/m`,
+ * and an unanchored search lets an inline mention shadow the real field — a Goal
+ * reading "Document **Requirements** handling." would otherwise BECOME the
+ * Requirements value on an entirely single-line roadmap (review round 1).
+ *
+ * Interior text is preserved: only line boundaries fold, via the same
+ * newline-boundary expression Success Criteria uses (roadmap.cts, #2522) rather
+ * than a collapse-all-whitespace one. Collapsing all
+ * whitespace would rewrite a goal containing `a  b` into `a b` — substantive text,
+ * not formatting.
+ *
+ * A label followed by blank lines takes the next non-empty line as its value,
+ * preserving the old Goal readers' `\s*` behaviour, which crossed newlines.
+ *
+ * Returns the folded value as ONE line, so every existing caller keeps the
+ * single-line string it expects, and `null` when the field is absent or empty.
+ */
+function extractPhaseField(section: string, field: string): string | null {
+  if (typeof section !== 'string' || !section) return null;
+  const lines = splitLines(section);
+
+  // Every label spelling this repo's roadmaps contain, anchored to line start:
+  // `**Goal:**`, `**Requirements**:`, `**Requirements** :`, and a bare `**Field**`.
+  const labelRe = new RegExp(
+    `^[ \\t]*\\*\\*${field}[ \\t]*:?[ \\t]*\\*\\*[ \\t]*:?[ \\t]*(.*)$`, 'i');
+  const isFieldHeading = (line: string): boolean =>
+    /^[ \t]*\*\*[^*]+\*\*[ \t]*:?/.test(line) || /^[ \t]*\*\*[^*]+:\*\*/.test(line);
+  const isStructuralBoundary = (line: string): boolean =>
+    isFieldHeading(line)
+    || /^[ \t]*#{1,6}\s/.test(line)
+    || /^[ \t]*(?:[-*+]|\d+[.)])\s/.test(line)
+    || /^[ \t]*(?:```|~~~)/.test(line);
+
+  let labelIdx = -1;
+  let firstLineValue = '';
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = labelRe.exec(lines[i]);
+    if (m) { labelIdx = i; firstLineValue = m[1] ?? ''; break; }
+  }
+  if (labelIdx === -1) return null;
+
+  const collected: string[] = [];
+  if (firstLineValue.trim() !== '') collected.push(firstLineValue);
+
+  for (let i = labelIdx + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.trim() === '') {
+      // Blank BEFORE any value: the old readers skipped it to find the value.
+      // Blank AFTER: the value has ended.
+      if (collected.length === 0) continue;
+      break;
+    }
+    if (isStructuralBoundary(line)) break;
+    collected.push(line);
+  }
+
+  const folded = collected.join('\n').replace(/\s*\n\s*/g, ' ').trim();
+  return folded === '' ? null : folded;
+}
+
 export = {
+  extractPhaseField,
   stripShippedMilestones,
   extractCurrentMilestone,
   extractCurrentMilestoneScoped,
