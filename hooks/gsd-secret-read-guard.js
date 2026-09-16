@@ -86,7 +86,12 @@
 //   on plain commands, without arming the compound-`cd` prompt". Writes to
 //   secret files are out of scope (Write/Edit were never gated). Commands
 //   over 1 MiB are denied outright (`command-too-large`) rather than
-//   scanned partially or waved through.
+//   scanned partially or waved through. (#4639 adds one more, by design: the
+//   value of `--env-file` under a container runtime is exempt, so the
+//   container's own command can print the interpolated environment
+//   (`alpine printenv`, `docker compose config`) — the same exposure class
+//   as the pre-existing volume-mount gap (`-v .env:/s`); the flag's value
+//   itself is a name, never contents.)
 //
 // Triggers on: Read, Grep, Bash tool calls (Kimi: ReadFile, Grep, Shell)
 // Action: BLOCK (decision: 'block', exit 2) — codes secret-read |
@@ -126,6 +131,15 @@ const NON_READING_COMMANDS = new Set([
   'test', '[', '[[', 'ls', 'stat', 'touch', 'rm', 'chmod', 'chown', 'mkdir',
   'basename', 'dirname', 'realpath', 'file', 'echo', 'printf',
 ]);
+
+// #4639: container runtimes take `--env-file <file>` — the runtime opens the
+// file itself, interpolates it into the container environment, and returns
+// nothing to the agent, so the flag's VALUE is a name, never contents. The
+// same category NON_READING_COMMANDS encodes, expressed as a flag value. Only
+// the flag's value under these runtimes is exempt; every other operand in the
+// segment is still checked, so the carve-out cannot launder a read.
+const CONTAINER_RUNTIMES = new Set(['docker', 'docker-compose', 'podman', 'nerdctl']);
+const ENV_FILE_FLAG_RE = /^--env-file(=|$)/;
 
 // Shell interpreters that run a script from `-c`, a file operand, or stdin
 // (heredoc / here-string / piped `echo`|`printf`). `su` is here for its `-c`
@@ -840,7 +854,19 @@ function findSecretRead(command, depth) {
 
     if (NON_READING_COMMANDS.has(base)) continue;
 
+    // #4639: exempt ONLY the value of `--env-file`, and only when the
+    // segment's command word is a container runtime. A bare `--env-file`
+    // consumes the next operand; `--env-file=<value>` is a single word.
+    const envFileExempt = CONTAINER_RUNTIMES.has(base);
+    let skipNext = false;
     for (const w of operands) {
+      if (envFileExempt) {
+        if (skipNext) { skipNext = false; continue; }
+        if (ENV_FILE_FLAG_RE.test(w.text)) {
+          if (!w.text.includes('=')) skipNext = true; // bare flag consumes the next operand
+          continue;
+        }
+      }
       if (namesSecret(normalizeOperand(w.text))) return w.text;
     }
   }
