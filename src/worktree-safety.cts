@@ -908,6 +908,19 @@ const WAVE_CLEANUP_WARNING = Object.freeze({
   SCOPE_OUT_OF_DECLARED: 'scope_out_of_declared',
   /** The scope diff could not be computed, so conformance is unknown. */
   SCOPE_CHECK_UNAVAILABLE: 'scope_check_unavailable',
+  /**
+   * #4415: an entry was merged on the evidence that its checkout was already
+   * gone, rather than on a clean read of a present worktree.
+   *
+   * Emitted because "the harness cleanly removed a finished executor" and
+   * "something else removed this path" are the same signature to this code —
+   * git still registers the path -> branch binding, and `statSync` reports
+   * ENOENT, in both cases. Before this path existed, EVERY anomalous absence
+   * blocked loudly, which gave an operator something to investigate; accepting
+   * the routine case silently would take that signal away from the case that is
+   * not routine. Advisory, never a gate: the entry still merged.
+   */
+  ACCEPTED_ABSENT_WORKTREE: 'accepted_absent_worktree',
 });
 
 interface WaveCleanupWarning {
@@ -915,6 +928,13 @@ interface WaveCleanupWarning {
   branch: string;
   /** The offending path; null when the check itself could not run. */
   path: string | null;
+  /**
+   * #4415: git's own words for why it considers the registration stale — the
+   * text of the porcelain `prunable` line. Present only on
+   * ACCEPTED_ABSENT_WORKTREE, and null when git marked the entry prunable with
+   * no reason (it emits the marker bare in some versions).
+   */
+  detail?: string | null;
 }
 
 /**
@@ -1124,10 +1144,51 @@ function executeWorktreeWaveCleanupPlan(plan: WaveCleanupPlan | null, deps: Work
     }
   };
 
+  // Carries git's `prunable` reason for the most recent acceptance, so the
+  // warning below can quote git rather than paraphrase it. Set only on the
+  // accepting call; callers that reject never read it.
+  let lastAcceptedPrunableReason: string | null = null;
   const absentAndIdentified = (worktreePath: string, branch: string): boolean => {
     const registered = registeredFor(worktreePath);
     if (!registered || registered.branch !== branch) return false;
-    return confirmedGone(worktreePath);
+    if (!confirmedGone(worktreePath)) return false;
+    lastAcceptedPrunableReason = registered.prunable;
+    return true;
+  };
+
+  /**
+   * #4415 (maintainer review round 3): record that an entry took the absent path.
+   *
+   * Two Medium findings close here together. This code cannot distinguish "the
+   * harness cleanly removed a finished executor" from "an operator or an external
+   * process removed this path" — both leave git's registration intact and both
+   * stat ENOENT. Before the absent path existed, every anomalous absence blocked
+   * loudly; accepting the routine case silently would have removed that signal
+   * from the case that is not routine, reporting `merged_removed`/`ok`
+   * indistinguishably from an ordinary merge. The module already carries an
+   * advisory channel for a materially less risky condition (scope conformance) a
+   * few lines below, so withholding one here was inconsistent with its own
+   * pattern.
+   *
+   * It also gives `WorktreeEntry.prunable` its consumer. The field was parsed and
+   * documented as "worth surfacing to an operator" and then never read — dead
+   * weight, and its bare-marker test asserted an outcome driven by other code.
+   * Quoting git's own reason here is what that parsing was for.
+   */
+  const noteAcceptedAbsent = (result: WaveCleanupEntryResult, entry: CleanupManifestEntry): void => {
+    // The parser normalises a bare `prunable` line to the literal 'prunable' so the
+    // field stays truthy either way. That sentinel is the marker echoed back, not a
+    // reason, so it is reported as "no reason given" rather than quoted at an
+    // operator as though git had said something.
+    const reason = lastAcceptedPrunableReason === 'prunable' ? null : lastAcceptedPrunableReason;
+    const warning: WaveCleanupWarning = {
+      code: WAVE_CLEANUP_WARNING.ACCEPTED_ABSENT_WORKTREE,
+      branch: entry.branch,
+      path: entry.worktree_path,
+      detail: reason,
+    };
+    result.warnings.push(warning);
+    allWarnings.push(warning);
   };
 
   // #2852: every per-entry failure site marks the SAME shape — status='blocked',
@@ -1188,6 +1249,7 @@ function executeWorktreeWaveCleanupPlan(plan: WaveCleanupPlan | null, deps: Work
         continue;
       }
       worktreeAbsent = true;
+      noteAcceptedAbsent(result, entry);
     } else if (branchCheck.stdout.trim() !== entry.branch) {
       blockEntry(result, 'branch_mismatch', branchCheck?.stderr || '');
       continue; // #2852: isolate
@@ -1322,6 +1384,7 @@ function executeWorktreeWaveCleanupPlan(plan: WaveCleanupPlan | null, deps: Work
           continue; // #2852: isolate
         }
         worktreeAbsent = true;
+        noteAcceptedAbsent(result, entry);
       }
       if (!worktreeAbsent) {
         // Filter rescued SUMMARY paths out of the porcelain output before deciding dirty.

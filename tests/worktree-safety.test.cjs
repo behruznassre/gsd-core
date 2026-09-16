@@ -2723,10 +2723,41 @@ describe('executeWorktreeWaveCleanupPlan', () => {
       assert.deepEqual(result.pending, []);
     });
 
-    test('a bare `prunable` marker (no reason text) is still read as prunable', () => {
+    test('an entry accepted as absent warns, quoting git\'s own prunable reason', () => {
+      // Maintainer review round 3, both Medium findings. "The harness cleanly removed
+      // a finished executor" and "something else removed this path" are the SAME
+      // signature to this code, so accepting the routine case silently would take the
+      // operator's only signal away from the case that is not routine. Pre-fix, every
+      // anomalous absence blocked loudly.
+      const result = executeWorktreeWaveCleanupPlan(plan([entry]), {
+        statSync: statGone,
+        execGit: absentWorktreeGit(),
+      });
+
+      assert.equal(result.entries[0].status, 'merged_removed', 'the entry still merges — this is advisory, not a gate');
+      assert.equal(result.entries[0].reason, 'ok');
+
+      const warned = result.entries[0].warnings
+        .filter((w) => w.code === WAVE_CLEANUP_WARNING.ACCEPTED_ABSENT_WORKTREE);
+      assert.equal(warned.length, 1, `expected exactly one accepted-absent warning: ${JSON.stringify(result.entries[0].warnings)}`);
+      assert.equal(warned[0].branch, BR);
+      assert.equal(warned[0].path, WT);
+      assert.equal(
+        warned[0].detail, 'gitdir file points to non-existent location',
+        'the warning must quote git\'s own prunable reason, not paraphrase it',
+      );
+      assert.ok(
+        result.warnings.some((w) => w.code === WAVE_CLEANUP_WARNING.ACCEPTED_ABSENT_WORKTREE),
+        'and it must reach the wave-level warnings too, as the scope advisory does',
+      );
+    });
+
+    test('a bare `prunable` marker (no reason text) is accepted, and its detail is null', () => {
       // git emits `prunable` bare in some versions and `prunable <reason>` in others.
-      // Coverage gap noted in Codex review round 4; the parser normalises both, and a
-      // bare marker must not read as "not prunable".
+      // An earlier cut of this row asserted only `merged_removed`, which is driven by
+      // confirmedGone and the branch match — NOT by the bare-marker parsing it claimed
+      // to cover, so a regression in that parsing would not have reddened it
+      // (maintainer review round 3). Asserting the parsed value closes that.
       const bare = 'worktree /repo/main\nHEAD deadbeef\nbranch refs/heads/main\n'
         + `\nworktree ${WT}\nHEAD deadbeef\nbranch refs/heads/${BR}\nprunable\n`;
       const result = executeWorktreeWaveCleanupPlan(plan([entry]), {
@@ -2736,6 +2767,14 @@ describe('executeWorktreeWaveCleanupPlan', () => {
 
       assert.equal(result.entries[0].status, 'merged_removed');
       assert.equal(result.entries[0].reason, 'ok');
+
+      const warned = result.entries[0].warnings
+        .filter((w) => w.code === WAVE_CLEANUP_WARNING.ACCEPTED_ABSENT_WORKTREE);
+      assert.equal(warned.length, 1, 'a bare marker is still an acceptance, so it still warns');
+      assert.equal(
+        warned[0].detail, null,
+        `a bare marker carries no reason, so detail is null rather than the literal "prunable": ${JSON.stringify(warned[0])}`,
+      );
     });
 
     test('a worktree list that cannot be read blocks rather than guessing', () => {
@@ -8210,9 +8249,16 @@ describe('#2596 scope conformance — executeWorktreeWaveCleanupPlan integration
   });
 
   test('WAVE_CLEANUP_WARNING is a frozen, locked code set', () => {
+    // The lock is the point: a new advisory code is a deliberate addition to a
+    // published contract, not something that appears because a branch needed one.
+    // ACCEPTED_ABSENT_WORKTREE is added here consciously (#4415, maintainer review
+    // round 3) — an entry merged on the evidence that its checkout was already gone
+    // reported `merged_removed`/`ok` indistinguishably from an ordinary merge, which
+    // removed the operator's only signal for the case where something OTHER than the
+    // harness removed the path.
     assert.deepEqual(
       Object.keys(WAVE_CLEANUP_WARNING).sort(),
-      ['SCOPE_CHECK_UNAVAILABLE', 'SCOPE_OUT_OF_DECLARED'],
+      ['ACCEPTED_ABSENT_WORKTREE', 'SCOPE_CHECK_UNAVAILABLE', 'SCOPE_OUT_OF_DECLARED'],
     );
     assert.equal(Object.isFrozen(WAVE_CLEANUP_WARNING), true);
   });
