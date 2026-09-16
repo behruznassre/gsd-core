@@ -385,12 +385,14 @@ fi
 # Zero-applicable guard: a report where NO category applied across ANY element is far more likely a
 # classification miss (or malformed elements) than a genuinely state-free UI. Surface it loudly.
 APPLICABLE=$(printf '%s' "$COVERAGE" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let n=0;try{n=JSON.parse(s).coverage.applicable}catch{n=0}process.stdout.write(String(n))})')
-if [ "$APPLICABLE" = "0" ]; then
+UNCLASSIFIED=$(printf '%s' "$COVERAGE" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let n=0;try{n=JSON.parse(s).coverage.unclassified}catch{n=0}process.stdout.write(String(n))})')
+# #4656: all-unclassified reads as a non-zero applicable — widen the guard to fire there too.
+if [ "$APPLICABLE" = "0" ] || [ "$UNCLASSIFIED" = "$APPLICABLE" ]; then
   echo "WARNING: ui-consideration-probe proposed ZERO applicable categories across all elements — likely a classification miss or malformed elements, not a genuinely state-free UI. Do NOT silently write an empty UI Considerations section." >&2
 fi
 ```
 
-If `$APPLICABLE` is `0`, do NOT proceed silently: ask via AskUserQuestion ("The UI probe found no
+If the guard above fired (`$APPLICABLE` is `0`, or every element is unclassified — `$UNCLASSIFIED = $APPLICABLE`, #4656), do NOT proceed silently: ask via AskUserQuestion ("The UI probe found no
 applicable state considerations — is this genuinely a state-free surface, or should we revisit the
 element descriptions?"). Only write an empty section after explicit confirmation.
 
