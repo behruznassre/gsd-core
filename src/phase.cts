@@ -3896,16 +3896,22 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
           );
 
           const sectionText = phaseSectionMatch ? phaseSectionMatch[1] : '';
-          const reqMatch = sectionText.match(
-            /\*\*Requirements:?\*\*[^\S\n]*:?[^\S\n]*([^\n]+)/i,
-          );
+          // #4731: multiline-aware — hard-wrapped Requirements read past the
+          // line break before the ID scan. The shared extractor also stops at
+          // headings and table rows, so a Requirements field followed by the
+          // Traceability table cannot bleed other phases' REQ-IDs into the
+          // citation scan (isolated-review MEDIUM on the inline lookahead,
+          // whose lazy capture swallowed everything to section end).
+          const reqLine = sectionText
+            ? roadmapParserMod.extractPhaseFieldMultiline(sectionText, 'Requirements')
+            : null;
 
           const originalReqContent = fs.readFileSync(reqPath, 'utf-8');
           let reqContent = originalReqContent;
 
           // #2316: `citedReqIds` — the REQ-IDs ROADMAP's own **Requirements:**
           // line for this phase actually cites — is hoisted out of the
-          // `if (reqMatch)` block (previously scoped only inside it) so the
+          // `if (reqLine)` block (previously scoped only inside it) so the
           // ghost-ID cross-check below (~#2316-1) can consult it. `TBD` is the
           // literal placeholder `phase.add`/`-batch`/`-insert` seed
           // (`**Requirements**: TBD`, src/phase.cts:833,920,1078) — never a
@@ -3918,18 +3924,18 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
           // `else`, discarding this fact silently instead of surfacing it.
           const traceabilityWriteMisses: string[] = [];
 
-          if (reqMatch) {
+          if (reqLine) {
             // #2334 HIGH 3 + #3697: selection and under-selection detection both
             // live in `analyzeRequirementsLine` (module scope, above), extracted in
             // round 3 so the parser is directly testable — a closure in here is
             // reachable only by spawning the CLI, which no fast-check property test
             // can do. `citedReqIds` is byte-identical to the expression that stood
             // here; nothing about what phase-complete MARKS has changed.
-            const reqLineAnalysis = analyzeRequirementsLine(reqMatch[1]);
+            const reqLineAnalysis = analyzeRequirementsLine(reqLine);
             citedReqIds = reqLineAnalysis.citedReqIds;
             const reqLineWarning = formatRequirementsLineWarning(
               phaseNum,
-              reqMatch[1],
+              reqLine,
               reqLineAnalysis,
             );
             if (reqLineWarning) {
@@ -4237,6 +4243,37 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
       let roadmapNextNum: string | null = null;
       let roadmapNextName: string | null = null;
 
+      // #4699: a phase whose roadmap checkbox is `[x]` is already complete and
+      // must never be selected as next_phase — out-of-order completion (a
+      // reopened phase finished after later phases shipped) otherwise persists
+      // the already-done phase as STATE.md current_phase. Collected from the
+      // same milestone-scoped text the roadmap scan walks; membership is
+      // comparePhaseNum-based so `02` and `2` dedupe. With no ROADMAP.md (or no
+      // parseable rows) the set is empty and the scans behave exactly as
+      // before.
+      const roadmapCompleteNums: string[] = [];
+      if (roadmapContent !== null) {
+        try {
+          const milestoneForComplete = extractCurrentMilestone(roadmapContent, cwd);
+          const completePattern = new RegExp(
+            `-\\s*\\[[xX]\\]\\s*(?:\\*\\*|__)?\\s*Phase\\s+(${PHASE_NUMBER_TOKEN_SOURCE})`,
+            'gi'
+          );
+          let cm: RegExpExecArray | null;
+          while ((cm = completePattern.exec(milestoneForComplete)) !== null) {
+            if (isSentinelPhaseId(cm[1])) continue;
+            if (!roadmapCompleteNums.some((n) => comparePhaseNum(cm![1], n) === 0)) {
+              roadmapCompleteNums.push(cm[1]);
+            }
+          }
+        } catch {
+          /* best-effort: an unreadable milestone section leaves the complete
+           * set empty — the scans then behave exactly as they did pre-#4699. */
+        }
+      }
+      const isCompletePhaseNum = (num: string): boolean =>
+        roadmapCompleteNums.some((n) => comparePhaseNum(num, n) === 0);
+
       try {
         // #3185 (ADR-3180 Decision 1): "which phase directories belong to
         // the CURRENT milestone" — routed through the canonical owner
@@ -4252,6 +4289,9 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
           if (dm) {
             // #3185: canonical sentinel predicate (SENTINEL_RANGES [0,999]) — this was a local 999-only literal that admitted Phase 0.
             if (isSentinelPhaseId(dm[1])) continue;
+            // #4699: an already-complete phase (roadmap checkbox [x]) is never
+            // a next_phase candidate — out-of-order completion must skip it.
+            if (roadmapContent !== null && isCompletePhaseNum(dm[1])) continue;
             // Numeric MINIMUM above N, not "first encountered". `listMilestonePhaseDirs`
             // does sort by `comparePhaseNum`, so a `break` on the first hit happens to be
             // correct today — but that makes this scan's correctness depend on an
@@ -4321,6 +4361,10 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
             // already skips sentinel dirs on disk via isSentinelPhaseId (#3185);
             // stage 2's heading scan must not advance into backlog headings either.
             if (isSentinelPhaseId(pmNum)) continue;
+            // #4699: skip complete phases — a `[x]` checkbox row and the
+            // `## Phase Details` heading of an already-done phase both name a
+            // phase that must never be next_phase.
+            if (roadmapContent !== null && isCompletePhaseNum(pmNum)) continue;
             // #3701 review: the numeric MINIMUM above N, not the first row above N in
             // DOCUMENT order. This scan walks raw roadmap text, and one global regex
             // sweeps both the `## Phases` checklist and the `## Phase Details`
@@ -4693,7 +4737,7 @@ function cmdPhaseUatPassed(
   cwd: string,
   phaseNum: string | undefined,
   raw: boolean,
-  opts: { policy?: { requireVerification?: boolean } } = {},
+  opts: { policy?: { requireVerification?: boolean; uatOnly?: boolean } } = {},
 ): void {
   if (!phaseNum) {
     error('phase number required for phase uat-passed');

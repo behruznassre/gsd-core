@@ -5275,3 +5275,262 @@ describe('#4040 partial-init completeness fields', () => {
       'new-project gate must resume a partial bootstrap instead of erroring');
   });
 });
+
+// ── #4731 — hard-wrapped Goal/Requirements fields read past the line break ───
+// The roadmapper soft-wraps long fields at ~85 chars; the five single-line
+// field regexes truncated every wrapped Goal/Requirements at the first line:
+// plan-phase's phase_req_ids silently dropped the IDs on continuation lines
+// (silently escaping the Requirements Coverage Gate) and get-phase/analyze
+// cut the goal mid-sentence.
+describe('init plan-phase — wrapped Goal/Requirements fields (#4731)', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTempDir('gsd-4731-');
+    fs.mkdirSync(path.join(tmpDir, '.planning'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), '# State\n');
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'REQUIREMENTS.md'),
+      ['# Requirements', '', '- [ ] **REQ-01**: thing', '- [ ] **REQ-11**: thing'].join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      [
+        '# Roadmap',
+        '',
+        '## Phases',
+        '',
+        '- [ ] **Phase 1: Demo** - Goal',
+        '',
+        '## Phase Details',
+        '',
+        '### Phase 1: Demo',
+        '',
+        '**Goal:** Deliver a small demo feature that exercises the planning pipeline end to end with a',
+        'goal sentence long enough to wrap onto a second line',
+        '**Requirements**: REQ-01, REQ-02, REQ-03, REQ-04, REQ-05, REQ-06, REQ-07, REQ-08, REQ-09,',
+        'REQ-10, REQ-11',
+        '**Plans**: 1 plans',
+        '',
+      ].join('\n'),
+    );
+    const phaseDir = path.join(tmpDir, '.planning', 'phases', '01-demo');
+    fs.mkdirSync(phaseDir, { recursive: true });
+    fs.writeFileSync(path.join(phaseDir, '01-01-PLAN.md'), '---\nphase: 01-demo\nplan: 01\n---\n# Plan');
+    fs.writeFileSync(path.join(phaseDir, '01-01-SUMMARY.md'), '---\nphase: 01-demo\nplan: 01\n---\n# Summary');
+  });
+
+  afterEach(() => cleanup(tmpDir));
+
+  test('wrapped Requirements yield all eleven IDs (#4731)', () => {
+    const result = runGsdTools('init plan-phase 1 --pick phase_req_ids', tmpDir);
+    assert.equal(
+      result.output.trim(),
+      'REQ-01, REQ-02, REQ-03, REQ-04, REQ-05, REQ-06, REQ-07, REQ-08, REQ-09, REQ-10, REQ-11',
+      'continuation-line REQ-10/REQ-11 must not be silently dropped',
+    );
+  });
+
+  test('wrapped Goal is returned in full (#4731)', () => {
+    const result = runGsdTools('query roadmap.get-phase 1 --pick goal', tmpDir);
+    assert.equal(
+      result.output.trim(),
+      'Deliver a small demo feature that exercises the planning pipeline end to end with a goal sentence long enough to wrap onto a second line',
+      'the goal must read past the hard wrap',
+    );
+  });
+});
+
+// ── #4683 — gap-closure plans reused threat IDs that earlier plans in the ────
+// same phase had already assigned to different threats. Nothing detected it:
+// SECURITY.md rows and VALIDATION.md's Threat Ref column key on the ID, so a
+// reused ID makes every downstream consumer ambiguous. The init payloads now
+// carry the cross-plan duplicate list (T-{phase}-NN shapes; the reserved
+// T-{phase}-SC supply-chain row is deliberately shared and never flagged), and
+// execute-phase.md hard-stops on a non-empty list before any dispatch.
+describe('#4683 — cross-plan threat-ID duplicate detection', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.realpathSync(createFixture());
+  });
+  afterEach(() => cleanup(tmpDir));
+
+  function threatPlan({ ids, gapClosure = false, superseded = false, withSc = true }) {
+    const rows = ids.map((id) => `| ${id} | Tampering | component | medium | mitigate | fix it |`);
+    return [
+      ...(superseded ? ['---', 'status: superseded', '---', ''] : []),
+      '# Plan',
+      '',
+      ...(gapClosure ? ['gap_closure: true', ''] : []),
+      '<threat_model>',
+      '| Threat ID | Category | Component | Severity | Disposition | Mitigation |',
+      '|-----------|----------|-----------|----------|-------------|------------|',
+      ...(withSc ? ['| T-47-SC | Tampering | npm installs | high | mitigate | legitimacy gate |'] : []),
+      ...rows,
+      '</threat_model>',
+      '',
+    ].join('\n');
+  }
+
+  test('init execute-phase reports threat IDs reused across plans (#4683)', () => {
+    seedPhase(tmpDir, '47-security', {
+      // Earlier plans own T-47-01..09 / 10..14 / 15..19.
+      '47-03-PLAN.md': threatPlan({ ids: ['T-47-01', 'T-47-02', 'T-47-03'] }),
+      '47-04-PLAN.md': threatPlan({ ids: ['T-47-10', 'T-47-11', 'T-47-15'] }),
+      '47-05-PLAN.md': threatPlan({ ids: ['T-47-19'] }),
+      // Gap-closure plans renumber from 01 again — the bug: every ID below is
+      // already claimed by an earlier plan for a DIFFERENT threat.
+      '47-06-PLAN.md': threatPlan({ ids: ['T-47-10', 'T-47-11', 'T-47-19'], gapClosure: true }),
+      '47-07-PLAN.md': threatPlan({ ids: ['T-47-15'], gapClosure: true }),
+    });
+    writePlanningDocs(tmpDir);
+
+    const result = runGsdTools('init execute-phase 47', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+
+    const duplicates = output.threat_id_duplicates;
+    assert.ok(Array.isArray(duplicates), 'threat_id_duplicates must be an array');
+    const byId = Object.fromEntries(duplicates.map((d) => [d.id, d.plans]));
+    for (const id of ['T-47-10', 'T-47-11', 'T-47-15', 'T-47-19']) {
+      assert.ok(byId[id], `reused ID ${id} must be reported, got: ${JSON.stringify(duplicates)}`);
+      assert.ok(byId[id].length >= 2, `${id} must name at least the two plans claiming it`);
+    }
+    assert.strictEqual(byId['T-47-15'][0], '47-04-PLAN.md');
+    assert.strictEqual(byId['T-47-15'][1], '47-07-PLAN.md');
+    // Only genuinely reused IDs — the unique ones stay out.
+    assert.ok(!byId['T-47-01'] && !byId['T-47-02'] && !byId['T-47-03'], 'uniquely-claimed IDs must not be reported');
+    assert.strictEqual(output.threat_id_duplicate_count, 4,
+      `count must match the duplicate list, got ${output.threat_id_duplicate_count} for ${JSON.stringify(duplicates)}`);
+    // The reserved supply-chain ID is shared BY DESIGN (every plan keeps it).
+    assert.ok(!byId['T-47-SC'], 'T-47-SC is reserved and deliberately shared — never a duplicate');
+  });
+
+  test('init execute-phase reports no duplicates for unique registers (#4683)', () => {
+    seedPhase(tmpDir, '47-security', {
+      '47-03-PLAN.md': threatPlan({ ids: ['T-47-01', 'T-47-02'] }),
+      '47-04-PLAN.md': threatPlan({ ids: ['T-47-03', 'T-47-04'] }),
+    });
+    writePlanningDocs(tmpDir);
+
+    const result = runGsdTools('init execute-phase 47', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    assert.deepEqual(output.threat_id_duplicates, []);
+    assert.strictEqual(output.threat_id_duplicate_count, 0);
+  });
+
+  test('superseded plans do not hold threat IDs against their replacements (#4683)', () => {
+    seedPhase(tmpDir, '47-security', {
+      // Deliberately retired: its IDs moved to the replacing plan.
+      '47-03-PLAN.md': threatPlan({ ids: ['T-47-01'], superseded: true }),
+      '47-05-PLAN.md': threatPlan({ ids: ['T-47-01'] }),
+    });
+    writePlanningDocs(tmpDir);
+
+    const result = runGsdTools('init execute-phase 47', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    assert.deepEqual(output.threat_id_duplicates, [],
+      'a superseded plan\'s IDs were deliberately reassigned — not a collision');
+    assert.strictEqual(output.threat_id_duplicate_count, 0);
+  });
+
+  test('init plan-phase surfaces the same duplicate list (#4683)', () => {
+    seedPhase(tmpDir, '47-security', {
+      '47-03-PLAN.md': threatPlan({ ids: ['T-47-01'] }),
+      '47-04-PLAN.md': threatPlan({ ids: ['T-47-01'] }),
+    });
+    writePlanningDocs(tmpDir);
+
+    const result = runGsdTools('init plan-phase 47', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    assert.strictEqual(output.threat_id_duplicate_count, 1);
+    assert.deepEqual(output.threat_id_duplicates, [{ id: 'T-47-01', plans: ['47-03-PLAN.md', '47-04-PLAN.md'] }]);
+  });
+
+  test('IDs outside a <threat_model> block never count (#4683)', () => {
+    seedPhase(tmpDir, '47-security', {
+      '47-03-PLAN.md': '# Plan\n\nSee T-47-01 in SECURITY.md. | T-47-02 | not a register |\n',
+      '47-04-PLAN.md': '# Plan\n\nSee T-47-01 again.\n',
+    });
+    writePlanningDocs(tmpDir);
+
+    const result = runGsdTools('init execute-phase 47', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    assert.deepEqual(output.threat_id_duplicates, [],
+      'prose mentions of an ID are not register rows — only <threat_model> tables count');
+    assert.strictEqual(output.threat_id_duplicate_count, 0);
+  });
+});
+
+// ── #4683 review repairs ─────────────────────────────────────────────────────
+describe('#4683 review repairs — fence blindness and deterministic ordering', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.realpathSync(createFixture());
+  });
+  afterEach(() => cleanup(tmpDir));
+
+  test('a register QUOTED inside a code fence is not a claim (#4683 review MAJOR)', () => {
+    seedPhase(tmpDir, '47-security', {
+      '47-03-PLAN.md': [
+        '# Plan', '',
+        '<threat_model>',
+        '| T-47-01 | Tampering | component | high | mitigate | fix |',
+        '</threat_model>', '',
+        'The register we are extending (quoted verbatim):', '',
+        '```markdown',
+        '<threat_model>',
+        '| Threat ID | Category | Component | Severity | Disposition | Mitigation |',
+        '|-----------|----------|-----------|----------|-------------|------------|',
+        '| T-47-01 | Tampering | component | high | mitigate | fix |',
+        '</threat_model>',
+        '```', '',
+      ].join('\n'),
+      '47-04-PLAN.md': [
+        '# Plan', '',
+        '<threat_model>',
+        '| T-47-02 | Repudiation | component | low | accept | rationale |',
+        '</threat_model>', '',
+        'Reference copy of phase 47-03\'s register:', '',
+        '~~~',
+        '<threat_model>',
+        '| T-47-01 | Tampering | component | high | mitigate | fix |',
+        '</threat_model>',
+        '~~~', '',
+      ].join('\n'),
+    });
+    writePlanningDocs(tmpDir);
+
+    const result = runGsdTools('init execute-phase 47', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    assert.deepEqual(output.threat_id_duplicates, [],
+      'quoted registers live in fenced code blocks — prose, not claims; only live blocks count');
+    assert.strictEqual(output.threat_id_duplicate_count, 0);
+  });
+
+  test('duplicate entries list claiming plans in deterministic sorted order (#4683 review MINOR)', () => {
+    seedPhase(tmpDir, '47-security', {
+      '47-07-PLAN.md': [
+        '# Plan', '', '<threat_model>', '| T-47-15 | DoS | component | medium | mitigate | fix |', '</threat_model>', '',
+      ].join('\n'),
+      '47-04-PLAN.md': [
+        '# Plan', '', '<threat_model>', '| T-47-15 | Repudiation | component | high | mitigate | fix |', '</threat_model>', '',
+      ].join('\n'),
+    });
+    writePlanningDocs(tmpDir);
+
+    const result = runGsdTools('init execute-phase 47', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+    const output = JSON.parse(result.output);
+    assert.deepEqual(output.threat_id_duplicates, [
+      { id: 'T-47-15', plans: ['47-04-PLAN.md', '47-07-PLAN.md'] },
+    ], 'claiming-plan lists must be sorted, never readdir order');
+  });
+});
