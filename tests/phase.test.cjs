@@ -4367,7 +4367,7 @@ describe('phase complete canonical verification gate (#1522)', () => {
     // runtime's installed surface. This project has no runtime configured, so it
     // takes the `claude` default — the canonical `/gsd-` hyphen form. The colon
     // form this previously asserted is the deprecated shape #2617 removed.
-    assert.match(errorPayload.message, /\/gsd-verify-work 0?1/);
+    assert.match(errorPayload.message, /\/gsd-execute-phase 0?1/);
     assert.equal(fs.readFileSync(roadmapPath, 'utf-8'), beforeRoadmap);
     assert.equal(fs.readFileSync(statePath, 'utf-8'), beforeState);
   });
@@ -12385,6 +12385,140 @@ describe('issue #2334: ghost-REQ-ID classification must probe write surfaces, no
   );
 });
 
+// ── #4731 review follow-up — the phase-complete citation scan must stop at the ─
+// section's own table. The inline lookahead the first cut used stopped only at
+// the next `**Bold**` label or end-of-section, so a Requirements field followed
+// by a table bled every ID-shaped cell after it into the citation scan — and
+// phase complete then ticked other phases' checkboxes and flipped their
+// Traceability rows. The shared extractor stops at headings, table rows, and
+// blank lines; these pins hold that boundary.
+describe('#4731 review follow-up: Requirements citation scan stops at the section table', () => {
+  function build4731TableBleedFixture() {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-4731-table-bleed-'));
+    const planDir = path.join(tmpDir, '.planning');
+    const phase1Dir = path.join(planDir, 'phases', '01-preset');
+    const phase2Dir = path.join(planDir, 'phases', '02-next');
+    fs.mkdirSync(phase1Dir, { recursive: true });
+    fs.mkdirSync(phase2Dir, { recursive: true });
+
+    // REQ-99 belongs to phase 02 — it sits in phase 01's deliverables table and
+    // is still Pending in REQUIREMENTS.md. Phase 01's own IDs are hard-wrapped
+    // across three lines (the #4731 shape).
+    fs.writeFileSync(path.join(planDir, 'REQUIREMENTS.md'), [
+      '# Requirements',
+      '',
+      '## Active',
+      '',
+      '- [ ] **REQ-11**: first wrapped requirement',
+      '- [ ] **REQ-12**: second wrapped requirement',
+      '- [ ] **REQ-13**: third wrapped requirement',
+      '- [ ] **REQ-99**: phase 02 requirement, still pending',
+      '',
+      '## Traceability',
+      '',
+      '| Requirement | Phase | Status |',
+      '|-------------|-------|--------|',
+      '| REQ-11 | Phase 1 | Pending |',
+      '| REQ-12 | Phase 1 | Pending |',
+      '| REQ-13 | Phase 1 | Pending |',
+      '| REQ-99 | Phase 2 | Pending |',
+      '',
+    ].join('\n'));
+
+    fs.writeFileSync(path.join(planDir, 'ROADMAP.md'), [
+      '# Roadmap',
+      '',
+      '- [ ] Phase 01: Preset',
+      '- [ ] Phase 02: Next',
+      '',
+      '### Phase 01: Preset',
+      '**Goal:** Build preset',
+      '**Requirements**: REQ-11,',
+      'REQ-12,',
+      'REQ-13',
+      '',
+      '| Deliverable | Requirement |',
+      '|-------------|-------------|',
+      '| Widget | REQ-99 |',
+      '',
+      '**Plans:** 1 plans',
+      '',
+      '### Phase 02: Next',
+      '**Goal:** whatever',
+      '**Requirements:** REQ-99',
+      '**Plans:** 1 plans',
+      '',
+      '## Progress',
+      '',
+      '| Phase | Plans Complete | Status | Completed |',
+      '|-------|----------------|--------|-----------|',
+      '| 01. Preset | 0/1 | Not started | - |',
+      '| 02. Next | 0/1 | Not started | - |',
+      '',
+    ].join('\n'));
+
+    fs.writeFileSync(path.join(planDir, 'STATE.md'), [
+      '---', 'milestone: v1.3', '---',
+      '# State',
+      '',
+      '**Current Phase:** 01',
+      '**Completed Phases:** 0',
+      '**Total Phases:** 2',
+      '**Progress:** 0%',
+      '',
+    ].join('\n'));
+
+    for (const [dir, n] of [[phase1Dir, '01'], [phase2Dir, '02']]) {
+      fs.writeFileSync(path.join(dir, `${n}-01-PLAN.md`), '# Plan\nDo the work.\n');
+      fs.writeFileSync(path.join(dir, `${n}-01-SUMMARY.md`), '# Summary\nDone.\n');
+    }
+
+    return tmpDir;
+  }
+
+  test(
+    '#4731-followup: a wrapped Requirements field followed by a table cites ONLY the wrapped IDs — the table\'s REQ-99 stays Pending',
+    () => {
+      const tmpDir = build4731TableBleedFixture();
+      try {
+        const { output } = runVerifiedPhaseComplete(['phase', 'complete', '1'], tmpDir);
+        const parsed = JSON.parse(output);
+        const warnings = parsed.warnings || [];
+        const reqContent = fs.readFileSync(path.join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+        for (const id of ['REQ-11', 'REQ-12', 'REQ-13']) {
+          assert.ok(
+            new RegExp(`-\\s*\\[x\\]\\s*\\*\\*${id}\\*\\*`, 'i').test(reqContent),
+            `#4731-followup FAILED (fixture invariant): ${id} is cited by the wrapped Requirements field and must be ticked.\n${reqContent}`,
+          );
+        }
+        // The discriminator: REQ-99 appears AFTER the field (in the section's
+        // deliverables table) — the scan must have stopped at the table.
+        assert.ok(
+          /-\s*\[\s\]\s*\*\*REQ-99\*\*/i.test(reqContent),
+          `#4731-followup FAILED: REQ-99 lives in the table AFTER the Requirements field (it belongs to phase 02) ` +
+          `and must NOT have been ticked by phase 01's completion scan.\n${reqContent}`,
+        );
+        const req99Row = reqContent.split(/\r?\n/)
+          .filter((l) => l.trim().startsWith('|'))
+          .map((l) => splitTableRow(l))
+          .find((cells) => cells[0] && cells[0].trim().toLowerCase() === 'req-99');
+        assert.ok(
+          req99Row && /^Pending$/i.test(req99Row[req99Row.length - 1].trim()),
+          `#4731-followup FAILED: REQ-99's Traceability row must stay Pending — the citation scan bled into the table.\n${reqContent}`,
+        );
+        assert.ok(
+          !warnings.some((w) => /not registered anywhere/i.test(w) && /REQ-99/i.test(w)),
+          `#4731-followup FAILED: REQ-99 must not surface as a ghost — it is registered; the scan just must not reach it, ` +
+          `got: ${JSON.stringify(warnings)}`,
+        );
+        assert.strictEqual(parsed.requirements_updated, true, "#4731-followup FAILED (fixture invariant): the phase's own IDs must have been written");
+      } finally {
+        cleanup(tmpDir);
+      }
+    },
+  );
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Regressions: issue #3697 — the `**Requirements**:` tokenizer UNDER-selects
 // silently. #2339 fixed OVER-selection (the shape filter) and added the
@@ -15810,5 +15944,142 @@ describe('bug #3982: archived details leak into lowest-outstanding scan', () => 
     const state = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8');
     assert.ok(!/current_phase:\s*10(\s|$)/m.test(state),
       `STATE.md current_phase must not jump backwards into the archived range; got: ${state}`);
+  });
+});
+
+// ── #4699 — next_phase must skip phases whose roadmap checkbox is [x] ────────
+// Out-of-order completion (a reopened phase finished after later phases
+// shipped) used to persist the already-complete phase as next_phase /
+// STATE.md current_phase: both next-phase scans select the numerically lowest
+// phase above N without consulting completion state. Roadmap checkbox state
+// is the completion rule (#2028) — an [x] phase is never "next".
+
+describe('phase complete skips already-complete phases as next_phase (#4699)', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTempProject('gsd-4699-');
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  function writeRoadmap({ thirdBox = '[x]', fourthBox = '[ ]' } = {}) {
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      `# Roadmap
+
+## Phases
+
+- [x] **Phase 1: One** - Goal one
+- [ ] **Phase 2: Two** - Goal two
+- ${thirdBox} **Phase 3: Three** - Goal three
+- ${fourthBox} **Phase 4: Four** - Goal four
+
+### Phase 1: One
+**Goal**: Goal one
+
+### Phase 2: Two
+**Goal**: Goal two
+
+### Phase 3: Three
+**Goal**: Goal three
+
+### Phase 4: Four
+**Goal**: Goal four
+`,
+    );
+  }
+
+  function scaffoldPhaseDir(n, slug) {
+    const padded = String(n).padStart(2, '0');
+    const dir = path.join(tmpDir, '.planning', 'phases', `${padded}-${slug}`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${padded}-01-PLAN.md`), '# Plan');
+    fs.writeFileSync(path.join(dir, `${padded}-01-SUMMARY.md`), '# Summary');
+    fs.writeFileSync(
+      path.join(dir, `${padded}-VERIFICATION.md`),
+      ['---', 'status: passed', '---', '', '# Verification', ''].join('\n'),
+    );
+  }
+
+  function writeMinimalState() {
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'STATE.md'),
+      '# State\n\n**Current Phase:** 2\n**Status:** In progress\n',
+    );
+  }
+
+  test('completing phase 2 out of order skips the already-complete phase 3 (#4699)', () => {
+    writeRoadmap();
+    writeMinimalState();
+    scaffoldPhaseDir(1, 'one');
+    scaffoldPhaseDir(2, 'two');
+    scaffoldPhaseDir(3, 'three');
+
+    const result = runGsdTools('phase complete 2', tmpDir);
+    const output = JSON.parse(result.output);
+    assert.equal(output.next_phase, '4',
+      'next_phase must skip the already-[x] phase 3 and select the outstanding phase 4');
+    assert.equal(output.is_last_phase, false);
+    // #4699's actual harm was persistence: STATE.md used to carry the
+    // already-complete phase as current_phase.
+    const state = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8');
+    assert.doesNotMatch(state, /current_phase:\s*3(\s|$)/m,
+      'STATE.md must not carry the already-complete phase as current_phase');
+  });
+
+  test('all later phases already [x] completes the milestone tail (#4699 corner)', () => {
+    writeRoadmap({ fourthBox: '[x]' });
+    writeMinimalState();
+    scaffoldPhaseDir(1, 'one');
+    scaffoldPhaseDir(2, 'two');
+    scaffoldPhaseDir(3, 'three');
+
+    const result = runGsdTools('phase complete 2', tmpDir);
+    const output = JSON.parse(result.output);
+    assert.equal(output.is_last_phase, true,
+      'when every phase above N is already [x], completing N is the milestone tail');
+    assert.equal(output.next_phase, null);
+  });
+
+  test('uppercase [X] checkboxes are recognized as complete (#4699)', () => {
+    writeRoadmap({ thirdBox: '[X]' });
+    writeMinimalState();
+    scaffoldPhaseDir(1, 'one');
+    scaffoldPhaseDir(2, 'two');
+    scaffoldPhaseDir(3, 'three');
+
+    const result = runGsdTools('phase complete 2', tmpDir);
+    const output = JSON.parse(result.output);
+    assert.equal(output.next_phase, '4', '[X] is a complete checkbox, case-insensitively');
+  });
+
+  test('checkbox completion matches phase numbers across zero-padding (#4699)', () => {
+    // Roadmap spells the phase without padding; the directory carries the
+    // zero-padded token — comparePhaseNum must dedupe them in the complete set.
+    writeRoadmap({ thirdBox: '[x]' });
+    writeMinimalState();
+    scaffoldPhaseDir(1, 'one');
+    scaffoldPhaseDir(2, 'two');
+    scaffoldPhaseDir(3, 'three');
+
+    const result = runGsdTools('phase complete 2', tmpDir);
+    const output = JSON.parse(result.output);
+    assert.equal(output.next_phase, '4');
+  });
+
+  test('an outstanding phase 3 (unchecked) is still selected — negative control (#4699)', () => {
+    writeRoadmap({ thirdBox: '[ ]' });
+    writeMinimalState();
+    scaffoldPhaseDir(1, 'one');
+    scaffoldPhaseDir(2, 'two');
+    scaffoldPhaseDir(3, 'three');
+
+    const result = runGsdTools('phase complete 2', tmpDir);
+    const output = JSON.parse(result.output);
+    assert.equal(output.next_phase, '03',
+      'without the fix scope change: an unchecked phase 3 stays a valid candidate (disk spelling wins)');
   });
 });

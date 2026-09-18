@@ -183,18 +183,31 @@ instrument — the executor's own narration is never the last word. For each `*-
 BASE=$(grep -oE '^plan_head_before: [0-9a-f]{7,40}' "$SUMMARY_FILE" | awk '{print $2}')
 CLAIMED=$(grep -oE '^commits: [0-9]+' "$SUMMARY_FILE" | grep -oE '[0-9]+' || echo absent)
 ACTUAL=$(git rev-list --count "${BASE}"..HEAD)
+AFTER=$(grep -oE '^plan_head_after: [0-9a-f]{7,40}' "$SUMMARY_FILE" | awk '{print $2}')
 ```
 - A `commits: absent` or `plan_head_before: absent` SUMMARY (pre-#3968 legacy) is reported as
   a WARNING with the measured git state, not a mismatch.
-- `ACTUAL == CLAIMED` is consistent. `ACTUAL == CLAIMED + 1` is ALSO consistent: the
-  SUMMARY/metadata commit itself lands after the executor measured, so exactly one
-  post-measurement commit is expected.
-- Anything else is a **BLOCKER** — the phase must not read as done: real project evidence
-  (#3968) showed 14 plans declaring `commits: 1` with zero git activity, their code sitting
-  uncommitted and one `git reset --hard` from loss. Record it as `commit_claim_mismatch`
-  with both numbers and the SUMMARY path; a mismatch means either the executor narrated
-  instead of measuring or commits were lost after the fact — both require reconciliation
-  before the phase can pass.
+- **Bounded reconciliation (#4670).** A SUMMARY carrying `plan_head_after:` (the executor's
+  HEAD at its measurement moment — after the last task commit, before the SUMMARY commit) is
+  reconciled against the plan's OWN window:
+```bash
+if git merge-base --is-ancestor "$AFTER" HEAD 2>/dev/null \
+   && [ "$(git rev-list --count "${BASE}..${AFTER}")" = "$CLAIMED" ]; then
+  : # consistent
+fi
+```
+  Consistent → done. Anything else is a **BLOCKER** — `commit_claim_mismatch` with both
+  numbers and the SUMMARY path: commits claimed but never made (#3968), task commits lost
+  after the fact, or the plan's recorded window rewritten afterwards (a rebase/amend/cherry-pick
+  of those commits makes `$AFTER` a non-ancestor — recount that plan's commits manually
+  before treating it as a genuine mismatch). The unbounded `${BASE}..HEAD` count is NOT
+  evidence either way: it grows with every later plan's commits and execute-phase's own
+  phase-completion commit, so an honest plan would read as a mismatch (#4670).
+- **Legacy fallback (#4670).** A SUMMARY with a base but no `plan_head_after:` (pre-#4670)
+  cannot be bounded to its own window — report the measured `${BASE}..HEAD` count as a
+  **WARNING** with the SUMMARY's task-commit list for manual counting. The old
+  `ACTUAL == CLAIMED` / `ACTUAL == CLAIMED + 1` tolerance was a guess that later plans'
+  commits defeat; it must never produce a BLOCKER on the unsound window.
 </step>
 
 <step name="extract_tests">
@@ -639,7 +652,7 @@ If an active secure-phase step hook exists AND `SECURITY_FILE` exists: check fro
 
 If no active secure-phase step hook exists OR (`SECURITY_FILE` exists AND `threats_open` is `0`):
 
-If execution verification is waiting only on human UAT and this session recorded zero issues, canonicalize the report before the shared completion predicate:
+If execution verification is waiting only on human UAT and this session recorded zero issues, canonicalize the report before the shared completion predicate. (#4663) Zero issues is NOT pass evidence on its own — blocked rows are not issues by this workflow's own rule, so a session that observed nothing (0 passed / 0 issues / N blocked) must NOT flip the report. The flip runs the SAME UAT-row predicate the phase-close uses, in its `--uat-only` form: it skips the verification-status blockers (the report still reads `human_needed` at this point — the full predicate could never pass here), and `passed` means at least one UAT check passed with no row pending/blocked/failed or skipped without a reason. The flagged transition-gate call below stays the final say on canonical verification:
 
 ```bash
 PHASE_DIR=$(printf '%s' "$INIT" | jq -r '.phase_dir // empty')
@@ -648,19 +661,35 @@ VERIFICATION_STATUS=$(gsd_run query verification.status "$PHASE_DIR" 2>/dev/null
 VERIFICATION_STATUS_VALUE=$(printf '%s' "$VERIFICATION_STATUS" | jq -r '.status // empty' 2>/dev/null || echo "")
 PHASE_VERIFICATION_STATUS="$VERIFICATION_STATUS_VALUE"
 if [ "$VERIFICATION_STATUS_VALUE" = "human_needed" ]; then
-  gsd_run query frontmatter.set "$VERIFICATION_FILE" --field status --value passed
+  UAT_PRECHECK=$(gsd_run phase uat-passed "{phase}" --uat-only 2>/dev/null)
+  UAT_PRECHECK_PASSED=$(printf '%s' "$UAT_PRECHECK" | jq -r '.passed // false' 2>/dev/null || echo "false")
+  if [ "$UAT_PRECHECK_PASSED" = "true" ]; then
+    gsd_run query frontmatter.set "$VERIFICATION_FILE" --field status --value passed
+  else
+    UAT_BLOCKERS=$(printf '%s' "$UAT_PRECHECK" | jq -r '.blockers | length' 2>/dev/null)
+    [ -n "$UAT_BLOCKERS" ] || UAT_BLOCKERS="?"
+    echo "NOT canonicalizing: ${UAT_BLOCKERS} UAT row(s) blocked or not passing; verification stays human_needed. Resolve or pass them, then re-run /gsd:verify-work {phase}." >&2
+  fi
 fi
 ```
 
-If `PHASE_VERIFICATION_STATUS` is `stale`, stop before phase advancement and present:
+If `PHASE_VERIFICATION_STATUS` is `stale`, the covered source files changed after the verifier
+last ran — re-run the VERIFIER, not this workflow (`/gsd:verify-work` never rewrites
+VERIFICATION.md; its only write is the human_needed canonicalization, #4663). Spawn the
+verifier for this phase exactly as execute-phase's `verify_phase_goal` step does (subagent
+`gsd-verifier`; phase directory, goal, requirement IDs, and all SUMMARYs in
+`<required_reading>`), then re-read `verification.status` and continue at the fresh/passed
+case below. (#4682)
 
 ```
-All UAT tests passed, but phase advancement is blocked until canonical verification is fresh.
+Verification is stale: covered source files changed after the verifier last ran.
 
 Blocking completion:
 verification is stale
 
-- `/gsd:verify-work {phase}` — re-run verification against the latest summaries
+- Re-run the verifier for phase {phase} (dispatch `gsd-verifier` as in execute-phase's
+  verify_phase_goal step) to regenerate VERIFICATION.md with a fresh digest, then re-run
+  `/gsd:verify-work {phase}`
 ```
 
 Otherwise, check the shared UAT-plus-verification completion predicate before transition:
