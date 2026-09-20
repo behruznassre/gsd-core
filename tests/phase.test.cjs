@@ -5203,6 +5203,86 @@ describe('phase complete command', () => {
     assert.ok(req.includes('| API-01 | Phase 2 | Pending |'), 'API-01 should remain Pending');
   });
 
+  test('#4837 regression: a deferral bullet under Requirements does not complete another phase\u2019s REQ', () => {
+    // The parser folded a following list item into the Requirements value, and
+    // src/phase.cts advances every REQ-ID it is handed without checking which
+    // phase owns it. The two together silently marked Phase 2's AUTH-03
+    // Complete while completing Phase 1, exit 0, no warning. This asserts the
+    // end of that chain, so it stays closed even if the boundary moves.
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      `# Roadmap
+
+- [ ] Phase 1: Auth
+
+### Phase 1: Auth
+**Goal:** User authentication
+**Requirements:** AUTH-01, AUTH-02
+- Deferred to Phase 2: AUTH-03
+**Plans:** 1 plans
+
+### Phase 2: API
+**Goal:** Build API
+**Requirements:** API-01
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'REQUIREMENTS.md'),
+      `# Requirements
+
+## v1 Requirements
+
+### Authentication
+
+- [ ] **AUTH-01**: User can sign up with email
+- [ ] **AUTH-02**: User can log in
+- [ ] **AUTH-03**: User can reset password
+
+### API
+
+- [ ] **API-01**: REST endpoints
+
+## Traceability
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| AUTH-01 | Phase 1 | Pending |
+| AUTH-02 | Phase 1 | Pending |
+| AUTH-03 | Phase 2 | Pending |
+| API-01 | Phase 2 | Pending |
+`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'STATE.md'),
+      `# State\n\n**Current Phase:** 01\n**Current Phase Name:** Auth\n**Status:** In progress\n**Current Plan:** 01-01\n**Last Activity:** 2025-01-01\n**Last Activity Description:** Working\n`
+    );
+
+    const p1 = path.join(tmpDir, '.planning', 'phases', '01-auth');
+    fs.mkdirSync(p1, { recursive: true });
+    fs.writeFileSync(path.join(p1, '01-01-PLAN.md'), '# Plan');
+    fs.writeFileSync(path.join(p1, '01-01-SUMMARY.md'), '# Summary');
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', '02-api'), { recursive: true });
+
+    const result = runVerifiedPhaseComplete('phase complete 1', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const req = fs.readFileSync(path.join(tmpDir, '.planning', 'REQUIREMENTS.md'), 'utf-8');
+
+    // Phase 1's own requirements still complete — the boundary must not cost coverage.
+    assert.ok(req.includes('- [x] **AUTH-01**'), 'AUTH-01 checkbox should be checked');
+    assert.ok(req.includes('- [x] **AUTH-02**'), 'AUTH-02 checkbox should be checked');
+
+    // Phase 2's requirement, named only in the deferral bullet, must be untouched.
+    assert.ok(
+      req.includes('- [ ] **AUTH-03**'),
+      'AUTH-03 belongs to Phase 2 and must NOT be checked by completing Phase 1',
+    );
+    assert.ok(
+      req.includes('| AUTH-03 | Phase 2 | Pending |'),
+      'AUTH-03 traceability row must remain Pending',
+    );
+  });
+
   test('#2245 F1: phase complete traceability write is not fooled by an earlier Out of Scope table', () => {
     // Same class as the milestone.cts F1 regression: the shipped requirements
     // template puts an `## Out of Scope` table (`| Feature | Reason |`, no

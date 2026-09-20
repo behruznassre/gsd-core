@@ -2264,22 +2264,62 @@ export = {
  * #4731 — extract a bold-labeled phase field (Goal, Requirements, ...) reading
  * past hard-wrapped continuation lines. The roadmapper soft-wraps long fields
  * at ~85 chars, so a single-line capture silently truncated every wrapped
- * Goal/Requirements. Stops at: another `**Field**` label line, a blank line,
- * or any heading. Wrapped lines are trimmed and joined with single spaces; a
+ * Goal/Requirements. Stops at: another `**Field**` label line (any case), a
+ * blank line, any heading, a list item, a fence, or a table row. The label must
+ * start its own line. Those boundaries are structural on purpose (#4837): this
+ * value reaches `phase complete`, which advances every REQ-ID it is handed
+ * without checking which phase owns it, so prose folded into the value becomes
+ * a completion instruction. Wrapped lines are trimmed and joined with spaces; a
  * single-line field is returned unchanged (trimmed). Returns null when the
  * label is absent.
  */
+/**
+ * #4837 — the lines a phase field's value may not absorb.
+ *
+ * Deliberately a SUPERSET of the boundaries #4826 recognized: `[^\S\r\n]`
+ * keeps its `\s` tolerance for NBSP and other Unicode indentation (minus the
+ * line breaks), and the closing `**` stays optional, so an `\u00a0**Deferred:**`
+ * or an unclosed `**Deferred:` line still ends the value. Narrowing any of
+ * these would let previously-excluded prose reach `phase complete`'s mutation
+ * loop, which is the defect this is here to prevent.
+ */
+function isStructuralLine(line: string, requireLabelColon = false): boolean {
+  const text = line.replace(/\r$/, '');
+  // A field label of any case — `**depends on**:` is one too (#4837).
+  const labelRules = requireLabelColon
+    ? [/^[^\S\r\n]*\*\*[^*\r\n]*:/, /^[^\S\r\n]*\*\*[^*\r\n]+\*\*[^\S\r\n]*:/]
+    : [/^[^\S\r\n]*\*\*[^*\r\n]+(?:\*\*)?[^\S\r\n]*:?/];
+  if (labelRules.some((re) => re.test(text))) return true;
+  if (/^[^\S\r\n]*#{1,4}(?:[^\S\r\n]|$)/.test(text)) return true;
+  if (/^[^\S\r\n]*(?:[-*+]|\d+[.)])(?:[^\S\r\n]|$)/.test(text)) return true;
+  if (/^[^\S\r\n]*\|/.test(text)) return true;
+  // CommonMark §4.5, the same rule src/markdown-sectionizer.cts applies: a
+  // backtick fence's info string may not contain a backtick, so an inline
+  // ```code``` span opening a line is content, not a fence.
+  const fence = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(text);
+  if (fence && !(fence[2][0] === '`' && fence[3].includes('`'))) return true;
+  return false;
+}
+
 function extractPhaseFieldMultiline(section: string, label: string): string | null {
   // #2769 label shapes: `**X:**`, `**X**:`, and the spaced `**X** :`.
+  // #4837: `^`-anchored under /m. Unanchored, an inline `**Requirements**`
+  // mention inside an earlier field's own prose won the match and became the
+  // value. A real field label always starts its line.
   const labelRe = new RegExp(
-    '\\*\\*' + label + '(?::\\*\\*|\\*\\*\\s*:?)\\s*([^\\n]+)',
-    'i',
+    '^[^\\S\\r\\n]*\\*\\*' + label + '(?::\\*\\*|\\*\\*\\s*:?)\\s*([^\\n]+)',
+    'im',
   );
   const match = section.match(labelRe);
   if (!match) return null;
   const startIdx = match.index ?? 0;
   const after = section.slice(startIdx + match[0].length);
   const firstLine = match[1].trim();
+  // The label's own line may be empty — `\s*` crosses newlines, so the capture
+  // then comes from a LATER line, bypassing every stop below. #4837: when that
+  // later line is structural, the field is empty, not a bullet's worth of text.
+  // Only then, or a `**Goal:** **Important** thing` value would read as a label.
+  if (/\n/.test(match[0]) && isStructuralLine(firstLine, true)) return null;
   const contLines = [];
   const lines = after.split('\n');
   for (let li = 0; li < lines.length; li++) {
@@ -2289,9 +2329,7 @@ function extractPhaseFieldMultiline(section: string, label: string): string | nu
     // continuation line.
     if (li === 0 && !raw.trim()) continue;
     if (!raw.trim()) break;
-    if (/^\s*\*\*[A-Z][A-Za-z ]*:?(\*\*)?:?\s/.test(raw)) break;
-    if (/^\s*#{1,4}\s/.test(raw)) break;
-    if (/^\s*\|/.test(raw)) break;
+    if (isStructuralLine(raw)) break;
     contLines.push(raw.trim());
   }
   return [firstLine, ...contLines].join(' ').trim() || null;

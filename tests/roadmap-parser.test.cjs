@@ -3816,3 +3816,167 @@ describe('#1881 unreadable ROADMAP vs absent ROADMAP', () => {
     });
   });
 }
+
+// ─── #4837 regression: extractPhaseFieldMultiline structural boundaries ──────
+
+describe('#4837 regression: extractPhaseFieldMultiline structural boundaries', () => {
+  const { extractPhaseFieldMultiline } = roadmapParser;
+
+  // The value this reader returns reaches a MUTATION path: src/phase.cts feeds
+  // it to analyzeRequirementsLine and flips the checkbox for every REQ-ID it
+  // finds, with no check that the ID belongs to the phase being completed. So a
+  // boundary this reader fails to stop at is not a display bug — it is prose
+  // becoming a completion instruction for somebody else's requirement.
+
+  test('a list item after the field line is not continuation text', () => {
+    const section = [
+      '**Requirements**: REQ-01, REQ-02',
+      '- Deferred to Phase 2: REQ-99',
+    ].join('\n');
+    assert.equal(extractPhaseFieldMultiline(section, 'Requirements'), 'REQ-01, REQ-02');
+  });
+
+  test('every list marker shape stops the scan', () => {
+    for (const marker of ['-', '*', '+', '1.', '2)']) {
+      const section = `**Requirements**: REQ-01\n${marker} Deferred to Phase 2: REQ-99`;
+      assert.equal(
+        extractPhaseFieldMultiline(section, 'Requirements'),
+        'REQ-01',
+        `marker ${marker} should stop the scan`,
+      );
+    }
+  });
+
+  test('a fenced code block after the field line is not continuation text', () => {
+    for (const fence of ['```', '~~~']) {
+      const section = [
+        '**Goal**: Ship the parser',
+        `${fence}bash`,
+        'gsd phase complete 1',
+        fence,
+      ].join('\n');
+      assert.equal(
+        extractPhaseFieldMultiline(section, 'Goal'),
+        'Ship the parser',
+        `fence ${fence} should stop the scan`,
+      );
+    }
+  });
+
+  test('a lowercase-led bold label stops a previous field’s scan', () => {
+    const section = [
+      '**Goal**: Ship the parser',
+      '**depends on**: Phase 1',
+    ].join('\n');
+    assert.equal(extractPhaseFieldMultiline(section, 'Goal'), 'Ship the parser');
+  });
+
+  test('an inline bold mention does not shadow the real field line', () => {
+    const section = [
+      '**Goal**: Document how **Requirements** are handled',
+      '**Requirements**: REQ-07',
+    ].join('\n');
+    assert.equal(extractPhaseFieldMultiline(section, 'Requirements'), 'REQ-07');
+  });
+
+  // Codex review round 1 found the first three of these: the replacement stop
+  // set must be a SUPERSET of #4826's, or prose it used to exclude starts
+  // reaching the mutation path — strictly worse than truncating too early.
+
+  test('a NBSP-indented bold label still stops the scan', () => {
+    const section = '**Requirements:** REQ-01\n\u00a0**Deferred:** REQ-99';
+    assert.equal(extractPhaseFieldMultiline(section, 'Requirements'), 'REQ-01');
+  });
+
+  test('an unclosed bold label still stops the scan', () => {
+    const section = '**Requirements:** REQ-01\n**Deferred: REQ-99';
+    assert.equal(extractPhaseFieldMultiline(section, 'Requirements'), 'REQ-01');
+  });
+
+  test('an inline code span opening a line is content, not a fence (CommonMark \u00a74.5)', () => {
+    const section = '**Goal:** Document\n```code``` inline syntax';
+    assert.equal(
+      extractPhaseFieldMultiline(section, 'Goal'),
+      'Document ```code``` inline syntax',
+    );
+  });
+
+  test('a structural line after an EMPTY label line is not the value', () => {
+    // `\\s*` crosses newlines, so the capture can come from a later line and
+    // bypass every continuation stop. This is the triage's item 1 in its
+    // literal shape: a bullet immediately after `**Field:**`.
+    const section = '**Requirements:**\n- Deferred to Phase 2: REQ-99';
+    assert.equal(extractPhaseFieldMultiline(section, 'Requirements'), null);
+  });
+
+  test('a bold span is still a valid value on the label\u2019s own line', () => {
+    // The empty-label guard must key on the value coming from a LATER line,
+    // not on the value looking label-shaped.
+    const section = '**Goal:** **Important** thing';
+    assert.equal(extractPhaseFieldMultiline(section, 'Goal'), '**Important** thing');
+  });
+
+  // Codex review round 2 found the first four of these in the round-1 fix
+  // itself. Each is a shape where a marker sits at end-of-line, or where a
+  // rule that is right for the continuation loop is wrong for the value.
+
+  test('a CRLF bare-# heading line still stops the scan', () => {
+    // `#\r` becomes `#` after CR-stripping, and a rule demanding whitespace
+    // after the hashes then misses a boundary the base recognized.
+    const section = '**Requirements:** REQ-01\r\n#\r\nDeferred to Phase 2: REQ-99';
+    assert.equal(extractPhaseFieldMultiline(section, 'Requirements'), 'REQ-01');
+  });
+
+  test('a bold-leading value on the line after the label is kept, not nulled', () => {
+    // Only a colon separates a label from bold-leading prose. Treating every
+    // bold-leading line as a label deletes a real field.
+    assert.equal(
+      extractPhaseFieldMultiline('**Goal:**\n**Important** thing', 'Goal'),
+      '**Important** thing',
+    );
+    assert.equal(
+      extractPhaseFieldMultiline('**Requirements:**\n**Required** REQ-01', 'Requirements'),
+      '**Required** REQ-01',
+    );
+  });
+
+  test('a NBSP-indented label is still FOUND, not just stopped at', () => {
+    // The anchor must tolerate the same indentation the stop rules do, or a
+    // real field becomes undiscoverable.
+    const section = '**Goal:** x\n\u00a0**Requirements:** REQ-01';
+    assert.equal(extractPhaseFieldMultiline(section, 'Requirements'), 'REQ-01');
+  });
+
+  test('a bare list marker after an empty label line is still a boundary', () => {
+    // `- ` trims to `-`; a rule demanding whitespace after the marker misses it
+    // and the text below folds in. Base and the round-1 fix both did this.
+    const section = '**Requirements:**\n- \nDeferred to Phase 2: REQ-99';
+    assert.equal(extractPhaseFieldMultiline(section, 'Requirements'), null);
+  });
+
+  // Guard rails: the shapes #4731 added must survive the boundary tightening.
+  test('#4731 hard-wrapped continuation still folds', () => {
+    const section = [
+      '**Goal**: Read hard-wrapped Goal and Requirements fields past the line',
+      'break so a wrapped value is not silently truncated',
+    ].join('\n');
+    assert.equal(
+      extractPhaseFieldMultiline(section, 'Goal'),
+      'Read hard-wrapped Goal and Requirements fields past the line break so a wrapped value is not silently truncated',
+    );
+  });
+
+  test('#2769 label spellings still resolve', () => {
+    for (const label of ['**Goal:** v', '**Goal** : v', '**Goal**: v']) {
+      assert.equal(extractPhaseFieldMultiline(label, 'Goal'), 'v', `spelling ${label}`);
+    }
+  });
+
+  test('a value on the line after the label is still found', () => {
+    assert.equal(extractPhaseFieldMultiline('**Goal:**\nthe value', 'Goal'), 'the value');
+  });
+
+  test('an absent label is still null', () => {
+    assert.equal(extractPhaseFieldMultiline('**Goal**: x', 'Requirements'), null);
+  });
+});
