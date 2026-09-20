@@ -105,6 +105,7 @@ const {
   matchPhaseDirs,
   stripProjectCodePrefix,
   PHASE_NUMBER_TOKEN_SOURCE,
+  PHASE_DEP_REF_SOURCE,
   isForeignPrefixedPhaseQuery,
   isSentinelPhaseId,
   extractPhaseToken,
@@ -1027,6 +1028,13 @@ function cmdInitExecutePhase(
       ? toPosixPath(path.join(cwd, phaseInfo['directory'] as string))
       : null,
     phase_number: phaseInfo?.['phase_number'] || null,
+    // #4748: the disk path hands back the directory's padded number (`03A`)
+    // but the ROADMAP fallback above hands back the heading's bare one (`3A`),
+    // and execute-phase.md's review lookup needs the padded form for
+    // `{PADDED}-REVIEW.md`. It used to re-pad in shell with `printf "%02d"`,
+    // which cannot pad a letter id and reads an already-padded `08` as octal.
+    // Emit the canonical normalization, as the plan-phase/code-review inits do.
+    padded_phase: phaseInfo?.['phase_number'] ? normalizePhaseName(phaseInfo['phase_number']) : null,
     // #3171: prefer the ROADMAP's curated display name for `phase_name`. When
     // the phase directory already exists on disk, the disk-lookup path
     // (searchPhaseInDir) derives phase_name from the directory-name remainder
@@ -3105,6 +3113,23 @@ function cmdInitManager(cwd: string, raw: boolean): void {
     return reaches(numA, numB) || reaches(numB, numA);
   }
 
+  // #4764: a phase reference in depends_on prose is a PHASE-SHAPED token in
+  // context — directly following "Phase"/"Phases" — never a bare digit run.
+  // The previous whole-field scrape matched the token grammar against every
+  // digit run, so calendar dates ("2026-09-14" → 2026, 09, 14), git shas
+  // ("8bf403100d" → 8b, 403100d, …), bracketed ledger ids (WINDOWS #1843) and
+  // the row's OWN number all became "dependencies", and deps_satisfied came
+  // back false for phases whose prose declares none (50 of 92 phases in the
+  // reporter's milestone). The anchored grammar (owned by phase-id.cts as
+  // PHASE_DEP_REF_SOURCE, shared with planning-inspect's dependencies) keeps
+  // lists fully extracted ("Phases 601 and 602", "Phase 601, 602, and 603",
+  // "Phase 1-3") — silently dropping a REAL dependency would clear
+  // deps_satisfied prematurely, the dangerous direction. Negation prose
+  // ("dropped the dependency on Phase 654") is NOT detected: the issue's own
+  // minimum keeps such tokens.
+  const depPhaseRefRe = new RegExp(`${PHASE_DEP_REF_SOURCE}`, 'gi');
+  const depTokenRe = new RegExp(`${PHASE_NUMBER_TOKEN_SOURCE}`, 'gi');
+
   for (const phase of phases) {
     if (
       !phase['depends_on'] ||
@@ -3112,7 +3137,23 @@ function cmdInitManager(cwd: string, raw: boolean): void {
     ) {
       phase['deps_satisfied'] = true;
     } else {
-      const depNums = (phase['depends_on'] as string).match(new RegExp(`${PHASE_NUMBER_TOKEN_SOURCE}`, 'gi')) || [];
+      const prose = phase['depends_on'] as string;
+      const ownNumber = normalizePhaseNumber(phase['number'] as string);
+      const depNums: string[] = [];
+      const seen = new Set<string>();
+      let refMatch: RegExpExecArray | null;
+      depPhaseRefRe.lastIndex = 0;
+      while ((refMatch = depPhaseRefRe.exec(prose)) !== null) {
+        let tok: RegExpExecArray | null;
+        depTokenRe.lastIndex = 0;
+        while ((tok = depTokenRe.exec(refMatch[1])) !== null) {
+          const normalized = normalizePhaseNumber(tok[0]);
+          if (normalized === ownNumber) continue; // #4764: never the row's own phase
+          if (seen.has(normalized)) continue;
+          seen.add(normalized);
+          depNums.push(tok[0]);
+        }
+      }
       phase['deps_satisfied'] = depNums.every((n) => completedNums.has(normalizePhaseNumber(n)));
       phase['dep_phases'] = depNums;
     }
