@@ -21879,3 +21879,70 @@ describe('#5105: STATE.md writers replace an adjacent empty frontmatter block', 
     }
   }
 });
+
+// ─── #4998: a quoted milestone keeps its decoded value across writes ─────────
+
+describe('#4998 regression: state writes keep a quoted milestone value unchanged', () => {
+  let tmpDir;
+  beforeEach(() => { tmpDir = createTempProject(); });
+  afterEach(() => { cleanup(tmpDir); });
+
+  // The decoded milestone value carries literal double quotes, so YAML must
+  // double-quote and escape it — the shape the raw `^milestone:` line read
+  // captured verbatim (quotes and backslashes) and re-serialized.
+  const QUOTED_MILESTONE = '"v1.1 — Example milestone"';
+
+  function seed(sessionLines) {
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'phases', '03-example'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), [
+      '# Roadmap', '', '## Phases', '', '- [ ] **Phase 3: Example** - thing', '',
+      '### Phase 3: Example', '**Goal**: do it', '',
+    ].join('\n'));
+    const statePath = path.join(tmpDir, '.planning', 'STATE.md');
+    fs.writeFileSync(statePath, [
+      '---',
+      'gsd_state_version: 1.0',
+      `milestone: ${JSON.stringify(QUOTED_MILESTONE)}`,
+      'milestone_name: Example',
+      'status: executing',
+      '---',
+      '',
+      '# Project State',
+      '',
+      '## Current Position',
+      '',
+      'Phase: 3 of 3 (Example)',
+      'Plan: 1 of 2',
+      'Status: Executing',
+      '',
+      '## Session Continuity',
+      '',
+      ...sessionLines,
+      '',
+    ].join('\n'));
+    return statePath;
+  }
+
+  test('ten consecutive state.* writes leave the decoded milestone unchanged in STATE.md and state.json', () => {
+    const statePath = seed(['Last session: 2026-01-01', 'Stopped at: Phase 2 complete', 'Resume file: None']);
+    const writes = [
+      ['state', 'begin-phase', '--phase', '3', '--name', 'Example', '--plans', '2'],
+      ['state', 'add-decision', '--summary', 'a decision'],
+      ['state', 'record-session', '--stopped-at', 'mid phase 3'],
+      ['state', 'sync'],
+    ];
+    for (let i = 0; i < 10; i++) {
+      const res = runGsdTools(writes[i % writes.length], tmpDir);
+      assert.ok(res.success, `write ${i} failed: ${res.error}`);
+      const fm = frontmatterLib.extractFrontmatter(fs.readFileSync(statePath, 'utf-8'));
+      assert.strictEqual(fm.milestone, QUOTED_MILESTONE, `STATE.md milestone drifted after write ${i}`);
+      const stateJsonPath = path.join(tmpDir, '.planning', 'state.json');
+      if (i === 0) assert.ok(fs.existsSync(stateJsonPath), 'premise: begin-phase publishes state.json');
+      if (fs.existsSync(stateJsonPath)) {
+        const json = JSON.parse(fs.readFileSync(stateJsonPath, 'utf-8'));
+        assert.strictEqual(json.milestone, QUOTED_MILESTONE,
+          `state.json must carry the decoded milestone, not the on-disk YAML text (write ${i})`);
+      }
+    }
+  });
+});

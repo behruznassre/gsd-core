@@ -4084,3 +4084,21 @@ describe('roadmap-parser: sectioned ROADMAP with explicit `milestone: null` (#50
     assert.ok(unbound.includes('Phase 1: First'), 'explicit null leaves the whole document, not the v1.1 slice');
   });
 });
+
+// ─── #4998: readStateMilestoneScalar decodes the frontmatter value ────────────
+
+describe('#4998 regression: readStateMilestoneScalar', () => {
+  const { readStateMilestoneScalar } = roadmapParser;
+
+  test('returns the YAML-decoded value, not the on-disk quoted text', () => {
+    const state = '---\nmilestone: "\\"v1.1 — Example\\""\nstatus: executing\n---\n# State\n';
+    assert.strictEqual(readStateMilestoneScalar(state), '"v1.1 — Example"');
+    assert.strictEqual(readStateMilestoneScalar('---\nmilestone: v2.0\n---\n'), 'v2.0');
+    assert.strictEqual(readStateMilestoneScalar('---\nmilestone: 1.0\n---\n'), '1.0', 'FAILSAFE: a number-shaped value stays text');
+  });
+
+  test('falls back to the line read when there is no parseable frontmatter key', () => {
+    assert.strictEqual(readStateMilestoneScalar('# State\nmilestone: v3.0\n'), 'v3.0');
+    assert.strictEqual(readStateMilestoneScalar('# State\n'), null);
+  });
+});
