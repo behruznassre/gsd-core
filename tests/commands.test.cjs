@@ -6297,6 +6297,130 @@ describe('gsd-tools.cjs resolveMainWorktreeCwd (#3050)', () => {
   });
 });
 
+// ─── #4885 — a linked-worktree SUBDIRECTORY must not commit into main ───────
+// From a subdirectory (no `.planning/` of its own) of a linked worktree that
+// DOES carry its own checked-out `.planning/`, the root resolver remapped to
+// the main checkout, so `commit` reported success while advancing the MAIN
+// checkout's HEAD. The remap to main must survive only where the worktree has
+// no `.planning/` of its own (planning untracked, so it lives only in main).
+describe('#4885 regression: linked-worktree subdirectory resolves to its own worktree', () => {
+  const { createTempGitProject } = require('./helpers.cjs');
+  const { resolveMainWorktreeCwd } = require('../gsd-core/bin/gsd-tools.cjs');
+  const { ownWorktreePlanningRoot } = require('../gsd-core/bin/lib/worktree-safety.cjs');
+  const head = (cwd) => gitOrThrow(['rev-parse', 'HEAD'], { cwd }).trim();
+  const dirs = [];
+  after(() => { for (const d of dirs) cleanup(d); });
+
+  // Main checkout + a linked worktree OUTSIDE it. `trackPlanning: false`
+  // gitignores `.planning/`, so the worktree is created without one.
+  function mainWithWorktree({ trackPlanning, nested = false }) {
+    const main = createTempGitProject('gsd-4885-main-');
+    dirs.push(main);
+    fs.writeFileSync(path.join(main, '.planning', 'STATE.md'), '# State\n');
+    if (!trackPlanning) {
+      fs.writeFileSync(path.join(main, '.gitignore'), '.planning/\n');
+      gitOrThrow(['rm', '-r', '-q', '--cached', '.planning'], { cwd: main });
+    }
+    gitOrThrow(['add', '-A'], { cwd: main });
+    gitOrThrow(['commit', '-m', 'seed'], { cwd: main });
+    let wt;
+    if (nested) {
+      wt = path.join(main, '.claude', 'worktrees', 'agent-1');
+    } else {
+      const parent = createTempDir('gsd-4885-wt-');
+      dirs.push(parent);
+      wt = path.join(parent, 'wt');
+    }
+    gitOrThrow(['worktree', 'add', '-b', 'wt-branch', wt], { cwd: main });
+    const sub = path.join(wt, 'src', 'deeper');
+    fs.mkdirSync(sub, { recursive: true });
+    return { main, wt, sub };
+  }
+
+  test('commit from a worktree subdirectory advances the WORKTREE HEAD, not main', () => {
+    const { main, wt, sub } = mainWithWorktree({ trackPlanning: true });
+    fs.appendFileSync(path.join(wt, '.planning', 'STATE.md'), 'worktree edit\n');
+    fs.appendFileSync(path.join(main, '.planning', 'STATE.md'), 'main edit\n');
+    const mainBefore = head(main);
+    const wtBefore = head(wt);
+
+    const res = runGsdTools(['commit', 'docs: from worktree subdir', '--files', '.planning/STATE.md'], sub);
+    assert.ok(res.success, `commit failed: ${res.error}`);
+    assert.equal(JSON.parse(res.output).committed, true);
+
+    assert.equal(head(main), mainBefore, 'main checkout HEAD must not move');
+    assert.notEqual(head(wt), wtBefore, 'the worktree the caller is in must receive the commit');
+    assert.match(fs.readFileSync(path.join(main, '.planning', 'STATE.md'), 'utf8'), /main edit/,
+      'main\'s uncommitted edit must be left alone');
+  });
+
+  test('a worktree with no .planning/ of its own still resolves to the main checkout', () => {
+    const { main, sub } = mainWithWorktree({ trackPlanning: false });
+    assert.equal(ownWorktreePlanningRoot(sub), null);
+    assert.equal(fs.realpathSync(resolveMainWorktreeCwd(sub)), fs.realpathSync(main));
+  });
+
+  test('the walk stops at the worktree top: a worktree nested in main never adopts main\'s .planning/', () => {
+    const { main, wt, sub } = mainWithWorktree({ trackPlanning: false, nested: true });
+    assert.ok(!fs.existsSync(path.join(wt, '.planning')), 'fixture premise: nested worktree has no .planning/');
+    assert.ok(fs.existsSync(path.join(main, '.planning')), 'fixture premise: main (an ancestor of sub) does');
+    assert.equal(ownWorktreePlanningRoot(sub), null);
+    assert.equal(fs.realpathSync(resolveMainWorktreeCwd(sub)), fs.realpathSync(main));
+  });
+
+  test('a monorepo package inside the worktree with its own .planning/ is the root', () => {
+    const { wt } = mainWithWorktree({ trackPlanning: false });
+    const pkg = path.join(wt, 'packages', 'a');
+    fs.mkdirSync(path.join(pkg, '.planning'), { recursive: true });
+    const deep = path.join(pkg, 'src');
+    fs.mkdirSync(deep);
+    assert.equal(ownWorktreePlanningRoot(deep), fs.realpathSync(pkg));
+    assert.equal(resolveMainWorktreeCwd(deep), fs.realpathSync(pkg));
+  });
+
+  // Codex review: handing cwd to findProjectRoot's lexical, ten-ancestor walk
+  // to rediscover the root failed this — the resolver must return the
+  // directory it found (a linked --cwd case lives in commands.platform).
+  test('a cwd deeper than findProjectRoot\'s ancestor bound writes the worktree\'s config, not a stray one', () => {
+    const { wt } = mainWithWorktree({ trackPlanning: true });
+    const deep = path.join(wt, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k');
+    fs.mkdirSync(deep, { recursive: true });
+    const res = runGsdTools(['config-set', 'workflow.research', 'false'], deep);
+    assert.ok(res.success, `config-set failed: ${res.error}`);
+    assert.ok(!fs.existsSync(path.join(deep, '.planning')), 'no stray .planning/ under the deep cwd');
+    const cfg = JSON.parse(fs.readFileSync(path.join(wt, '.planning', 'config.json'), 'utf8'));
+    assert.equal(cfg.workflow.research, false, 'the worktree\'s own config must be the one updated');
+  });
+
+  test('a git failure answers null, keeping the existing main-checkout remap', () => {
+    const failed = { exitCode: 128, stdout: '', stderr: 'fatal', timedOut: false };
+    const timedOut = { exitCode: null, stdout: '', stderr: '', timedOut: true };
+    assert.equal(ownWorktreePlanningRoot('/repo/wt/sub', { execGit: () => failed, existsSync: () => true }), null);
+    assert.equal(ownWorktreePlanningRoot('/repo/wt/sub', { execGit: () => timedOut, existsSync: () => true }), null);
+  });
+
+  test('only a linked_worktree reason consults the own-worktree check', () => {
+    const calls = [];
+    const probe = (cwd) => { calls.push(cwd); return '/repo/wt'; };
+    for (const reason of ['main_worktree', 'not_git_repo']) {
+      const resolved = resolveMainWorktreeCwd('/repo/wt', {
+        existsSync: () => false,
+        resolveWorktreeRoot: () => ({ root: '/repo/wt', reason }),
+        ownWorktreePlanningRoot: probe,
+        writeWarning: () => {},
+      });
+      assert.equal(resolved, '/repo/wt');
+    }
+    assert.deepEqual(calls, [], 'non-linked reasons must not reach the own-worktree check');
+    assert.equal(resolveMainWorktreeCwd('/repo/wt/sub', {
+      existsSync: () => false,
+      resolveWorktreeRoot: () => ({ root: '/repo', reason: 'linked_worktree' }),
+      ownWorktreePlanningRoot: probe,
+    }), '/repo/wt');
+    assert.deepEqual(calls, ['/repo/wt/sub']);
+  });
+});
+
 // ─── #4055 — a merged-and-deleted phase branch must not be resurrected ──────
 
 describe('#4055: merged-and-deleted phase branch must not be resurrected', () => {

@@ -5175,18 +5175,26 @@ function skipsRootResolution(command) {
  * be driven directly in tests via injected deps.
  *
  * @param {string} cwd
- * @param {{ existsSync?: (p: string) => boolean, resolveWorktreeRoot?: (cwd: string) => { root: string, reason: string }, writeWarning?: (msg: string) => void }} [deps]
+ * @param {{ existsSync?: (p: string) => boolean, resolveWorktreeRoot?: (cwd: string) => { root: string, reason: string }, ownWorktreePlanningRoot?: (cwd: string) => string | null, writeWarning?: (msg: string) => void }} [deps]
  * @returns {string} resolved cwd
  */
 function resolveMainWorktreeCwd(cwd, deps = {}) {
   const existsSync = deps.existsSync || fs.existsSync;
   const resolveWorktreeRoot = deps.resolveWorktreeRoot || require('./lib/worktree-safety.cjs').resolveWorktreeRoot;
+  const ownWorktreePlanningRoot = deps.ownWorktreePlanningRoot || require('./lib/worktree-safety.cjs').ownWorktreePlanningRoot;
   const writeWarning = deps.writeWarning || ((msg) => process.stderr.write(msg));
 
   if (existsSync(path.join(cwd, '.planning'))) {
     return cwd;
   }
   const { root: worktreeRoot, reason: worktreeRootReason } = resolveWorktreeRoot(cwd);
+  // #4885: from a SUBDIRECTORY of a linked worktree that has its own
+  // `.planning/`, resolve to the directory owning it — remapping to the main
+  // checkout committed into the wrong checkout.
+  if (worktreeRootReason === 'linked_worktree') {
+    const ownRoot = ownWorktreePlanningRoot(cwd);
+    if (ownRoot) return ownRoot;
+  }
   if (worktreeRootReason === 'git_timed_out') {
     writeWarning(
       'WARNING: could not determine the git worktree root (git timed out). ' +

@@ -34,6 +34,7 @@
  * - "AC5: --amend remains exempt from the empty-diff guard" — runs a real executable pre-commit hook installed with a POSIX mode bit (chmod-mode-bit)
  * - "a cherry-pick in progress keeps its pre-existing outcome" — runs a real executable pre-commit hook installed with a POSIX mode bit (chmod-mode-bit)
  * - "a revert in progress still reports nothing_to_commit, not the hook rejection" — runs a real executable pre-commit hook installed with a POSIX mode bit (chmod-mode-bit)
+ * - "a --cwd that is a symlink from main into the worktree still commits in the worktree" — creates a real directory symlink/junction from the main checkout into a linked worktree (symlink-keyword)
  */
 
 const { test, describe, after, beforeEach, afterEach } = require('node:test');
@@ -919,4 +920,48 @@ describe('#3776: query commit --files reports an empty diff as nothing_to_commit
     assert.strictEqual(output.reason, 'nothing_to_commit',
       'a revert permits partial commits, so the empty-diff guard must still apply');
   });
+});
+
+// ─── #4885 — a linked-worktree subdirectory must not commit into main ───────
+
+describe('#4885 regression: linked-worktree subdirectory resolves to its own worktree', () => {
+  const head = (cwd) => gitOrThrow(['rev-parse', 'HEAD'], { cwd }).trim();
+  const dirs = [];
+  after(() => { for (const d of dirs) cleanup(d); });
+
+  function mainWithWorktree() {
+    const main = createTempDir('gsd-4885-main-');
+    dirs.push(main);
+    gitOrThrow(['init'], { cwd: main });
+    gitOrThrow(['config', 'user.email', 'test@test.com'], { cwd: main });
+    gitOrThrow(['config', 'user.name', 'Test'], { cwd: main });
+    gitOrThrow(['config', 'commit.gpgsign', 'false'], { cwd: main });
+    fs.mkdirSync(path.join(main, '.planning'));
+    fs.writeFileSync(path.join(main, '.planning', 'STATE.md'), '# State\n');
+    fs.writeFileSync(path.join(main, '.planning', 'config.json'), '{}\n');
+    gitOrThrow(['add', '-A'], { cwd: main });
+    gitOrThrow(['commit', '-m', 'seed'], { cwd: main });
+    const parent = createTempDir('gsd-4885-wt-');
+    dirs.push(parent);
+    const wt = path.join(parent, 'wt');
+    gitOrThrow(['worktree', 'add', '-b', 'wt-branch', wt], { cwd: main });
+    const sub = path.join(wt, 'src', 'deeper');
+    fs.mkdirSync(sub, { recursive: true });
+    return { main, wt, sub };
+  }
+
+  test('a --cwd that is a symlink from main into the worktree still commits in the worktree', () => {
+    const { main, wt, sub } = mainWithWorktree({ trackPlanning: true });
+    const link = path.join(main, 'wt-link');
+    fs.symlinkSync(sub, link, 'junction');
+    fs.appendFileSync(path.join(wt, '.planning', 'STATE.md'), 'worktree edit\n');
+    fs.appendFileSync(path.join(main, '.planning', 'STATE.md'), 'main edit\n');
+    const mainBefore = head(main);
+    const wtBefore = head(wt);
+    const res = runGsdTools(['commit', 'docs: via link', '--files', '.planning/STATE.md', '--cwd', link], main);
+    assert.ok(res.success, `commit failed: ${res.error}`);
+    assert.equal(head(main), mainBefore, 'main checkout HEAD must not move');
+    assert.notEqual(head(wt), wtBefore, 'the worktree the link points into must receive the commit');
+  });
+
 });

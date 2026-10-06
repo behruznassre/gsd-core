@@ -243,6 +243,60 @@ function resolveWorktreeLinkage(cwd: string, deps: WorktreeDeps = {}): WorktreeC
   };
 }
 
+/**
+ * #4885: the directory that owns `.planning/` inside `cwd`'s OWN linked
+ * worktree — the nearest one between `cwd` and that worktree's top level
+ * (inclusive) — or null when the worktree has none of its own.
+ *
+ * `resolveWorktreeLinkage` answers "which main checkout does this linked
+ * worktree belong to" — right for the isolation guard (#3045), wrong as a
+ * project root when the worktree has its own checked-out `.planning/`: from a
+ * SUBDIRECTORY of such a worktree, remapping to the main checkout made every
+ * planning write (and `commit`) land in a different checkout than the one
+ * the caller is in. A worktree with no `.planning/` of its own (planning
+ * untracked, so it lives only in the main checkout) still answers null here,
+ * so that remap is unchanged.
+ *
+ * The returned directory is canonical (realpath) and IS the project root:
+ * handing back `cwd` for a later lexical, depth-bounded ancestor walk to
+ * rediscover would let a symlinked `--cwd` walk into the main checkout, and
+ * a cwd deeper than that walk's bound miss the worktree's `.planning/`.
+ *
+ * The walk stops at the worktree's own top level, so a worktree nested inside
+ * the main checkout (e.g. `.claude/worktrees/agent-*`) never sees the main
+ * checkout's `.planning/` as its own. Any git failure answers null.
+ */
+function ownWorktreePlanningRoot(cwd: string, deps: WorktreeDeps = {}): string | null {
+  const execGit = deps.execGit || execGitDefault;
+  const existsSync = deps.existsSync || fs.existsSync;
+
+  const top = execGit(['rev-parse', '--show-toplevel'], { cwd });
+  if (top.timedOut || top.exitCode !== 0 || !String(top.stdout).trim()) return null;
+
+  let start: string;
+  let ownTop: string;
+  try {
+    // --show-toplevel prints a realpath; compare against cwd's realpath so a
+    // symlinked cwd (macOS /tmp -> /private/tmp) stays inside the walk.
+    // `.native`: only it reliably expands Windows 8.3 short names, so a
+    // `RUNNER~1` cwd still compares equal to git's long-form top.
+    start = fs.realpathSync.native(cwd);
+    ownTop = fs.realpathSync.native(String(top.stdout).trim());
+  } catch {
+    return null;
+  }
+  if (!isContainedIn(start, ownTop)) return null;
+
+  let d = start;
+  for (;;) {
+    if (existsSync(path.join(d, '.planning'))) return d;
+    if (d === ownTop) return null;
+    const next = path.dirname(d);
+    if (next === d) return null;
+    d = next;
+  }
+}
+
 function resolveWorktreeContext(cwd: string, deps: WorktreeDeps = {}): WorktreeContextResult {
   const existsSync = deps.existsSync || fs.existsSync;
 
@@ -3138,5 +3192,6 @@ export = {
   cmdWorktreeWorkerStatus,
   cmdWorktreeWorkerComplete,
   resolveWorktreeRoot,
+  ownWorktreePlanningRoot,
   pruneOrphanedWorktrees,
 };
