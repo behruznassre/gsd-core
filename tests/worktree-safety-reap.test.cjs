@@ -40,6 +40,7 @@ const { makeFaultyGit, withFaultyFs } = require('./helpers/faulty-deps.cjs');
 
 const {
   reapOrphanWorktrees,
+  reapOrphanWorktreesWithScan,
   cmdWorktreeReapOrphans,
   pruneOrphanedWorktrees,
 } = require('../gsd-core/bin/lib/worktree-safety.cjs');
@@ -894,7 +895,8 @@ describe('#3057 cmdWorktreeReapOrphans / pruneOrphanedWorktrees output verdicts'
     });
 
     assert.deepStrictEqual(err, ['[gsd] worktree.reap-orphans failed: boom\n']);
-    assert.deepStrictEqual(JSON.parse(out.join('')), { ok: true, reaped: 0, entries: [] });
+    // #4941: `scan: null` says no discovery source was read — not an all-clear.
+    assert.deepStrictEqual(JSON.parse(out.join('')), { ok: true, reaped: 0, entries: [], scan: null });
   });
 
   test('cmdWorktreeReapOrphans warns with the skipped count and emits the skipped row as JSON', () => {
@@ -992,5 +994,169 @@ describe('#3057 cmdWorktreeReapOrphans / pruneOrphanedWorktrees output verdicts'
 
     assert.deepStrictEqual(removed, [], 'a throwing git must never crash the caller');
     assert.deepStrictEqual(err, [], 'the degraded-health warning belongs to the timeout arm only');
+  });
+});
+
+// ─── #4941: `.claude/worktrees/` residue git has forgotten ───────────────────
+// A harness teardown that does not complete leaves `.claude/worktrees/agent-*`
+// with no `.git` file; `git worktree prune` then deletes its admin entry, so
+// the admin-dir scan could not see it and the sweep reported
+// `{ok:true, reaped:0}` with the directory still on disk. The residue is now
+// NAMED, never deleted: a missing `.git` proves nothing about ownership or
+// cleanliness, so disposal stays the operator's call.
+
+describe('#4941 regression: reap-orphans names unregistered .claude/worktrees residue without deleting it', () => {
+  let tmpBase;
+
+  beforeEach(() => {
+    tmpBase = fs.mkdtempSync(path.join(resolvedTmpDir(), 'gsd-4941-reap-'));
+  });
+
+  afterEach(() => {
+    cleanup(tmpBase);
+  });
+
+  /** The issue's shape: a harness worktree whose .git file is gone. */
+  function makeResidue(repoDir, name) {
+    const dir = path.join(repoDir, '.claude', 'worktrees', name);
+    git(['worktree', 'add', '-b', `worktree-${name}`, dir, 'HEAD'], repoDir);
+    fs.mkdirSync(path.join(dir, 'node_modules', 'pkg-a'), { recursive: true });
+    fs.unlinkSync(path.join(dir, '.git')); // a linked worktree's .git is a FILE
+    return dir;
+  }
+
+  function repoWithResidue(name) {
+    const repoDir = path.join(tmpBase, `repo-${name}`);
+    initRepo(repoDir);
+    const residue = makeResidue(repoDir, 'agent-t1');
+    git(['worktree', 'prune'], repoDir);
+    return { repoDir, residue };
+  }
+
+  const rows = (results) => results.map((r) => [canonicalPath(r.path), r.status, r.reason]);
+
+  test('with no admin dir left at all, the residue is named, kept, and the scan says what was read', () => {
+    const { repoDir, residue } = repoWithResidue('noadmin');
+    assert.ok(!fs.existsSync(path.join(repoDir, '.git', 'worktrees')), 'fixture premise: admin dir pruned away');
+
+    const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+
+    assert.deepStrictEqual(rows(results), [[canonicalPath(residue), 'skipped', 'unregistered_residue']]);
+    assert.deepStrictEqual(scan, { admin_dir: 'unlisted', residue_dir: 'scanned' });
+    assert.ok(fs.existsSync(path.join(residue, 'node_modules', 'pkg-a')), 'the residue must NOT be deleted');
+  });
+
+  test('residue beside a LIVE harness worktree: only the residue is named, both stay', () => {
+    const { repoDir, residue } = repoWithResidue('beside-live');
+    const live = path.join(repoDir, '.claude', 'worktrees', 'agent-live');
+    git(['worktree', 'add', '-b', 'worktree-agent-live', live, 'HEAD'], repoDir);
+
+    const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+
+    assert.deepStrictEqual(rows(results), [[canonicalPath(residue), 'skipped', 'unregistered_residue']]);
+    assert.deepStrictEqual(scan, { admin_dir: 'scanned', residue_dir: 'scanned' });
+    assert.ok(fs.existsSync(residue));
+    assert.ok(fs.existsSync(path.join(live, '.git')), 'the live worktree must be untouched');
+  });
+
+  test('a user\'s own directory under .claude/worktrees is named at most — its files survive', () => {
+    const repoDir = path.join(tmpBase, 'repo-userdir');
+    initRepo(repoDir);
+    const notes = path.join(repoDir, '.claude', 'worktrees', 'notes');
+    fs.mkdirSync(notes, { recursive: true });
+    fs.writeFileSync(path.join(notes, 'draft.md'), 'my work\n');
+
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+
+    assert.deepStrictEqual({ status: row.status, reason: row.reason }, { status: 'skipped', reason: 'unregistered_residue' });
+    assert.strictEqual(fs.readFileSync(path.join(notes, 'draft.md'), 'utf8'), 'my work\n');
+  });
+
+  test('a residue newer than the mtime guard is not reported (it may be mid-creation)', () => {
+    const { repoDir } = repoWithResidue('fresh');
+    assert.deepStrictEqual(reapOrphanWorktrees(repoDir, { mtimeSafe: () => new Date(1000), nowMs: 1000 }), []);
+  });
+
+  test('a residue whose age cannot be read is reported as age-unknown, not as residue', () => {
+    const { repoDir } = repoWithResidue('ageunknown');
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ mtimeSafe: () => null })));
+    assert.deepStrictEqual({ status: row.status, reason: row.reason }, { status: 'skipped', reason: 'residue_age_unknown' });
+  });
+
+  test('a directory git still lists is never reported as residue', () => {
+    const repoDir = path.join(tmpBase, 'repo-registered');
+    initRepo(repoDir);
+    makeResidue(repoDir, 'agent-t1'); // .git file gone, NOT pruned
+    // The reaper's own step-5 `worktree prune` would drop the stale entry
+    // before the residue scan runs; fail it so the registration survives and
+    // the scan must rely on its own `worktree list` check.
+    const faultyGit = makeFaultyGit({
+      faults: [{ kind: 'exit', exitCode: 1, when: ['worktree', 'prune'] }],
+      passthrough: realExecGit,
+    });
+    assert.deepStrictEqual(reapOrphanWorktrees(repoDir, deadOwnerDeps({ execGit: faultyGit })), []);
+  });
+
+  test('a symlinked child is never a candidate and its target is untouched', () => {
+    const repoDir = path.join(tmpBase, 'repo-symlink');
+    initRepo(repoDir);
+    const target = path.join(tmpBase, 'precious');
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'keep.txt'), 'keep\n');
+    fs.mkdirSync(path.join(repoDir, '.claude', 'worktrees'), { recursive: true });
+    fs.symlinkSync(target, path.join(repoDir, '.claude', 'worktrees', 'agent-link'), 'junction');
+
+    const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+    assert.deepStrictEqual(results, []);
+    assert.strictEqual(scan.residue_dir, 'scanned');
+    assert.strictEqual(fs.readFileSync(path.join(target, 'keep.txt'), 'utf8'), 'keep\n');
+  });
+
+  test('a .claude/worktrees aliased outside the checkout is not scanned', () => {
+    const repoDir = path.join(tmpBase, 'repo-alias');
+    initRepo(repoDir);
+    const elsewhere = path.join(tmpBase, 'other-repo');
+    fs.mkdirSync(path.join(elsewhere, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, '.claude'));
+    fs.symlinkSync(elsewhere, path.join(repoDir, '.claude', 'worktrees'), 'junction');
+
+    const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+    assert.deepStrictEqual(results, []);
+    assert.strictEqual(scan.residue_dir, 'outside_checkout');
+    assert.ok(fs.existsSync(path.join(elsewhere, 'src')));
+  });
+
+  test('a failed worktree listing names the candidates as worktree_list_failed', () => {
+    const { repoDir, residue } = repoWithResidue('listfail');
+    const faultyGit = makeFaultyGit({
+      faults: [{ kind: 'exit', exitCode: 128, when: ['worktree', 'list'] }],
+      passthrough: realExecGit,
+    });
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ execGit: faultyGit })));
+    assert.deepStrictEqual({ status: row.status, reason: row.reason }, { status: 'skipped', reason: 'worktree_list_failed' });
+    assert.ok(fs.existsSync(residue));
+  });
+
+  test('a fail-closed bail-out says the residue dir was not scanned', () => {
+    const { repoDir } = repoWithResidue('bail');
+    const faultyGit = makeFaultyGit({
+      faults: [{ kind: 'exit', exitCode: 128, when: ['rev-parse', '--git-dir'] }],
+      passthrough: realExecGit,
+    });
+    const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps({ execGit: faultyGit }));
+    assert.deepStrictEqual(results, []);
+    assert.deepStrictEqual(scan, { admin_dir: 'git_dir_unresolved', residue_dir: 'not_scanned' });
+  });
+
+  test('the CLI output names the residue, reaps nothing, and carries the scan', () => {
+    const { repoDir } = repoWithResidue('cli');
+    const out = [];
+    const err = [];
+    cmdWorktreeReapOrphans(repoDir, { write: (s) => out.push(s), writeErr: (s) => err.push(s), ...deadOwnerDeps() });
+    const parsed = JSON.parse(out.join(''));
+    assert.strictEqual(parsed.reaped, 0);
+    assert.deepStrictEqual(parsed.entries.map((e) => e.reason), ['unregistered_residue']);
+    assert.deepStrictEqual(parsed.scan, { admin_dir: 'unlisted', residue_dir: 'scanned' });
+    assert.match(err.join(''), /1 orphan\(s\) skipped/, 'the operator is told something is left on disk');
   });
 });
