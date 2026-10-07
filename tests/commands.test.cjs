@@ -6379,17 +6379,41 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
   });
 
   // Codex review: handing cwd to findProjectRoot's lexical, ten-ancestor walk
-  // to rediscover the root failed this — the resolver must return the
-  // directory it found (a linked --cwd case lives in commands.platform).
-  test('a cwd deeper than findProjectRoot\'s ancestor bound writes the worktree\'s config, not a stray one', () => {
-    const { wt } = mainWithWorktree({ trackPlanning: true });
-    const deep = path.join(wt, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k');
-    fs.mkdirSync(deep, { recursive: true });
-    const res = runGsdTools(['config-set', 'workflow.research', 'false'], deep);
-    assert.ok(res.success, `config-set failed: ${res.error}`);
-    assert.ok(!fs.existsSync(path.join(deep, '.planning')), 'no stray .planning/ under the deep cwd');
-    const cfg = JSON.parse(fs.readFileSync(path.join(wt, '.planning', 'config.json'), 'utf8'));
-    assert.equal(cfg.workflow.research, false, 'the worktree\'s own config must be the one updated');
+  // to rediscover the root failed past its bound — the resolver must return
+  // the directory it found (a linked --cwd case lives in commands.platform).
+  // Depths straddle FIND_PROJECT_ROOT_MAX_DEPTH (10): limit-1, limit, limit+1.
+  for (const depth of [9, 10, 11]) {
+    test(`a cwd ${depth} levels below the worktree writes the worktree's config, not a stray one`, () => {
+      const { wt } = mainWithWorktree({ trackPlanning: true });
+      const deep = path.join(wt, ...'abcdefghijk'.slice(0, depth).split(''));
+      fs.mkdirSync(deep, { recursive: true });
+      const res = runGsdTools(['config-set', 'workflow.research', 'false'], deep);
+      assert.ok(res.success, `config-set failed: ${res.error}`);
+      assert.ok(!fs.existsSync(path.join(deep, '.planning')), 'no stray .planning/ under the deep cwd');
+      const cfg = JSON.parse(fs.readFileSync(path.join(wt, '.planning', 'config.json'), 'utf8'));
+      assert.equal(cfg.workflow.research, false, 'the worktree\'s own config must be the one updated');
+    });
+  }
+
+  // Review finding: the dispatch-isolation sentinel is WRITTEN under
+  // gsd-tools' resolved root and READ by the guard hooks through
+  // resolveSentinelRoot. If the two resolve different checkouts, the guard
+  // reads a sentinel that was never written there and falls back silently.
+  test('the isolation-sentinel reader resolves the same root gsd-tools writes to', () => {
+    const { resolveSentinelRoot, readSentinel } = require('../hooks/lib/isolation-sentinel.js');
+    const own = mainWithWorktree({ trackPlanning: true });
+    assert.equal(fs.realpathSync(resolveSentinelRoot(own.sub)), fs.realpathSync(resolveMainWorktreeCwd(own.sub)));
+    assert.equal(fs.realpathSync(resolveSentinelRoot(own.sub)), fs.realpathSync(own.wt));
+    const shared = mainWithWorktree({ trackPlanning: false });
+    assert.equal(fs.realpathSync(resolveSentinelRoot(shared.sub)), fs.realpathSync(resolveMainWorktreeCwd(shared.sub)));
+    assert.equal(fs.realpathSync(resolveSentinelRoot(shared.sub)), fs.realpathSync(shared.main));
+
+    const res = runGsdTools(['query', 'record-dispatch-isolation', '--isolation', 'none', '--json'], own.sub);
+    assert.ok(res.success, `record-dispatch-isolation failed: ${res.error}`);
+    assert.equal(JSON.parse(res.output).recorded, true);
+    const sentinel = readSentinel(own.sub);
+    assert.equal(sentinel.present, true, 'the guard must find the sentinel recorded from the same subdirectory');
+    assert.equal(sentinel.isolation, 'none');
   });
 
   test('a git failure answers null, keeping the existing main-checkout remap', () => {

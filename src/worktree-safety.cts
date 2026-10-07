@@ -297,6 +297,31 @@ function ownWorktreePlanningRoot(cwd: string, deps: WorktreeDeps = {}): string |
   }
 }
 
+/**
+ * #4885: the ONE answer to "which worktree root owns `.planning/` for `cwd`" —
+ * `resolveWorktreeRoot`, except that a linked worktree carrying its own
+ * `.planning/` resolves to that (`ownWorktreePlanningRoot`), not to the main
+ * checkout. gsd-tools' root resolver (where the dispatch-isolation sentinel is
+ * WRITTEN) and the hooks' `resolveSentinelRoot` (where it is READ) both route
+ * through here, so the two can never resolve different checkouts.
+ */
+function resolvePlanningWorktreeRoot(
+  cwd: string,
+  deps: {
+    resolveWorktreeRoot?: (cwd: string) => { root: string; reason: string };
+    ownWorktreePlanningRoot?: (cwd: string) => string | null;
+  } = {}
+): { root: string; reason: string } {
+  const resolveRoot = deps.resolveWorktreeRoot || resolveWorktreeRoot;
+  const ownRoot = deps.ownWorktreePlanningRoot || ownWorktreePlanningRoot;
+  const resolved = resolveRoot(cwd);
+  if (resolved.reason === 'linked_worktree') {
+    const own = ownRoot(cwd);
+    if (own) return { root: own, reason: resolved.reason };
+  }
+  return resolved;
+}
+
 function resolveWorktreeContext(cwd: string, deps: WorktreeDeps = {}): WorktreeContextResult {
   const existsSync = deps.existsSync || fs.existsSync;
 
@@ -3193,5 +3218,6 @@ export = {
   cmdWorktreeWorkerComplete,
   resolveWorktreeRoot,
   ownWorktreePlanningRoot,
+  resolvePlanningWorktreeRoot,
   pruneOrphanedWorktrees,
 };

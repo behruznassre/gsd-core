@@ -45,6 +45,7 @@ const os = require('os');
 const {
   runGsdTools,
   createTempProject,
+  createTempGitProject,
   createTempDir,
   cleanup,
   captureFdSync,
@@ -930,15 +931,9 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
   after(() => { for (const d of dirs) cleanup(d); });
 
   function mainWithWorktree() {
-    const main = createTempDir('gsd-4885-main-');
+    const main = createTempGitProject('gsd-4885-main-');
     dirs.push(main);
-    gitOrThrow(['init'], { cwd: main });
-    gitOrThrow(['config', 'user.email', 'test@test.com'], { cwd: main });
-    gitOrThrow(['config', 'user.name', 'Test'], { cwd: main });
-    gitOrThrow(['config', 'commit.gpgsign', 'false'], { cwd: main });
-    fs.mkdirSync(path.join(main, '.planning'));
     fs.writeFileSync(path.join(main, '.planning', 'STATE.md'), '# State\n');
-    fs.writeFileSync(path.join(main, '.planning', 'config.json'), '{}\n');
     gitOrThrow(['add', '-A'], { cwd: main });
     gitOrThrow(['commit', '-m', 'seed'], { cwd: main });
     const parent = createTempDir('gsd-4885-wt-');
@@ -951,7 +946,7 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
   }
 
   test('a --cwd that is a symlink from main into the worktree still commits in the worktree', () => {
-    const { main, wt, sub } = mainWithWorktree({ trackPlanning: true });
+    const { main, wt, sub } = mainWithWorktree();
     const link = path.join(main, 'wt-link');
     fs.symlinkSync(sub, link, 'junction');
     fs.appendFileSync(path.join(wt, '.planning', 'STATE.md'), 'worktree edit\n');

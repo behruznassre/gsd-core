@@ -85,7 +85,7 @@ describe('hooks/lib/isolation-sentinel.js: resolveSentinelRoot self-heal reachab
       },
     });
     require.cache[WORKTREE_SAFETY_PATH] = fakeModule(WORKTREE_SAFETY_PATH, {
-      resolveWorktreeRoot: () => {
+      resolvePlanningWorktreeRoot: () => {
         worktreeSafetyCalls += 1;
         return { root: 'SHOULD-NOT-BE-REACHED' };
       },
@@ -115,7 +115,7 @@ describe('hooks/lib/isolation-sentinel.js: resolveSentinelRoot self-heal reachab
     const result = resolveSentinelRoot(cwd);
 
     assert.equal(seamCalls, 1, 'ensureRuntimeBuild() must be called exactly once when .planning is not directly under cwd');
-    assert.equal(worktreeSafetyCalls, 0, 'a thrown RuntimeBuildError must short-circuit before resolveWorktreeRoot is ever reached');
+    assert.equal(worktreeSafetyCalls, 0, 'a thrown RuntimeBuildError must short-circuit before resolvePlanningWorktreeRoot is ever reached');
     assert.equal(projectRootCalls, 0, 'a thrown RuntimeBuildError must short-circuit before findProjectRoot is ever reached');
     assert.equal(result, cwd, 'resolveSentinelRoot degrades to the raw cwd on a build failure, same as any other resolution failure');
   });

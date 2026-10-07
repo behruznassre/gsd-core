@@ -114,7 +114,7 @@ function sentinelPath(cwd) {
  * written where it looked. Deriving both sides through this one function
  * closes that divergence.
  *
- * `findProjectRoot`/`resolveWorktreeRoot` are read from the sibling
+ * `findProjectRoot`/`resolvePlanningWorktreeRoot` are read from the sibling
  * `gsd-core/bin/lib/*.cjs` modules staged alongside these hooks at install
  * time (same pattern the guard hooks already use for
  * capability-registry.cjs/runtime-name-policy.cjs) — two directories up from
@@ -140,8 +140,10 @@ function resolveSentinelRoot(cwd) {
     // cold-tree encounter.
     const { ensureRuntimeBuild } = require('../../gsd-core/bin/ensure-runtime-build.cjs');
     ensureRuntimeBuild();
-    const { resolveWorktreeRoot } = require('../../gsd-core/bin/lib/worktree-safety.cjs');
-    const { root } = resolveWorktreeRoot(cwd);
+    // #4885: the same resolver gsd-tools' root resolution uses, so a linked
+    // worktree carrying its own `.planning/` is read where it was written.
+    const { resolvePlanningWorktreeRoot } = require('../../gsd-core/bin/lib/worktree-safety.cjs');
+    const { root } = resolvePlanningWorktreeRoot(cwd);
     const { findProjectRoot } = require('../../gsd-core/bin/lib/project-root.cjs');
     return findProjectRoot(root);
   } catch {
