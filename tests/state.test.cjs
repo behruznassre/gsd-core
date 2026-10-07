@@ -22098,6 +22098,24 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.match(session(), /\nLast session: \S+\nStopped at: Phase 3\nResume file: None/);
   });
 
+  test('a nested fence (```` around ```) is one example — its inner label is never the anchor', () => {
+    seed([], ['````md', '```', '**Last session:** example', '```', '````', 'Last session: 2026-01-01', 'Resume file: None']);
+    recordSession('--stopped-at', 'Phase 3');
+    // Non-blank lines: the write path's own spacing may add blanks in a fence.
+    const lines = session().split(/\r?\n/).filter(Boolean);
+    const close = lines.lastIndexOf('````');
+    assert.ok(lines[close + 1].startsWith('Last session: '), session());
+    assert.deepStrictEqual(lines.slice(close + 2, close + 4), ['Stopped at: Phase 3', 'Resume file: None']);
+  });
+
+  test('an insert below a sibling stops before an indented fence, never inside it', () => {
+    seed([], ['Last session: 2026-01-01', '  ```', '**Resume file:** example', '  ```', 'Resume file: None']);
+    recordSession('--stopped-at', 'Phase 3');
+    const lines = session().split(/\r?\n/).filter(Boolean);
+    const at = lines.indexOf('Stopped at: Phase 3');
+    assert.deepStrictEqual(lines.slice(at, at + 4), ['Stopped at: Phase 3', '  ```', '**Resume file:** example', '  ```']);
+  });
+
   test('a ## Session Continuity heading at EOF with no newline is not glued to an inserted field', () => {
     fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '', '## Session Continuity'].join('\n'));
     const before = fs.readFileSync(statePath(), 'utf-8');

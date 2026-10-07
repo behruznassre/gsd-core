@@ -135,7 +135,7 @@ import {
   stateReplaceFieldIfTemplate,
   stateCurrentPositionSlice,
 } from './state-document.cjs';
-import { tokenizeHeadings, collectSection, collectSections, replaceSection, stripFencedCode } from './markdown-sectionizer.cjs';
+import { tokenizeHeadings, collectSection, collectSections, replaceSection, stripFencedCode, scanFencedBlocks } from './markdown-sectionizer.cjs';
 import type { HeadingToken } from './markdown-sectionizer.cjs';
 import { parseMarkdownTable, updateTableCell, deleteTableRow, insertTableRow, splitTableRow, isDelimiterRow } from './markdown-table.cjs';
 import { textEncodingError } from './validate.cjs';
@@ -2121,13 +2121,13 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // into; leave rewriteMatched false rather than glue a field onto it.
         if (!section || content[section.bodyStart - 1] !== '\n') return;
         const lines = section.body.split('\n');
-        // Lines inside a fenced block are examples, never an anchor.
-        let inFence = false;
-        const fenced = lines.map((l) => {
-          const isFence = /^[ \t]*(?:```|~~~)/.test(l);
-          if (isFence) inFence = !inFence;
-          return isFence || inFence;
-        });
+        // Lines inside a fenced block (delimiters included) are examples:
+        // never an anchor, never an insertion point.
+        const fenced = lines.map(() => false);
+        for (const block of scanFencedBlocks(lines)) {
+          const end = block.closeLineIdx === -1 ? lines.length - 1 : block.closeLineIdx;
+          for (let i = block.openLineIdx; i <= end; i++) fenced[i] = true;
+        }
         // The spellings stateReplaceField writes: `**Label:**`, `**Label**:`, `Label:`.
         const labelRe = (label: string): RegExp => new RegExp(`^[ \\t]*(?:\\*\\*)?${label}(?::\\*\\*|\\*\\*:|:)(?:\\s|$)`, 'i');
         const lineOf = (label: string): number =>
@@ -2143,8 +2143,13 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
           let at = 0;
           for (let j = k - 1; j >= 0 && anchor === -1; j--) {
             anchor = lineOf(fields[j][0]);
-            // Below the sibling's own wrapped lines, never between them.
-            if (anchor !== -1) at = anchor + 1 + continuationLineCount(lines.slice(anchor + 1));
+            // Below the sibling's own wrapped lines, never between them — but
+            // stop before a fence the continuation scan does not recognize.
+            if (anchor !== -1) {
+              const tail = continuationLineCount(lines.slice(anchor + 1));
+              at = anchor + 1;
+              while (at < anchor + 1 + tail && !fenced[at]) at++;
+            }
           }
           for (let j = k + 1; j < fields.length && anchor === -1; j++) {
             anchor = lineOf(fields[j][0]);
