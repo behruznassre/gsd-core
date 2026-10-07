@@ -2512,6 +2512,9 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
   const nowMs = deps.nowMs ?? Date.now();
 
   const results: ReapResult[] = [];
+  // Only an unresolvable git dir stops the residue scan (it needs `<top>/.git`).
+  // An unresolvable default branch fails the REAP closed, but the report-only
+  // residue scan does not depend on it, so it still runs.
   const bail = (admin_dir: string) => ({ results, scan: { admin_dir, residue_dir: 'not_scanned' } });
   const sweepResidue = (admin_dir: string) => {
     const residue = findUnregisteredResidue(repoRoot, gitDirPath, deps, nowMs, reapMtimeGuardMs);
@@ -2541,14 +2544,14 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
     // Remote default branch is known — use it exclusively.
     const branchName = defaultBranchResult.stdout.trim().replace(/^origin\//, '');
     const r = execGit(['rev-parse', `refs/remotes/origin/${branchName}`], { cwd: repoRoot });
-    if (!gitResultOk(r)) return bail('default_branch_unresolved'); // remote ref unresolvable — fail closed
+    if (!gitResultOk(r)) return sweepResidue('default_branch_unresolved'); // remote ref unresolvable — fail closed
     mainTip = r.stdout.trim();
   } else {
     // No remote configured (local-only repo, e.g. test fixtures).
     const hasRemote = execGit(['remote'], { cwd: repoRoot });
     if (gitResultOk(hasRemote) && hasRemote.stdout.trim()) {
       // Remote exists but origin/HEAD not set — ambiguous; fail closed.
-      return bail('default_branch_unresolved');
+      return sweepResidue('default_branch_unresolved');
     }
     // Build candidate list: init.defaultBranch config, HEAD symref, then main, master.
     const candidateBranches: string[] = [];
@@ -2573,7 +2576,7 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
         break;
       }
     }
-    if (!mainTip) return bail('default_branch_unresolved');
+    if (!mainTip) return sweepResidue('default_branch_unresolved');
   }
 
   // 3. Build a canonical-path → listed-path index from git worktree list.

@@ -1198,6 +1198,23 @@ describe('#4941 regression: reap-orphans names unregistered .claude/worktrees re
     assert.ok(fs.existsSync(residue));
   });
 
+  // Codex review: with a live sibling keeping `.git/worktrees/` present, a
+  // remote without origin/HEAD failed the reap closed AND skipped the residue
+  // scan, which does not depend on the default branch.
+  test('an unresolvable default branch still names the residue beside a live worktree', () => {
+    const { repoDir, residue } = repoWithResidue('nohead');
+    git(['worktree', 'add', '-b', 'worktree-agent-live', path.join(repoDir, '.claude', 'worktrees', 'agent-live'), 'HEAD'], repoDir);
+    const originSrc = path.join(tmpBase, 'origin-nohead');
+    initRepo(originSrc);
+    git(['remote', 'add', 'origin', originSrc], repoDir);
+
+    const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+
+    assert.deepStrictEqual(rows(results), [[canonicalPath(residue), 'skipped', 'unregistered_residue']]);
+    assert.deepStrictEqual(scan, { admin_dir: 'default_branch_unresolved', residue_dir: 'scanned' });
+    assert.ok(fs.existsSync(residue));
+  });
+
   test('a fail-closed bail-out says the residue dir was not scanned', () => {
     const { repoDir } = repoWithResidue('bail');
     const faultyGit = makeFaultyGit({
