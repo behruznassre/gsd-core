@@ -2888,7 +2888,8 @@ function cmdWorktreeReapOrphans(cwd: string, deps: RecordAgentCmdDeps & Worktree
   const skippedCount = result.filter((r) => r.status === 'skipped').length;
   if (skippedCount > 0) {
     // Surface skipped entries so operators are aware of unresolved orphans.
-    writeErr(`[gsd] worktree.reap-orphans: ${skippedCount} orphan(s) skipped (run with DEBUG=1 for details)\n`);
+    // #4941 review: there is no DEBUG path here — the rows ARE the details.
+    writeErr(`[gsd] worktree.reap-orphans: ${skippedCount} orphan(s) skipped — see "entries" in the JSON output\n`);
   }
   write(`${JSON.stringify({ ok: true, reaped: result.filter((r) => r.status === 'reaped').length, entries: result, scan }, null, 2)}\n`);
 }

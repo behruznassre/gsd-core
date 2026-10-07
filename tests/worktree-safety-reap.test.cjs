@@ -911,7 +911,7 @@ describe('#3057 cmdWorktreeReapOrphans / pruneOrphanedWorktrees output verdicts'
     });
 
     assert.deepStrictEqual(err, [
-      '[gsd] worktree.reap-orphans: 1 orphan(s) skipped (run with DEBUG=1 for details)\n',
+      '[gsd] worktree.reap-orphans: 1 orphan(s) skipped — see "entries" in the JSON output\n',
     ]);
     const payload = JSON.parse(out.join(''));
     assert.strictEqual(payload.ok, true);
@@ -1076,6 +1076,67 @@ describe('#4941 regression: reap-orphans names unregistered .claude/worktrees re
     const { repoDir } = repoWithResidue('fresh');
     assert.deepStrictEqual(reapOrphanWorktrees(repoDir, { mtimeSafe: () => new Date(1000), nowMs: 1000 }), []);
   });
+
+  // The guard is `age < guardMs` → skip: guardMs-1 is still mid-creation,
+  // guardMs and guardMs+1 are residue.
+  for (const [age, reported] of [[-1, false], [0, true], [1, true]]) {
+    test(`a residue aged guardMs${age < 0 ? '-1' : age > 0 ? '+1' : ''} is ${reported ? '' : 'not '}reported`, () => {
+      const guardMs = 60_000;
+      const { repoDir } = repoWithResidue(`guard${age}`);
+      const results = reapOrphanWorktrees(repoDir, deadOwnerDeps({
+        reapMtimeGuardMs: guardMs,
+        mtimeSafe: () => new Date(0),
+        nowMs: guardMs + age,
+      }));
+      assert.deepStrictEqual(results.map((r) => r.reason), reported ? ['unregistered_residue'] : []);
+    });
+  }
+
+  test('no .claude/worktrees at all scans as absent', () => {
+    const repoDir = path.join(tmpBase, 'repo-absent');
+    initRepo(repoDir);
+    const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+    assert.deepStrictEqual(results, []);
+    assert.deepStrictEqual(scan, { admin_dir: 'unlisted', residue_dir: 'absent' });
+  });
+
+  test('a .claude/worktrees that cannot be listed scans as unreadable, not absent', () => {
+    const repoDir = path.join(tmpBase, 'repo-unreadable');
+    initRepo(repoDir);
+    fs.mkdirSync(path.join(repoDir, '.claude'));
+    fs.writeFileSync(path.join(repoDir, '.claude', 'worktrees'), 'not a directory\n'); // readdir → ENOTDIR
+    const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+    assert.deepStrictEqual(results, []);
+    assert.strictEqual(scan.residue_dir, 'unreadable');
+  });
+
+  test('run from a linked worktree, the residue scan reports not_main_checkout', () => {
+    const { repoDir } = repoWithResidue('linked');
+    const linked = path.join(tmpBase, 'linked-wt');
+    git(['worktree', 'add', '-b', 'linked-branch', linked, 'HEAD'], repoDir);
+    const { results, scan } = reapOrphanWorktreesWithScan(linked, deadOwnerDeps());
+    assert.ok(!results.some((r) => r.reason === 'unregistered_residue'), 'a linked worktree does not scan main\'s residue');
+    assert.strictEqual(scan.residue_dir, 'not_main_checkout');
+  });
+
+  // A non-ENOENT failure probing a child (or its `.git`) proves nothing about
+  // it, so it is named as unreadable — never silently passed over or called
+  // residue.
+  for (const probe of ['child', '.git']) {
+    test(`a non-ENOENT lstat failure on the ${probe} names the child residue_unreadable`, () => {
+      const { repoDir, residue } = repoWithResidue(`lstat-${probe === '.git' ? 'git' : 'child'}`);
+      const target = probe === '.git' ? path.join(residue, '.git') : residue;
+      const realLstat = fs.lstatSync;
+      const results = withFaultyFs({
+        lstatSync: (p, ...rest) => {
+          if (p === target) throw Object.assign(new Error('EACCES: injected'), { code: 'EACCES' });
+          return realLstat(p, ...rest);
+        },
+      }, () => reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+      assert.deepStrictEqual(rows(results), [[canonicalPath(residue), 'skipped', 'residue_unreadable']]);
+      assert.ok(fs.existsSync(residue));
+    });
+  }
 
   test('a residue whose age cannot be read is reported as age-unknown, not as residue', () => {
     const { repoDir } = repoWithResidue('ageunknown');
