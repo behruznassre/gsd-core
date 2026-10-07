@@ -5178,7 +5178,7 @@ function skipsRootResolution(command) {
  * be driven directly in tests via injected deps.
  *
  * @param {string} cwd
- * @param {{ existsSync?: (p: string) => boolean, resolveWorktreeRoot?: (cwd: string) => { root: string, reason: string }, ownWorktreePlanningRoot?: (cwd: string) => string | null, writeWarning?: (msg: string) => void }} [deps]
+ * @param {{ existsSync?: (p: string) => boolean, resolveWorktreeRoot?: (cwd: string) => { root: string, reason: string }, ownWorktreePlanningRoot?: (cwd: string) => { root: string | null, timedOut: boolean }, writeWarning?: (msg: string) => void }} [deps]
  * @returns {string} resolved cwd
  */
 function resolveMainWorktreeCwd(cwd, deps = {}) {

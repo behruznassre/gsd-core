@@ -264,14 +264,18 @@ function resolveWorktreeLinkage(cwd: string, deps: WorktreeDeps = {}): WorktreeC
  *
  * The walk stops at the worktree's own top level, so a worktree nested inside
  * the main checkout (e.g. `.claude/worktrees/agent-*`) never sees the main
- * checkout's `.planning/` as its own. Any git failure answers null.
+ * checkout's `.planning/` as its own. Any git failure answers `root: null`;
+ * a git TIMEOUT also sets `timedOut`, so the caller can warn (#3050) instead of
+ * treating "could not look" as "has none".
  */
-function ownWorktreePlanningRoot(cwd: string, deps: WorktreeDeps = {}): string | null {
+function ownWorktreePlanningRoot(cwd: string, deps: WorktreeDeps = {}): { root: string | null; timedOut: boolean } {
   const execGit = deps.execGit || execGitDefault;
   const existsSync = deps.existsSync || fs.existsSync;
+  const none = { root: null, timedOut: false };
 
   const top = execGit(['rev-parse', '--show-toplevel'], { cwd });
-  if (top.timedOut || top.exitCode !== 0 || !String(top.stdout).trim()) return null;
+  if (top.timedOut) return { root: null, timedOut: true };
+  if (top.exitCode !== 0 || !String(top.stdout).trim()) return none;
 
   let start: string;
   let ownTop: string;
@@ -283,16 +287,16 @@ function ownWorktreePlanningRoot(cwd: string, deps: WorktreeDeps = {}): string |
     start = fs.realpathSync.native(cwd);
     ownTop = fs.realpathSync.native(String(top.stdout).trim());
   } catch {
-    return null;
+    return none;
   }
-  if (!isContainedIn(start, ownTop)) return null;
+  if (!isContainedIn(start, ownTop)) return none;
 
   let d = start;
   for (;;) {
-    if (existsSync(path.join(d, '.planning'))) return d;
-    if (d === ownTop) return null;
+    if (existsSync(path.join(d, '.planning'))) return { root: d, timedOut: false };
+    if (d === ownTop) return none;
     const next = path.dirname(d);
-    if (next === d) return null;
+    if (next === d) return none;
     d = next;
   }
 }
@@ -303,13 +307,15 @@ function ownWorktreePlanningRoot(cwd: string, deps: WorktreeDeps = {}): string |
  * `.planning/` resolves to that (`ownWorktreePlanningRoot`), not to the main
  * checkout. gsd-tools' root resolver (where the dispatch-isolation sentinel is
  * WRITTEN) and the hooks' `resolveSentinelRoot` (where it is READ) both route
- * through here, so the two can never resolve different checkouts.
+ * through here, so whenever git answers, the two resolve the same checkout. A
+ * timed-out own-worktree probe reports `git_timed_out` (still rooted at the
+ * main checkout) so gsd-tools warns rather than silently writing there.
  */
 function resolvePlanningWorktreeRoot(
   cwd: string,
   deps: {
     resolveWorktreeRoot?: (cwd: string) => { root: string; reason: string };
-    ownWorktreePlanningRoot?: (cwd: string) => string | null;
+    ownWorktreePlanningRoot?: (cwd: string) => { root: string | null; timedOut: boolean };
   } = {}
 ): { root: string; reason: string } {
   const resolveRoot = deps.resolveWorktreeRoot || resolveWorktreeRoot;
@@ -317,7 +323,8 @@ function resolvePlanningWorktreeRoot(
   const resolved = resolveRoot(cwd);
   if (resolved.reason === 'linked_worktree') {
     const own = ownRoot(cwd);
-    if (own) return { root: own, reason: resolved.reason };
+    if (own.root) return { root: own.root, reason: resolved.reason };
+    if (own.timedOut) return { root: resolved.root, reason: 'git_timed_out' };
   }
   return resolved;
 }

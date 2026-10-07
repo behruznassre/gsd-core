@@ -6356,7 +6356,7 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
 
   test('a worktree with no .planning/ of its own still resolves to the main checkout', () => {
     const { main, sub } = mainWithWorktree({ trackPlanning: false });
-    assert.equal(ownWorktreePlanningRoot(sub), null);
+    assert.equal(ownWorktreePlanningRoot(sub).root, null);
     assert.equal(fs.realpathSync(resolveMainWorktreeCwd(sub)), fs.realpathSync(main));
   });
 
@@ -6364,7 +6364,7 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     const { main, wt, sub } = mainWithWorktree({ trackPlanning: false, nested: true });
     assert.ok(!fs.existsSync(path.join(wt, '.planning')), 'fixture premise: nested worktree has no .planning/');
     assert.ok(fs.existsSync(path.join(main, '.planning')), 'fixture premise: main (an ancestor of sub) does');
-    assert.equal(ownWorktreePlanningRoot(sub), null);
+    assert.equal(ownWorktreePlanningRoot(sub).root, null);
     assert.equal(fs.realpathSync(resolveMainWorktreeCwd(sub)), fs.realpathSync(main));
   });
 
@@ -6374,7 +6374,7 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     fs.mkdirSync(path.join(pkg, '.planning'), { recursive: true });
     const deep = path.join(pkg, 'src');
     fs.mkdirSync(deep);
-    assert.equal(ownWorktreePlanningRoot(deep), fs.realpathSync(pkg));
+    assert.equal(ownWorktreePlanningRoot(deep).root, fs.realpathSync(pkg));
     assert.equal(resolveMainWorktreeCwd(deep), fs.realpathSync(pkg));
   });
 
@@ -6416,16 +6416,32 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     assert.equal(sentinel.isolation, 'none');
   });
 
-  test('a git failure answers null, keeping the existing main-checkout remap', () => {
+  test('a git failure answers root null, keeping the existing main-checkout remap', () => {
     const failed = { exitCode: 128, stdout: '', stderr: 'fatal', timedOut: false };
     const timedOut = { exitCode: null, stdout: '', stderr: '', timedOut: true };
-    assert.equal(ownWorktreePlanningRoot('/repo/wt/sub', { execGit: () => failed, existsSync: () => true }), null);
-    assert.equal(ownWorktreePlanningRoot('/repo/wt/sub', { execGit: () => timedOut, existsSync: () => true }), null);
+    assert.deepEqual(ownWorktreePlanningRoot('/repo/wt/sub', { execGit: () => failed, existsSync: () => true }), { root: null, timedOut: false });
+    assert.deepEqual(ownWorktreePlanningRoot('/repo/wt/sub', { execGit: () => timedOut, existsSync: () => true }), { root: null, timedOut: true });
+  });
+
+  // Codex review: a timed-out own-worktree probe is "could not look", not "has
+  // none" — falling through silently to the main checkout would reproduce
+  // #4885 with no signal. It must reach the #3050 git-timeout warning.
+  test('a timed-out own-worktree probe warns instead of silently resolving to main', () => {
+    const warnings = [];
+    const resolved = resolveMainWorktreeCwd('/repo/wt/sub', {
+      existsSync: () => false,
+      resolveWorktreeRoot: () => ({ root: '/repo', reason: 'linked_worktree' }),
+      ownWorktreePlanningRoot: () => ({ root: null, timedOut: true }),
+      writeWarning: (msg) => warnings.push(msg),
+    });
+    assert.equal(resolved, '/repo');
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /git timed out/);
   });
 
   test('only a linked_worktree reason consults the own-worktree check', () => {
     const calls = [];
-    const probe = (cwd) => { calls.push(cwd); return '/repo/wt'; };
+    const probe = (cwd) => { calls.push(cwd); return { root: '/repo/wt', timedOut: false }; };
     for (const reason of ['main_worktree', 'not_git_repo']) {
       const resolved = resolveMainWorktreeCwd('/repo/wt', {
         existsSync: () => false,
