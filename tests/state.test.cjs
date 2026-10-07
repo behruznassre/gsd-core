@@ -22073,6 +22073,47 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     ].join('\n'));
   });
 
+  // Codex review of this half: every insert path, not only the skip path,
+  // must keep a note below a field and land outside examples.
+  test('a canonical ## Session with a note and a missing field keeps the note (no whole-section rewrite)', () => {
+    seed([], ['**Last session:** 2026-01-01', '**Stopped at:** Phase 2', 'Deployment requires operator approval.'], '## Session');
+    recordSession('--stopped-at', 'Phase 2', '--resume-file', 'plan.md');
+    assert.ok(session().includes(
+      '**Stopped at:** Phase 2\nDeployment requires operator approval.\n**Resume file:** plan.md'), session());
+  });
+
+  test('with no session heading, a skipped field does not reappear with the new value in the appended section', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
+      'Last session: 2026-01-01', 'Stopped at: old handoff', 'its continuation', ''].join('\n'));
+    const { json } = recordSession('--stopped-at', 'new handoff', '--resume-file', 'plan.md');
+    assert.deepStrictEqual(json.skipped.map((s) => s.field), ['Stopped At']);
+    assert.ok(!json.updated.includes('Stopped At'), JSON.stringify(json));
+    assert.ok(!fs.readFileSync(statePath(), 'utf-8').includes('new handoff'));
+  });
+
+  test('a fenced example of a sibling label is never the insertion anchor', () => {
+    seed([], ['```', '**Last session:** example', '```', 'Last session: 2026-01-01', 'Resume file: None']);
+    recordSession('--stopped-at', 'Phase 3');
+    assert.ok(session().includes('```\n**Last session:** example\n```\n'), session());
+    assert.match(session(), /\nLast session: \S+\nStopped at: Phase 3\nResume file: None/);
+  });
+
+  test('a ## Session Continuity heading at EOF with no newline is not glued to an inserted field', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '', '## Session Continuity'].join('\n'));
+    const before = fs.readFileSync(statePath(), 'utf-8');
+    const { json } = recordSession('--stopped-at', 'Phase 3');
+    assert.strictEqual(json.recorded, false);
+    assert.strictEqual(fs.readFileSync(statePath(), 'utf-8'), before);
+  });
+
+  test('`**Label**:` siblings anchor the insert, which uses the readable `**Label:**` spelling', () => {
+    seed([], ['**Last session**: 2026-01-01', '**Resume file**: None']);
+    const { json } = recordSession('--stopped-at', 'Phase 3');
+    assert.ok(json.updated.includes('Stopped At'), JSON.stringify(json));
+    assert.match(session(), /\*\*Last session\*\*: \S+\n\*\*Stopped at:\*\* Phase 3\n\*\*Resume file\*\*: None/);
+    assert.strictEqual(frontmatterLib.extractFrontmatter(fs.readFileSync(statePath(), 'utf-8')).stopped_at, 'Phase 3');
+  });
+
   test('a frontmatter-only stopped_at the write replaces is reported in replacedRecord', () => {
     seed(['stopped_at: "derive from git log; do not read this field"'], ['Last session: 2026-01-01', 'Resume file: None']);
     const { json } = recordSession('--stopped-at', 'Phase 3 plan 1 done');

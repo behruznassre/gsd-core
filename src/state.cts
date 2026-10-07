@@ -2117,10 +2117,21 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // the heading in bold, the pre-#4998 shape. Every existing line is kept.
       const insertMissingFields = (isTarget: (h: HeadingToken) => boolean): void => {
         const section = collectSection(content, isTarget, { levelBounded: true });
-        if (!section) return;
+        // A heading with no line terminator (at EOF) has no body to insert
+        // into; leave rewriteMatched false rather than glue a field onto it.
+        if (!section || content[section.bodyStart - 1] !== '\n') return;
         const lines = section.body.split('\n');
+        // Lines inside a fenced block are examples, never an anchor.
+        let inFence = false;
+        const fenced = lines.map((l) => {
+          const isFence = /^[ \t]*(?:```|~~~)/.test(l);
+          if (isFence) inFence = !inFence;
+          return isFence || inFence;
+        });
+        // The spellings stateReplaceField writes: `**Label:**`, `**Label**:`, `Label:`.
+        const labelRe = (label: string): RegExp => new RegExp(`^[ \\t]*(?:\\*\\*)?${label}(?::\\*\\*|\\*\\*:|:)(?:\\s|$)`, 'i');
         const lineOf = (label: string): number =>
-          lines.findIndex((l) => new RegExp(`^(?:\\*\\*)?${label}:(?:\\*\\*)?(?:\\s|$)`, 'i').test(l));
+          lines.findIndex((l, i) => !fenced[i] && labelRe(label).test(l));
         const fields: [string, boolean, string][] = [
           ['Last session', needsLastSession, now],
           ['Stopped at', !!needsStoppedAt, stoppedAtValue],
@@ -2140,51 +2151,27 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
             at = anchor;
           }
           if (anchor === -1) at = 0;
-          const bold = anchor === -1 || lines[anchor].startsWith('**');
+          // Plain beside a plain sibling, else bold — in the spellings
+          // stateExtractField reads back (`**Label:**`, unindented `Label:`), not
+          // the anchor's own `**Label**:`, which the sync could not read.
+          const bold = anchor === -1 || lines[anchor].trimStart().startsWith('**');
           lines.splice(at, 0, bold ? `**${label}:** ${value}` : `${label}: ${value}`);
+          fenced.splice(at, 0, false);
         });
         content = replaceSection(content, section, lines.join('\n'));
         rewriteMatched = true;
       };
 
-      if (existingCanonicalSession && skippedWrapped.length > 0) {
-        // #4998: the canonical rewrite below replaces the whole section, which
-        // would delete the wrapped value just left untouched. Insert instead.
+      if (existingCanonicalSession) {
+        // #4998: insert the missing fields in place. This used to replace the
+        // whole section with three canonical lines, which deleted any wrapped
+        // value or note in it — and reset an authored Resume file to None.
         insertMissingFields((h) => h.level === 2 && h.text.trim().toLowerCase() === 'session');
-      } else if (existingCanonicalSession) {
-        // Normalize in place: replace the ENTIRE BODY of the existing ## Session
-        // section (heading + all content up to the next ## heading or EOF) with
-        // canonical bold-label lines. The negative-lookahead per-line pattern
-        // `(?!^## )[\s\S]` consumes every line that doesn't start with "## ",
-        // which correctly stops at the next section boundary without consuming it.
-        // A trailing blank line is added so the next ## heading keeps its spacing.
-        //
-        // CRLF-tolerant (`\r?\n` after `[ \t]*`): the prior literal `\n` could not
-        // match a CRLF STATE.md (`---\r\n`), silently no-op'ing the replace while
-        // updated.push(...) reported success — #2450. The detector regex on the
-        // line above (`/^## Session[ \t]*$/im`) was already CRLF-tolerant, so the
-        // asymmetry armed the bug.
-        const canonicalReplacement = [
-          '## Session',
-          '',
-          `**Last session:** ${now}`,
-          `**Stopped at:** ${stoppedAtValue}`,
-          `**Resume file:** ${resumeValue}`,
-          '',
-          '',
-        ].join('\n');
-        content = content.replace(
-          /^(## Session[ \t]*\r?\n(?:(?!^## )[\s\S])*)/m,
-          () => {
-            rewriteMatched = true;
-            return canonicalReplacement;
-          },
-        );
       } else if (existingSessionContinuity) {
         // #1101: a `## Session Continuity` section already exists (bootstrap
         // shape). Previously this fell through to the append branch and created
         // a SECOND `## Session` block — a duplicate. Instead, insert only the
-        // canonical fields that are still missing, right after the heading,
+        // canonical fields that are still missing (#4998: beside their siblings),
         // preserving the `## Session Continuity` heading and ALL existing lines
         // (e.g. prose like "Next recommended action"). Fields already updated in
         // place above (needs* false) are not re-inserted. A function replacement
@@ -2197,13 +2184,19 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         insertMissingFields((h) => h.level === 2 && h.text.trim().toLowerCase() === 'session continuity');
       } else {
         // No session heading exists at all — append a new canonical section.
+        // #4998: the appended section becomes the one the sync reads, so a
+        // field left whole as wrapped must not reappear in it with the new
+        // value; it then carries only the fields that are actually missing.
+        const scaffoldFields: [string, boolean, string][] = [
+          ['Last session', skippedWrapped.length === 0 || needsLastSession, now],
+          ['Stopped at', skippedWrapped.length === 0 || !!needsStoppedAt, stoppedAtValue],
+          ['Resume file', skippedWrapped.length === 0 || needsResumeFile, resumeValue],
+        ];
         const scaffold = [
           '',
           '## Session',
           '',
-          `**Last session:** ${now}`,
-          `**Stopped at:** ${stoppedAtValue}`,
-          `**Resume file:** ${resumeValue}`,
+          ...scaffoldFields.filter(([, include]) => include).map(([label, , value]) => `**${label}:** ${value}`),
           '',
         ].join('\n');
         content = content.trimEnd() + '\n' + scaffold;
