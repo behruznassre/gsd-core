@@ -21,6 +21,7 @@ const {
   stateReplaceField,
   stateExtractField,
   stateReplaceFieldWithFallback,
+  editedLineContinuation,
 } = require('../gsd-core/bin/lib/state-document.cjs');
 
 describe('stateReplaceField — table branch (characterization, #2880)', () => {
@@ -2661,5 +2662,39 @@ describe('#4186: normalizeStateStatus anchored status vocabulary — documented 
     // recognizes the whole-field value.
     assert.strictEqual(normalizeStateStatus('Executing Phase 5 — final stretch', null), 'Executing Phase 5 — final stretch');
     assert.strictEqual(normalizeStateStatus('Complete but needs manual QA', null), 'Complete but needs manual QA');
+  });
+});
+
+describe('editedLineContinuation (#4998): the continuation of the line a write changed', () => {
+  const doc = [
+    '## Session', '',
+    'Last session: archived v1.0 and moved',
+    'its files to milestones.',
+    'Stopped at: Phase 2 complete',
+    '| Resume file | None |',
+    'not a continuation of a table cell',
+    '',
+  ].join('\n');
+
+  test('names the wrapped tail of the edited line, located from the edit', () => {
+    const after = stateReplaceField(doc, 'Last session', '2026-10-07');
+    assert.strictEqual(editedLineContinuation(doc, after), 'its files to milestones.');
+  });
+
+  test('a single-line field, an unchanged write, and a table row have none', () => {
+    assert.strictEqual(editedLineContinuation(doc, stateReplaceField(doc, 'Stopped at', 'Phase 3')), null);
+    assert.strictEqual(editedLineContinuation(doc, doc), null);
+    assert.strictEqual(editedLineContinuation(doc, stateReplaceField(doc, 'Resume file', 'x.md')), null);
+  });
+
+  test('a new value that only extends the old one still resolves to the same line', () => {
+    const after = doc.replace('moved\n', 'moved them\n');
+    assert.strictEqual(editedLineContinuation(doc, after), 'its files to milestones.');
+  });
+
+  test('CRLF documents resolve the same continuation', () => {
+    const crlf = doc.replace(/\n/g, '\r\n');
+    const after = stateReplaceField(crlf, 'Last session', '2026-10-07');
+    assert.strictEqual(editedLineContinuation(crlf, after), 'its files to milestones.');
   });
 });

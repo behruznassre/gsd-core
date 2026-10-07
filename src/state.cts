@@ -128,6 +128,8 @@ import {
   isUnfilledFieldValue,
   leadingCalendarDate,
   stateFieldContinuation,
+  editedLineContinuation,
+  continuationLineCount,
   stateReplaceField,
   KNOWN_TEMPLATE_DEFAULTS,
   stateReplaceFieldIfTemplate,
@@ -1969,6 +1971,18 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
   // ADR-3473 §8.7 (#3872): caller-allocated out-param, filled with the
   // transaction's own pre-write snapshot + body by `applyPostSyncPreservation`.
   const preWriteState: StatePreWriteSnapshot = {};
+  // #4998: fields left untouched because their existing value wraps onto the
+  // next line. The writers are single-line, so replacing such a field rewrote
+  // only its first line and orphaned the rest. Which lines continue a value and
+  // which are a separate note directly below it cannot be told apart, so the
+  // write leaves the field whole and says so rather than deleting either.
+  const skippedWrapped: { field: string; continuation: string }[] = [];
+  const skipWrapped = (field: string, before: string, after: string): boolean => {
+    const continuation = editedLineContinuation(before, after);
+    if (continuation === null) return false;
+    skippedWrapped.push({ field, continuation });
+    return true;
+  };
 
   readModifyWriteStateMd(statePath, (content) => {
     // #4763 (1): read the pre-write session record. The capture mirrors the
@@ -1984,14 +1998,19 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       const cont = stateFieldContinuation(content, fieldName);
       return cont ? `${first}\n${cont}` : first;
     };
-    priorRecord.stoppedAt = capturePrior('Stopped At');
+    // #4998: with no body line, the frontmatter `stopped_at` is the only copy of
+    // the record, and the sync re-derives it from the line inserted below — a
+    // displacement like any other, so it is the prior record too.
+    const fmStoppedAt = extractFrontmatter(content)['stopped_at'];
+    priorRecord.stoppedAt = capturePrior('Stopped At')
+      ?? (typeof fmStoppedAt === 'string' && fmStoppedAt.trim() ? fmStoppedAt.trim() : undefined);
     priorRecord.resumeFile = capturePrior('Resume File');
 
     // Update Last session / Last Date
     let result = stateReplaceField(content, 'Last session', now);
-    if (result) { content = result; updated.push('Last session'); }
+    if (result && !skipWrapped('Last session', content, result)) { content = result; updated.push('Last session'); }
     result = stateReplaceField(content, 'Last Date', now);
-    if (result) { content = result; updated.push('Last Date'); }
+    if (result && !skipWrapped('Last Date', content, result)) { content = result; updated.push('Last Date'); }
 
     // Update Stopped at
     // #3374 Variant B: stateReplaceField returns the replaced string on any
@@ -2008,7 +2027,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       if (!result) result = stateReplaceField(content, 'Stopped at', options.stopped_at);
       if (result) {
         stoppedAtMatched = true;
-        if (result !== content) { content = result; updated.push('Stopped At'); }
+        if (result !== content && !skipWrapped('Stopped At', content, result)) { content = result; updated.push('Stopped At'); }
       }
     }
 
@@ -2021,21 +2040,16 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // Caller explicitly passed a value — always honour it.
       result = stateReplaceField(content, 'Resume File', options.resume_file);
       if (!result) result = stateReplaceField(content, 'Resume file', options.resume_file);
-      if (result) { content = result; updated.push('Resume File'); }
+      if (result && !skipWrapped('Resume File', content, result)) { content = result; updated.push('Resume File'); }
     } else {
       // No explicit value — only set 'None' when existing value is also a known default
       // (i.e. not executor-authored).
-      const newRf = stateReplaceFieldIfTemplate(content, 'Resume File', resumeFileDefaults, 'None');
-      if (newRf !== content) {
+      let newRf = stateReplaceFieldIfTemplate(content, 'Resume File', resumeFileDefaults, 'None');
+      // Try alternate capitalisation
+      if (newRf === content) newRf = stateReplaceFieldIfTemplate(content, 'Resume file', resumeFileDefaults, 'None');
+      if (newRf !== content && !skipWrapped('Resume File', content, newRf)) {
         content = newRf;
         updated.push('Resume File');
-      } else {
-        // Try alternate capitalisation
-        const newRfAlt = stateReplaceFieldIfTemplate(content, 'Resume file', resumeFileDefaults, 'None');
-        if (newRfAlt !== content) {
-          content = newRfAlt;
-          updated.push('Resume File');
-        }
       }
     }
 
@@ -2064,8 +2078,12 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     // identical value is already persisted on disk and must not trigger the
     // insertion rewrite below.
     const needsStoppedAt = options.stopped_at && !stoppedAtMatched;
-    const needsResumeFile = options.resume_file !== undefined && options.resume_file !== null && !updated.includes('Resume File');
-    const needsLastSession = !updated.includes('Last session') && !updated.includes('Last Date');
+    // #4998: a field skipped as wrapped is present, not missing.
+    const skipped = (field: string): boolean => skippedWrapped.some((s) => s.field === field);
+    const needsResumeFile = options.resume_file !== undefined && options.resume_file !== null
+      && !updated.includes('Resume File') && !skipped('Resume File');
+    const needsLastSession = !updated.includes('Last session') && !updated.includes('Last Date')
+      && !skipped('Last session') && !skipped('Last Date');
 
     if (callerSuppliedValues && (needsStoppedAt || needsResumeFile || needsLastSession)) {
       const resumeValue = (options.resume_file !== undefined && options.resume_file !== null)
@@ -2091,7 +2109,49 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // mutates content).
       let rewriteMatched = false;
 
-      if (existingCanonicalSession) {
+      // #4998: insert each missing field into the section matching `isTarget`,
+      // in the section's own spelling and in template order (Last session →
+      // Stopped at → Resume file), beside the sibling it follows — a bold
+      // `**Stopped at:**` above plain `Last session:` lines is a line the
+      // template does not define. With no sibling present it goes right after
+      // the heading in bold, the pre-#4998 shape. Every existing line is kept.
+      const insertMissingFields = (isTarget: (h: HeadingToken) => boolean): void => {
+        const section = collectSection(content, isTarget, { levelBounded: true });
+        if (!section) return;
+        const lines = section.body.split('\n');
+        const lineOf = (label: string): number =>
+          lines.findIndex((l) => new RegExp(`^(?:\\*\\*)?${label}:(?:\\*\\*)?(?:\\s|$)`, 'i').test(l));
+        const fields: [string, boolean, string][] = [
+          ['Last session', needsLastSession, now],
+          ['Stopped at', !!needsStoppedAt, stoppedAtValue],
+          ['Resume file', needsResumeFile, resumeValue],
+        ];
+        fields.forEach(([label, needed, value], k) => {
+          if (!needed) return;
+          let anchor = -1;
+          let at = 0;
+          for (let j = k - 1; j >= 0 && anchor === -1; j--) {
+            anchor = lineOf(fields[j][0]);
+            // Below the sibling's own wrapped lines, never between them.
+            if (anchor !== -1) at = anchor + 1 + continuationLineCount(lines.slice(anchor + 1));
+          }
+          for (let j = k + 1; j < fields.length && anchor === -1; j++) {
+            anchor = lineOf(fields[j][0]);
+            at = anchor;
+          }
+          if (anchor === -1) at = 0;
+          const bold = anchor === -1 || lines[anchor].startsWith('**');
+          lines.splice(at, 0, bold ? `**${label}:** ${value}` : `${label}: ${value}`);
+        });
+        content = replaceSection(content, section, lines.join('\n'));
+        rewriteMatched = true;
+      };
+
+      if (existingCanonicalSession && skippedWrapped.length > 0) {
+        // #4998: the canonical rewrite below replaces the whole section, which
+        // would delete the wrapped value just left untouched. Insert instead.
+        insertMissingFields((h) => h.level === 2 && h.text.trim().toLowerCase() === 'session');
+      } else if (existingCanonicalSession) {
         // Normalize in place: replace the ENTIRE BODY of the existing ## Session
         // section (heading + all content up to the next ## heading or EOF) with
         // canonical bold-label lines. The negative-lookahead per-line pattern
@@ -2130,30 +2190,11 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // place above (needs* false) are not re-inserted. A function replacement
         // is used so `$`-bearing caller values are inserted literally (#3454).
         //
-        // CRLF-tolerant (`\r?\n`): same #2450 fix as the canonical branch above.
-        const linesToInsert: string[] = [];
-        if (needsLastSession) linesToInsert.push(`**Last session:** ${now}`);
-        if (needsStoppedAt) linesToInsert.push(`**Stopped at:** ${stoppedAtValue}`);
-        if (needsResumeFile) linesToInsert.push(`**Resume file:** ${resumeValue}`);
-        if (linesToInsert.length > 0) {
-          // Case-insensitive to match the `existingSessionContinuity` detection
-          // above (#1101 review F3) — otherwise a lowercase heading would detect
-          // but no-op the insert while still reporting the fields as updated.
-          content = content.replace(
-            /^(## Session Continuity[ \t]*\r?\n)/im,
-            (_m, heading: string) => {
-              rewriteMatched = true;
-              return heading + linesToInsert.join('\n') + '\n';
-            },
-          );
-        }
-        // No `else` branch: if linesToInsert.length === 0 the outer guard at
-        // :1144 (callerSuppliedValues && (needsStoppedAt || needsResumeFile
-        // || needsLastSession)) could not have fired, so this whole block is
-        // unreachable. Leaving `rewriteMatched = false` here is the fail-loud
-        // posture — a future change to the outer guard or needs* computation
-        // that makes this branch reachable will surface as a missing
-        // updated[] entry (silent recorded:false) rather than re-arming #2450.
+        // Heading match is case-insensitive and CRLF-tolerant like the
+        // `existingSessionContinuity` detection above (#1101 review F3, #2450):
+        // a detected heading the writer then misses would report fields as
+        // updated that were never written (`rewriteMatched` stays false).
+        insertMissingFields((h) => h.level === 2 && h.text.trim().toLowerCase() === 'session continuity');
       } else {
         // No session heading exists at all — append a new canonical section.
         const scaffold = [
@@ -2199,16 +2240,29 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
   // direction).
   const reconciledUpdated = reconcileReportedFields(statePath, preWriteState, updated, divergedFields);
 
+  // #4998: name every field left whole because its value wraps, and how to fix it.
+  const skippedRows = skippedWrapped.map(({ field, continuation }) => ({ field, reason: 'wrapped_value', continuation }));
+  const skippedDisclosure = skippedRows.map(({ field, continuation }) =>
+    `state record-session left ${field} unchanged — its value continues onto the next line ` +
+    `(${formatDiagnosticToken(continuation)}), and a single-line write would leave that line behind. ` +
+    'Fold the value onto one line, or put a blank line before that line if it is a separate note, then re-run.',
+  );
+
   if (reconciledUpdated.length > 0) {
     const result: Record<string, unknown> = { recorded: true, updated: reconciledUpdated };
     if (sessionCreated) result['created'] = true;
+    if (skippedRows.length > 0) {
+      result['skipped'] = skippedRows;
+      for (const line of skippedDisclosure) process.stderr.write(`[gsd-tools] WARNING: ${line}\n`);
+    }
     // #4763 (1): surface any non-empty prior record the write displaced. Gated
     // on reconciledUpdated (the fields that actually persisted, post-#3957
     // reconcile) rather than the pre-reconciliation updated[]. Only fields with
     // real prior content differing from the caller's value count — same-value
-    // rewrites, the insert path (no prior label), and the #944 template-default
-    // DWIM (defaults match case-insensitively, so a case-variant 'none' →
-    // 'None' rewrite is normalization, not displacement) are excluded.
+    // rewrites, the insert path with no prior record (no body label and, #4998,
+    // no frontmatter `stopped_at`), and the #944 template-default DWIM
+    // (defaults match case-insensitively, so a case-variant 'none' → 'None'
+    // rewrite is normalization, not displacement) are excluded.
     const isResumeTemplateDefault = priorRecord.resumeFile !== undefined
       && KNOWN_TEMPLATE_DEFAULTS['Resume File'].some(
         (d) => d.toLowerCase() === priorRecord.resumeFile?.toLowerCase());
@@ -2224,6 +2278,15 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     }
     if (Object.keys(replacedRecord).length > 0) result['replacedRecord'] = replacedRecord;
     output(result, raw, 'true');
+  } else if (skippedRows.length > 0) {
+    // #4998: every field the call would have changed wraps — nothing written.
+    declineNoOp(
+      raw,
+      'recorded',
+      'every session field to update has a value that continues onto the next line — left unchanged',
+      skippedDisclosure.join('\n[gsd-tools] WARNING: '),
+      { skipped: skippedRows },
+    );
   } else if (updated.length === 0) {
     // Nothing was ever attempted — no --stopped-at/--resume-file supplied
     // and no existing Last session/Last Date/Stopped At/Resume File labels

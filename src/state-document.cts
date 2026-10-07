@@ -377,16 +377,50 @@ export function stateFieldContinuation(content: string, fieldName: string): stri
   if (!match) return null;
 
   // `(.+)` stops at the line terminator, so the field's line ends where the
-  // match does. JS `.` excludes \r as well as \n, so on a CRLF document the \r
-  // sits just AFTER the match rather than inside it — hence the strip below
-  // before testing for the newline.
-  const afterValue = match.index + match[0].length;
+  // match does.
+  return continuationAfter(content, match.index + match[0].length);
+}
+
+/**
+ * #4998: the continuation (as `stateFieldContinuation` defines it) of the line
+ * a single-line field write CHANGED, located from the edit itself — the first
+ * byte where `before` and `after` differ — so it is always the occurrence the
+ * writer actually touched, whichever label grammar or occurrence it matched.
+ * `null` when nothing changed, the edited line is the last line, or it is a
+ * pipe-table row (a table cell cannot wrap).
+ */
+export function editedLineContinuation(before: string, after: string): string | null {
+  if (before === after) return null;
+  const limit = Math.min(before.length, after.length);
+  let i = 0;
+  while (i < limit && before.charCodeAt(i) === after.charCodeAt(i)) i++;
+  const lineStart = before.lastIndexOf('\n', i - 1) + 1;
+  if (before.slice(lineStart).trimStart().startsWith('|')) return null;
+  const lineEnd = before.indexOf('\n', i);
+  return lineEnd === -1 ? null : continuationAfter(before, lineEnd);
+}
+
+/** The continuation lines following the line that ends at `afterValue`. */
+function continuationAfter(content: string, afterValue: number): string | null {
+  // JS `.` excludes \r as well as \n, so on a CRLF document the \r sits just
+  // AFTER a `(.+)` match rather than inside it — hence the strip below before
+  // testing for the newline.
   const rest = content.slice(afterValue).replace(/^\r/, '');
   if (!rest.startsWith('\n')) return null; // end of file: nothing follows
 
-  const lines = rest.slice(1).split('\n').map((line) => line.replace(/\r$/, ''));
-  const continuation: string[] = [];
-  for (let i = 0; i < lines.length; i++) {
+  const lines = rest.slice(1).split('\n');
+  const continuation = lines.slice(0, continuationLineCount(lines)).map((line) => line.replace(/\r$/, '').trim());
+  return continuation.length ? continuation.join(' ') : null;
+}
+
+/**
+ * How many of `following` — the lines directly below a single-line field —
+ * continue its value rather than starting the next construct.
+ */
+export function continuationLineCount(following: string[]): number {
+  const lines = following.map((line) => line.replace(/\r$/, ''));
+  let i = 0;
+  for (; i < lines.length; i++) {
     const line = lines[i];
     if (!line.trim()) break;
     if (MD_STRUCTURE_LINE_RE.test(line)) break;
@@ -394,9 +428,8 @@ export function stateFieldContinuation(content: string, fieldName: string): stri
     // Look ahead one line: a setext underline below makes THIS line a heading
     // title, so stop before consuming it rather than after.
     if (i + 1 < lines.length && SETEXT_UNDERLINE_RE.test(lines[i + 1])) break;
-    continuation.push(line.trim());
   }
-  return continuation.length ? continuation.join(' ') : null;
+  return i;
 }
 
 export function stateExtractField(content: string, fieldName: string): string | null {
