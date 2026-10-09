@@ -1109,3 +1109,56 @@ describe('gsd-cursor-subagent-start.js: #4885 — workspace root is a project su
     assert.equal(JSON.parse(r.stdout).permission, undefined);
   });
 });
+
+describe('#4885: a symlink inside a GSD project that points into another repository', () => {
+  // Root resolution walks from where the workspace physically is. A lexical
+  // walk from `<project>/external-link` found the GSD project, so both guards
+  // enforced its isolation on a dispatch running in the other repository.
+  // Lives beside the symlink spoofing test above (same Windows skip), and
+  // drives both guards so the agent-guard file needs no symlink of its own.
+  let harnessProject;
+  let otherRepo;
+  let link;
+  let symlinkError = null;
+
+  before(() => {
+    harnessProject = makeGitProject('gsd-cs-4885-link-', JSON.stringify({ runtime: 'claude' }));
+    otherRepo = createTempDir('gsd-cs-4885-other-');
+    git(['init'], otherRepo);
+    fs.mkdirSync(path.join(otherRepo, 'src'));
+    link = path.join(harnessProject, 'external-link');
+    try {
+      fs.symlinkSync(path.join(otherRepo, 'src'), link, 'dir');
+    } catch (err) {
+      symlinkError = err;
+    }
+  });
+
+  after(() => {
+    cleanup(harnessProject);
+    cleanup(otherRepo);
+  });
+
+  test('Claude guard: a dispatch through the link is not governed by the GSD project', (t) => {
+    if (symlinkError) {
+      t.skip('directory symlinks require elevated privileges on this platform');
+      return;
+    }
+    const { evaluateDispatch } = require('../hooks/gsd-agent-isolation-guard.js');
+    const dispatch = (cwd) => evaluateDispatch({ tool_name: 'Agent', cwd, tool_input: { subagent_type: 'gsd-executor' } });
+    assert.equal(dispatch(link).action, 'allow');
+    // Control: the project itself still enforces.
+    assert.equal(dispatch(harnessProject).action, 'block');
+  });
+
+  test('Cursor guard: a workspace root through the link is not governed by the GSD project', (t) => {
+    if (symlinkError) {
+      t.skip('directory symlinks require elevated privileges on this platform');
+      return;
+    }
+    fs.writeFileSync(path.join(harnessProject, '.planning', 'config.json'), JSON.stringify({ runtime: 'cursor' }));
+    t.after(() => fs.writeFileSync(path.join(harnessProject, '.planning', 'config.json'), JSON.stringify({ runtime: 'claude' })));
+    assert.equal(JSON.parse(runHook(subagentPayload([link])).stdout).permission, undefined);
+    assert.equal(JSON.parse(runHook(subagentPayload([harnessProject])).stdout).permission, 'deny');
+  });
+});
