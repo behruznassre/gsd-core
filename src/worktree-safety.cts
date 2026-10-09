@@ -2758,29 +2758,20 @@ function findUnregisteredResidue(
   const mtimeSafe = deps.mtimeSafe || defaultMtimeSafe;
   const results: ReapResult[] = [];
 
-  // Only a main checkout scans. The common case is read off the path: a main
-  // checkout's git dir is `<top>/.git` with the cwd inside `<top>` (a
-  // `--separate-git-dir` that happens to be named `.git` sits elsewhere, so
-  // the cwd is not inside its parent). Any other git dir is either a linked
-  // worktree's `<common>/worktrees/<id>` or a `--separate-git-dir` main
-  // checkout, so git is asked which — a main checkout's git dir IS its common
-  // dir — and names the top.
+  // Only a main checkout scans: its git dir IS the common dir, while a linked
+  // worktree's is `<common>/worktrees/<id>`. Asked of git, as is the top —
+  // the git dir's location says nothing reliable about the checkout's, since
+  // `--separate-git-dir` can put it anywhere, under any name.
   const canonicalOrResolved = (p: string) => {
     try { return fs.realpathSync.native(p); } catch { return path.resolve(p); }
   };
-  let top: string;
-  if (path.basename(gitDirPath) === '.git'
-      && isContainedIn(canonicalOrResolved(repoRoot), canonicalOrResolved(path.dirname(gitDirPath)))) {
-    top = path.dirname(gitDirPath);
-  } else {
-    const commonDir = execGit(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
-    const topLevel = execGit(['rev-parse', '--show-toplevel'], { cwd: repoRoot });
-    if (!gitResultOk(commonDir) || !gitResultOk(topLevel)) return { results, status: 'top_unresolved' };
-    if (canonicalOrResolved(path.resolve(repoRoot, commonDir.stdout.trim())) !== canonicalOrResolved(gitDirPath)) {
-      return { results, status: 'not_main_checkout' };
-    }
-    top = topLevel.stdout.trim();
+  const commonDir = execGit(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
+  const topLevel = execGit(['rev-parse', '--show-toplevel'], { cwd: repoRoot });
+  if (!gitResultOk(commonDir) || !gitResultOk(topLevel)) return { results, status: 'top_unresolved' };
+  if (canonicalOrResolved(path.resolve(repoRoot, commonDir.stdout.trim())) !== canonicalOrResolved(gitDirPath)) {
+    return { results, status: 'not_main_checkout' };
   }
+  const top = topLevel.stdout.trim();
   const residueDir = path.join(top, '.claude', 'worktrees');
 
   let names: string[];

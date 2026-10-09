@@ -224,8 +224,9 @@ describe('#3057 reapOrphanWorktrees: default-branch discovery verdicts', () => {
     assert.strictEqual(probed.length, 1, 'the admin directory must be probed exactly once');
     assert.strictEqual(path.basename(probed[0]), 'worktrees');
     // Distinguishes this bail-out from the --git-dir one above: --git-dir DID
-    // run and succeed, and nothing after the admin listing was attempted.
-    assert.deepStrictEqual(argvOf(faultyGit), ['rev-parse --git-dir']);
+    // run and succeed, and nothing on the admin path ran after the listing.
+    // #4941: the report-only residue scan then asks git which checkout it is in.
+    assert.deepStrictEqual(argvOf(faultyGit), ['rev-parse --git-dir', 'rev-parse --git-common-dir', 'rev-parse --show-toplevel']);
   });
 
   test('returns no rows for a repo that has no linked worktrees at all', () => {
@@ -1333,6 +1334,27 @@ describe('#4941 regression: reap-orphans names unregistered .claude/worktrees re
     fs.mkdirSync(path.join(meta, '.claude', 'worktrees', 'decoy'), { recursive: true });
 
     const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+
+    assert.deepStrictEqual(rows(results), [[canonicalPath(residue), 'skipped', 'unregistered_residue']]);
+    assert.strictEqual(scan.residue_dir, 'scanned');
+  });
+
+  test('separate metadata in the checkout\'s PARENT (/project/.git beside /project/checkout) scans the checkout', () => {
+    const project = path.join(tmpBase, 'project');
+    const checkout = path.join(project, 'checkout');
+    fs.mkdirSync(checkout, { recursive: true });
+    git(['init', `--separate-git-dir=${path.join(project, '.git')}`], checkout);
+    git(['config', 'user.email', 'test@test.com'], checkout);
+    git(['config', 'user.name', 'Test'], checkout);
+    git(['config', 'commit.gpgsign', 'false'], checkout);
+    fs.writeFileSync(path.join(checkout, 'README.md'), '# Test\n');
+    git(['add', '-A'], checkout);
+    git(['commit', '-m', 'initial commit'], checkout);
+    const residue = makeResidue(checkout, 'agent-t1');
+    git(['worktree', 'prune'], checkout);
+    fs.mkdirSync(path.join(project, '.claude', 'worktrees', 'decoy'), { recursive: true });
+
+    const { results, scan } = reapOrphanWorktreesWithScan(checkout, deadOwnerDeps());
 
     assert.deepStrictEqual(rows(results), [[canonicalPath(residue), 'skipped', 'unregistered_residue']]);
     assert.strictEqual(scan.residue_dir, 'scanned');
