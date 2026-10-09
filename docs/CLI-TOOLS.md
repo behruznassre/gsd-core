@@ -124,6 +124,8 @@ node gsd-tools.cjs state signal-waiting --type TYPE --question "..." --options "
 node gsd-tools.cjs state signal-resume
 ```
 
+`state record-session` takes single-line values: a line break in `--stopped-at` or `--resume-file` is refused before anything is written. Its JSON lists the fields it wrote under `updated`, and under `replacedRecord` any non-empty Stopped At / Resume File value the write displaced. A field whose current value continues onto the next line is left unchanged, because a single-line write would orphan the rest: it is listed under `skipped` as `{ "field", "reason": "wrapped_value", "continuation" }` with a warning on stderr, and when every field to update was skipped the call reports `"recorded": false`.
+
 ### State Snapshot
 
 Structured parse of the full STATE.md:

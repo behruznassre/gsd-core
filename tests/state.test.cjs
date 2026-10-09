@@ -22138,6 +22138,75 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.deepStrictEqual(json.replacedRecord, { 'Stopped At': 'derive from git log; do not read this field' });
     assert.strictEqual(frontmatterLib.extractFrontmatter(fs.readFileSync(statePath(), 'utf-8')).stopped_at, 'Phase 3 plan 1 done');
   });
+  // ─── trek-e review 2026-10-09: the four items the body had deferred ───────
+  function readState() { return fs.readFileSync(statePath(), 'utf-8'); }
+  function frontmatterStoppedAt() {
+    const m = readState().match(/^stopped_at:\s*(.*)$/m);
+    return m ? m[1].replace(/^"(.*)"$/, '$1') : null;
+  }
+
+  test('(a) a line break in --stopped-at is refused before anything is written', () => {
+    seed([], ['Last session: 2026-01-01', 'Stopped at: Phase 2', 'Resume file: None']);
+    const before = readState();
+    const { runNode } = require('./helpers/process-seam.cjs');
+    const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+    const { TOOLS_PATH: toolsPath, TEST_ENV_BASE } = require('./helpers.cjs');
+    for (const value of ['line one\nForged: line', 'line one\rForged: line']) {
+      const rec = runNode([toolsPath, 'state', 'record-session', '--stopped-at', value],
+        { cwd: tmpDir, env: { ...process.env, ...TEST_ENV_BASE }, timeoutMs: PROBE_TIMEOUT_MS });
+      assert.notStrictEqual(rec.exitCode, 0, `must refuse ${JSON.stringify(value)}`);
+      assert.match(rec.stderr, /--stopped-at must be a single line/);
+      assert.strictEqual(readState(), before, 'STATE.md must be untouched');
+    }
+  });
+
+  test('(b) a **Stopped at**: (colon-outside) line that is updated reads back into frontmatter', () => {
+    seed(['stopped_at: old handoff'], ['**Last session**: 2026-01-01', '**Stopped at**: old handoff', '**Resume file**: None'], '## Session');
+    const { json } = recordSession('--stopped-at', 'new handoff');
+    assert.ok(json.updated.includes('Stopped At'), JSON.stringify(json));
+    assert.ok(session().includes('**Stopped at**: new handoff'), session());
+    assert.strictEqual(frontmatterStoppedAt(), 'new handoff', readState());
+  });
+
+  test('(c) an indented fence directly below Stopped at is not its continuation — the field is written', () => {
+    seed([], ['Last session: 2026-01-01', 'Stopped at: Phase 2', '  ```', '  example', '  ```', 'Resume file: None']);
+    const { json } = recordSession('--stopped-at', 'Phase 3');
+    assert.strictEqual(json.skipped, undefined, JSON.stringify(json));
+    assert.ok(session().includes('Stopped at: Phase 3\n  ```\n  example\n  ```\n'), session());
+  });
+
+  test('(c) an indented sibling field directly below Stopped at is not its continuation', () => {
+    seed([], ['Last session: 2026-01-01', 'Stopped at: Phase 2', '  **Resume file:** plan.md']);
+    const { json } = recordSession('--stopped-at', 'Phase 3');
+    assert.strictEqual(json.skipped, undefined, JSON.stringify(json));
+    assert.ok(session().includes('Stopped at: Phase 3\n  **Resume file:** plan.md'), session());
+  });
+
+  test('(d) no session heading, a wrapped field and a frontmatter stopped_at: no shadowing section is appended', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', 'stopped_at: old handoff', '---', '', '# Project State', '',
+      'Stopped at: old handoff', 'its continuation', ''].join('\n'));
+    const { json } = recordSession('--stopped-at', 'new handoff', '--resume-file', 'plan.md');
+    assert.deepStrictEqual(json.skipped.map((s) => s.field), ['Stopped At']);
+    const after = readState();
+    assert.ok(!/^## Session/m.test(after), `no section may be appended: ${after}`);
+    assert.match(after, /\nLast session: \S+\nStopped at: old handoff\nits continuation\nResume file: plan.md\n/);
+    assert.strictEqual(frontmatterStoppedAt(), 'old handoff', 'the record the sync reads is unchanged');
+  });
+
+  test('no session heading: a missing field goes beside the existing ones; an authored Resume file is not shadowed', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
+      'Stopped at: Phase 2', 'Resume file: .planning/phases/02/02-01-PLAN.md', ''].join('\n'));
+    recordSession('--stopped-at', 'Phase 3');
+    const after = readState();
+    assert.ok(!/^## Session/m.test(after), after);
+    assert.match(after, /\nLast session: \S+\nStopped at: Phase 3\nResume file: \.planning\/phases\/02\/02-01-PLAN\.md\n/);
+  });
+
+  test('no session heading and no session field: the canonical section is still appended', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', ''].join('\n'));
+    recordSession('--stopped-at', 'Phase 3');
+    assert.match(readState(), /\n## Session\n\n\*\*Last session:\*\* \S+\n\*\*Stopped at:\*\* Phase 3\n\*\*Resume file:\*\* None\n/);
+  });
 });
 
 // ---------------------------------------------------------------------------

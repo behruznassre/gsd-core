@@ -22,7 +22,10 @@ const {
   stateExtractField,
   stateReplaceFieldWithFallback,
   editedLineContinuation,
+  stateFieldContinuation,
+  insertMissingSessionFields,
 } = require('../gsd-core/bin/lib/state-document.cjs');
+const { scanFencedBlocks } = require('../gsd-core/bin/lib/markdown-sectionizer.cjs');
 
 describe('stateReplaceField — table branch (characterization, #2880)', () => {
   test('replaces a two-cell row in place', () => {
@@ -2696,5 +2699,113 @@ describe('editedLineContinuation (#4998): the continuation of the line a write c
     const crlf = doc.replace(/\n/g, '\r\n');
     const after = stateReplaceField(crlf, 'Last session', '2026-10-07');
     assert.strictEqual(editedLineContinuation(crlf, after), 'its files to milestones.');
+  });
+});
+
+describe('#4998 review round: single-line writes, colon-outside reads, continuation boundaries', () => {
+  test('every stateReplaceField rung refuses a value with a line break (it would forge sibling lines)', () => {
+    for (const value of ['a\nForged: x', 'a\rForged: x', 'a\r\nForged: x']) {
+      assert.equal(stateReplaceField('**Status:** old', 'Status', value), null, 'bold');
+      assert.equal(stateReplaceField('Status: old', 'Status', value), null, 'plain');
+      assert.equal(stateReplaceField('| Status | old |', 'Status', value), null, 'table');
+    }
+    // Control: the same rungs still write a single-line value.
+    assert.equal(stateReplaceField('Status: old', 'Status', 'new'), 'Status: new');
+  });
+
+  test('stateExtractField and stateFieldContinuation read both bold placements', () => {
+    assert.equal(stateExtractField('**Stopped at**: Phase 2', 'Stopped at'), 'Phase 2');
+    assert.equal(stateExtractField('**Stopped at:** Phase 2', 'Stopped at'), 'Phase 2');
+    assert.equal(stateFieldContinuation('**Stopped at**: Phase 2\nmore of it', 'Stopped at'), 'more of it');
+    // Not a field: the colon is neither inside nor directly after the bold.
+    assert.equal(stateExtractField('**Stopped at** Phase 2: x', 'Stopped at'), null);
+  });
+
+  // Continuation-run length 0 / 1 / 2: a blank line, end of file or a sibling ends it.
+  for (const [label, doc, expected] of [
+    ['run 0 (blank line)', 'F: a\n\nb', null],
+    ['run 1', 'F: a\nb', 'b'],
+    ['run 2', 'F: a\nb\nc\n\nd', 'b c'],
+  ]) {
+    test(`stateFieldContinuation: ${label}`, () => {
+      assert.equal(stateFieldContinuation(doc, 'F'), expected);
+    });
+  }
+
+  // Indentation boundary for a fence and a sibling field below a field: 0-3
+  // spaces open them, 4 is indented code — every row ends the run. An
+  // indented bullet stays a continuation (fails toward skipping the field).
+  for (const indent of [0, 1, 3, 4]) {
+    const pad = ' '.repeat(indent);
+    test(`a fence indented ${indent} is not a continuation`, () => {
+      assert.equal(stateFieldContinuation(`F: a\n${pad}\`\`\`\nx\n${pad}\`\`\``, 'F'), null);
+      assert.equal(stateFieldContinuation(`F: a\n${pad}~~~\nx`, 'F'), null);
+    });
+    test(`a sibling field indented ${indent} is not a continuation`, () => {
+      assert.equal(stateFieldContinuation(`F: a\n${pad}**G:** b`, 'F'), null);
+      assert.equal(stateFieldContinuation(`F: a\n${pad}G: b`, 'F'), null);
+    });
+  }
+  test('an indented bullet below a field stays its continuation', () => {
+    assert.equal(stateFieldContinuation('F: a\n  - note', 'F'), '- note');
+  });
+
+  // First-diff index around a line start: limit-1 (the newline ending the
+  // previous line), limit (the line's first byte), limit+1.
+  test('editedLineContinuation attributes the edit to the right line at a line boundary', () => {
+    const before = 'A: 1\nmore a\n\nB: 2\nmore b';
+    const bStart = before.indexOf('B: 2');
+    const editAt = (i) => before.slice(0, i) + 'X' + before.slice(i);
+    assert.equal(editedLineContinuation(before, editAt(0)), 'more a', 'index 0 is line A');
+    assert.equal(editedLineContinuation(before, editAt(bStart - 1)), null, 'limit-1 is the blank line above B');
+    assert.equal(editedLineContinuation(before, editAt(bStart)), 'more b', 'limit is line B');
+    assert.equal(editedLineContinuation(before, editAt(bStart + 1)), 'more b', 'limit+1 is line B');
+  });
+
+  test('editedLineContinuation: an edit at byte 0 of a document opening with a blank line is that blank line', () => {
+    assert.equal(editedLineContinuation('\nnext', 'X\nnext'), 'next');
+  });
+});
+
+describe('insertMissingSessionFields (#4998)', () => {
+  const FIELDS = (ls, sa, rf) => [['Last session', ls, 'V-LS'], ['Stopped at', sa, 'V-SA'], ['Resume file', rf, 'V-RF']];
+
+  test('inserts beside the template-order sibling, plain beside plain, bold beside bold', () => {
+    assert.equal(insertMissingSessionFields('Last session: x\nResume file: y', FIELDS(false, true, false), false),
+      'Last session: x\nStopped at: V-SA\nResume file: y');
+    assert.equal(insertMissingSessionFields('**Stopped at:** x', FIELDS(true, false, false), false),
+      '**Last session:** V-LS\n**Stopped at:** x');
+  });
+
+  test('requireSibling: no field present → null; otherwise inserted', () => {
+    assert.equal(insertMissingSessionFields('prose\n```\nStopped at: example\n```', FIELDS(true, true, true), true), null);
+    assert.equal(insertMissingSessionFields('prose', FIELDS(true, false, false), false), '**Last session:** V-LS\nprose');
+  });
+
+  // Property: every pre-existing line survives, in order; exactly the needed
+  // fields are added; no added line lands inside a fenced block.
+  test('property: keeps every line in order, adds exactly the needed fields, never inside a fence', () => {
+    const LINE = fc.constantFrom('', 'prose text', 'Last session: a', '**Stopped at:** b', 'Stopped at**: c',
+      'Resume file: d', '```', '~~~', '````md', '  ```', '  - bullet', '    code', '**Other:** z', '## Heading');
+    fc.assert(fc.property(
+      fc.array(LINE, { maxLength: 14 }), fc.boolean(), fc.boolean(), fc.boolean(), fc.boolean(),
+      (input, ls, sa, rf, requireSibling) => {
+        const out = insertMissingSessionFields(input.join('\n'), FIELDS(ls, sa, rf), requireSibling);
+        if (out === null) {
+          assert.ok(requireSibling, 'null only under requireSibling');
+          return;
+        }
+        const lines = out.split('\n');
+        const added = lines.map((l, i) => [l, i]).filter(([l]) => /V-(LS|SA|RF)$/.test(l));
+        assert.deepStrictEqual(lines.filter((l) => !/V-(LS|SA|RF)$/.test(l)), input.join('\n').split('\n'));
+        assert.equal(added.length, [ls, sa, rf].filter(Boolean).length);
+        const fenced = new Set();
+        for (const b of scanFencedBlocks(lines)) {
+          const end = b.closeLineIdx === -1 ? lines.length - 1 : b.closeLineIdx;
+          for (let i = b.openLineIdx; i <= end; i++) fenced.add(i);
+        }
+        for (const [, i] of added) assert.ok(!fenced.has(i), `added line ${i} is inside a fence:\n${out}`);
+      },
+    ));
   });
 });

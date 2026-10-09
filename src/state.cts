@@ -129,13 +129,13 @@ import {
   leadingCalendarDate,
   stateFieldContinuation,
   editedLineContinuation,
-  continuationLineCount,
+  insertMissingSessionFields,
   stateReplaceField,
   KNOWN_TEMPLATE_DEFAULTS,
   stateReplaceFieldIfTemplate,
   stateCurrentPositionSlice,
 } from './state-document.cjs';
-import { tokenizeHeadings, collectSection, collectSections, replaceSection, stripFencedCode, scanFencedBlocks } from './markdown-sectionizer.cjs';
+import { tokenizeHeadings, collectSection, collectSections, replaceSection, stripFencedCode } from './markdown-sectionizer.cjs';
 import type { HeadingToken } from './markdown-sectionizer.cjs';
 import { parseMarkdownTable, updateTableCell, deleteTableRow, insertTableRow, splitTableRow, isDelimiterRow } from './markdown-table.cjs';
 import { textEncodingError } from './validate.cjs';
@@ -1956,6 +1956,11 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
   if (!options.stopped_at && (options.resume_file === undefined || options.resume_file === null)) {
     error('stopped-at or resume-file required for state record-session');
   }
+  // #4998: every field this writes is single-line; a line break in a value
+  // would forge sibling lines, so it is refused before anything is touched.
+  for (const [flag, value] of [['--stopped-at', options.stopped_at], ['--resume-file', options.resume_file]] as const) {
+    if (typeof value === 'string' && /[\r\n]/.test(value)) error(`state record-session: ${flag} must be a single line`);
+  }
   const statePath = planningPaths(cwd).state;
   if (!fs.existsSync(statePath)) { output({ error: 'STATE.md not found' }, raw, undefined); return; }
 
@@ -2109,69 +2114,42 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // mutates content).
       let rewriteMatched = false;
 
-      // #4998: insert each missing field into the section matching `isTarget`,
+      // #4998: insert each missing field into `region`,
       // in the section's own spelling and in template order (Last session →
       // Stopped at → Resume file), beside the sibling it follows — a bold
       // `**Stopped at:**` above plain `Last session:` lines is a line the
       // template does not define. With no sibling present it goes right after
       // the heading in bold, the pre-#4998 shape. Every existing line is kept.
-      const insertMissingFields = (isTarget: (h: HeadingToken) => boolean): void => {
-        const section = collectSection(content, isTarget, { levelBounded: true });
-        // A heading with no line terminator (at EOF) has no body to insert
-        // into; leave rewriteMatched false rather than glue a field onto it.
-        if (!section || content[section.bodyStart - 1] !== '\n') return;
-        const lines = section.body.split('\n');
-        // Lines inside a fenced block (delimiters included) are examples:
-        // never an anchor, never an insertion point.
-        const fenced = lines.map(() => false);
-        for (const block of scanFencedBlocks(lines)) {
-          const end = block.closeLineIdx === -1 ? lines.length - 1 : block.closeLineIdx;
-          for (let i = block.openLineIdx; i <= end; i++) fenced[i] = true;
-        }
-        // The spellings stateReplaceField writes: `**Label:**`, `**Label**:`, `Label:`.
-        const labelRe = (label: string): RegExp => new RegExp(`^[ \\t]*(?:\\*\\*)?${label}(?::\\*\\*|\\*\\*:|:)(?:\\s|$)`, 'i');
-        const lineOf = (label: string): number =>
-          lines.findIndex((l, i) => !fenced[i] && labelRe(label).test(l));
-        const fields: [string, boolean, string][] = [
+      //
+      // `region` is a session section's body, or — with no session heading —
+      // the whole document, where the sync reads these fields too. Returns
+      // false, writing nothing, when `requireSibling` is set and no field of
+      // the three is present to insert beside.
+      type Region = { bodyStart: number; bodyEnd: number; body: string };
+      const insertMissingFields = (region: Region, requireSibling: boolean): boolean => {
+        const body = insertMissingSessionFields(region.body, [
           ['Last session', needsLastSession, now],
           ['Stopped at', !!needsStoppedAt, stoppedAtValue],
           ['Resume file', needsResumeFile, resumeValue],
-        ];
-        fields.forEach(([label, needed, value], k) => {
-          if (!needed) return;
-          let anchor = -1;
-          let at = 0;
-          for (let j = k - 1; j >= 0 && anchor === -1; j--) {
-            anchor = lineOf(fields[j][0]);
-            // Below the sibling's own wrapped lines, never between them — but
-            // stop before a fence the continuation scan does not recognize.
-            if (anchor !== -1) {
-              const tail = continuationLineCount(lines.slice(anchor + 1));
-              at = anchor + 1;
-              while (at < anchor + 1 + tail && !fenced[at]) at++;
-            }
-          }
-          for (let j = k + 1; j < fields.length && anchor === -1; j++) {
-            anchor = lineOf(fields[j][0]);
-            at = anchor;
-          }
-          if (anchor === -1) at = 0;
-          // Plain beside a plain sibling, else bold — in the spellings
-          // stateExtractField reads back (`**Label:**`, unindented `Label:`), not
-          // the anchor's own `**Label**:`, which the sync could not read.
-          const bold = anchor === -1 || lines[anchor].trimStart().startsWith('**');
-          lines.splice(at, 0, bold ? `**${label}:** ${value}` : `${label}: ${value}`);
-          fenced.splice(at, 0, false);
-        });
-        content = replaceSection(content, section, lines.join('\n'));
+        ], requireSibling);
+        if (body === null) return false;
+        content = content.slice(0, region.bodyStart) + body + content.slice(region.bodyEnd);
         rewriteMatched = true;
+        return true;
+      };
+      // A heading with no line terminator (at EOF) has no body to insert
+      // into; leave rewriteMatched false rather than glue a field onto it.
+      const insertIntoSection = (isTarget: (h: HeadingToken) => boolean): void => {
+        const section = collectSection(content, isTarget, { levelBounded: true });
+        if (!section || content[section.bodyStart - 1] !== '\n') return;
+        insertMissingFields(section, false);
       };
 
       if (existingCanonicalSession) {
         // #4998: insert the missing fields in place. This used to replace the
         // whole section with three canonical lines, which deleted any wrapped
         // value or note in it — and reset an authored Resume file to None.
-        insertMissingFields((h) => h.level === 2 && h.text.trim().toLowerCase() === 'session');
+        insertIntoSection((h) => h.level === 2 && h.text.trim().toLowerCase() === 'session');
       } else if (existingSessionContinuity) {
         // #1101: a `## Session Continuity` section already exists (bootstrap
         // shape). Previously this fell through to the append branch and created
@@ -2186,22 +2164,21 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // `existingSessionContinuity` detection above (#1101 review F3, #2450):
         // a detected heading the writer then misses would report fields as
         // updated that were never written (`rewriteMatched` stays false).
-        insertMissingFields((h) => h.level === 2 && h.text.trim().toLowerCase() === 'session continuity');
-      } else {
-        // No session heading exists at all — append a new canonical section.
-        // #4998: the appended section becomes the one the sync reads, so a
-        // field left whole as wrapped must not reappear in it with the new
-        // value; it then carries only the fields that are actually missing.
-        const scaffoldFields: [string, boolean, string][] = [
-          ['Last session', skippedWrapped.length === 0 || needsLastSession, now],
-          ['Stopped at', skippedWrapped.length === 0 || !!needsStoppedAt, stoppedAtValue],
-          ['Resume file', skippedWrapped.length === 0 || needsResumeFile, resumeValue],
-        ];
+        insertIntoSection((h) => h.level === 2 && h.text.trim().toLowerCase() === 'session continuity');
+      } else if (!insertMissingFields({ bodyStart: 0, bodyEnd: content.length, body: content }, true)) {
+        // No session heading and no session field anywhere — append a new
+        // canonical section. #4998: when some session field IS present
+        // without a heading, the missing ones were inserted beside it above
+        // instead: a new `## Session` would become the section the sync reads
+        // and shadow the existing lines, dropping a wrapped field's record and
+        // resetting an authored Resume file to None.
         const scaffold = [
           '',
           '## Session',
           '',
-          ...scaffoldFields.filter(([, include]) => include).map(([label, , value]) => `**${label}:** ${value}`),
+          `**Last session:** ${now}`,
+          `**Stopped at:** ${stoppedAtValue}`,
+          `**Resume file:** ${resumeValue}`,
           '',
         ].join('\n');
         content = content.trimEnd() + '\n' + scaffold;

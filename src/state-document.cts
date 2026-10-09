@@ -9,7 +9,7 @@
 
 import { splitTableRow } from './markdown-table.cjs';
 import { clampPercentFromFraction } from './phase-lifecycle.cjs';
-import { collectSection, withSection } from './markdown-sectionizer.cjs';
+import { collectSection, withSection, scanFencedBlocks } from './markdown-sectionizer.cjs';
 import type { HeadingToken } from './markdown-sectionizer.cjs';
 import { escapeRegex } from './pattern.cjs';
 import { parsePlanningDoc } from './planning-document.cjs';
@@ -325,9 +325,16 @@ export function isRealCalendarDate(year: number, month: number, day: number): bo
  * produce false S009 fires on well-formed content: an indented code block, an
  * HTML block, and a setext underline (`===`, which the `[-*_]{3,}` rule does not
  * cover — it only knows `-`, `*` and `_`).
+ *
+ * #4998: a fence opens with up to three leading spaces, as Markdown allows —
+ * an indented fence directly below a field was read as its continuation, so
+ * record-session skipped a field that does not wrap. Four spaces or a tab is
+ * the indented-code arm. Other indented structure (an indented bullet) stays a
+ * continuation on purpose: it fails toward skipping the field, never toward
+ * splitting a note from the field it annotates.
  */
 const MD_STRUCTURE_LINE_RE =
-  /^(?:#{1,6}\s|\||>|```|~~~|[-*_]{3,}\s*$|=+\s*$|[-*+]\s|\d+[.)]\s|\[[^\]]+\]:|<|(?: {4}|\t))/;
+  /^(?:#{1,6}\s|\||>| {0,3}(?:```|~~~)|[-*_]{3,}\s*$|=+\s*$|[-*+]\s|\d+[.)]\s|\[[^\]]+\]:|<|(?: {4}|\t))/;
 
 /**
  * A setext heading's underline — `===` or `---` on its own line. The line ABOVE
@@ -338,7 +345,10 @@ const MD_STRUCTURE_LINE_RE =
  */
 const SETEXT_UNDERLINE_RE = /^(?:=+|-+)\s*$/;
 
-const STATE_SIBLING_FIELD_LINE_RE = /^\*{0,2}[A-Za-z][A-Za-z0-9 _-]*\*{0,2}:{1,2}\*{0,2}(?:\s|$)/;
+// #4998: a sibling field may be indented as the field above it may be
+// (`stateExtractField`'s bold rung tolerates leading whitespace); up to three
+// spaces, as for MD_STRUCTURE_LINE_RE — four is indented code either way.
+const STATE_SIBLING_FIELD_LINE_RE = /^ {0,3}\*{0,2}[A-Za-z][A-Za-z0-9 _-]*\*{0,2}:{1,2}\*{0,2}(?:\s|$)/;
 
 /**
  * Return the prose that FOLLOWS a single-line field but plainly belongs to it —
@@ -372,7 +382,7 @@ export function stateFieldContinuation(content: string, fieldName: string): stri
   // is deliberately absent: a `| Field | value |` row is bounded by its closing
   // pipe and cannot wrap.
   const match =
-    new RegExp(`^[ \\t]*\\*\\*${escaped}:\\*\\*[ \\t]*(.+)`, 'im').exec(content) ??
+    new RegExp(`^[ \\t]*\\*\\*${escaped}(?::\\*\\*|\\*\\*:)[ \\t]*(.+)`, 'im').exec(content) ??
     new RegExp(`^${escaped}:[ \\t]*(.+)`, 'im').exec(content);
   if (!match) return null;
 
@@ -394,9 +404,13 @@ export function editedLineContinuation(before: string, after: string): string | 
   const limit = Math.min(before.length, after.length);
   let i = 0;
   while (i < limit && before.charCodeAt(i) === after.charCodeAt(i)) i++;
-  const lineStart = before.lastIndexOf('\n', i - 1) + 1;
-  if (before.slice(lineStart).trimStart().startsWith('|')) return null;
+  // `lastIndexOf` clamps a negative start to 0, so i = 0 would find a
+  // newline AT byte 0 and misplace the edited line onto the next one.
+  const lineStart = i === 0 ? 0 : before.lastIndexOf('\n', i - 1) + 1;
   const lineEnd = before.indexOf('\n', i);
+  // The edited line only: trimming the rest of the document would let a blank
+  // edited line borrow a later table row's pipe.
+  if (before.slice(lineStart, lineEnd === -1 ? before.length : lineEnd).trimStart().startsWith('|')) return null;
   return lineEnd === -1 ? null : continuationAfter(before, lineEnd);
 }
 
@@ -432,11 +446,69 @@ export function continuationLineCount(following: string[]): number {
   return i;
 }
 
+/** A session field `insertMissingSessionFields` may add: label, whether it is missing, the value. */
+export type SessionFieldInsert = readonly [label: string, needed: boolean, value: string];
+
+/**
+ * #4998: insert each needed field of `fields` — given in template order — into
+ * `body`, beside the sibling it follows in that order (below the sibling's own
+ * wrapped lines, never between them), else before the sibling it precedes,
+ * else at the top in bold. Plain beside a plain sibling, else bold, in the
+ * spellings `stateExtractField` reads back. Every existing line is kept, in
+ * order, and lines inside a fenced block are examples: never an anchor, never
+ * an insertion point.
+ *
+ * Returns `null`, inserting nothing, when `requireSibling` is set and no field
+ * of `fields` appears in `body` outside a fence.
+ */
+export function insertMissingSessionFields(
+  body: string,
+  fields: readonly SessionFieldInsert[],
+  requireSibling: boolean,
+): string | null {
+  const lines = body.split('\n');
+  const fenced = lines.map(() => false);
+  for (const block of scanFencedBlocks(lines)) {
+    const end = block.closeLineIdx === -1 ? lines.length - 1 : block.closeLineIdx;
+    for (let i = block.openLineIdx; i <= end; i++) fenced[i] = true;
+  }
+  // The spellings stateReplaceField writes: `**Label:**`, `**Label**:`, `Label:`.
+  const labelRe = (label: string): RegExp =>
+    new RegExp(`^[ \\t]*(?:\\*\\*)?${escapeRegex(label)}(?::\\*\\*|\\*\\*:|:)(?:\\s|$)`, 'i');
+  const lineOf = (label: string): number => lines.findIndex((l, i) => !fenced[i] && labelRe(label).test(l));
+  if (requireSibling && fields.every(([label]) => lineOf(label) === -1)) return null;
+  fields.forEach(([label, needed, value], k) => {
+    if (!needed) return;
+    let anchor = -1;
+    let at = 0;
+    for (let j = k - 1; j >= 0 && anchor === -1; j--) {
+      anchor = lineOf(fields[j][0]);
+      // Stop before a fence the continuation scan does not recognize.
+      if (anchor !== -1) {
+        const tail = continuationLineCount(lines.slice(anchor + 1));
+        at = anchor + 1;
+        while (at < anchor + 1 + tail && !fenced[at]) at++;
+      }
+    }
+    for (let j = k + 1; j < fields.length && anchor === -1; j++) {
+      anchor = lineOf(fields[j][0]);
+      at = anchor;
+    }
+    if (anchor === -1) at = 0;
+    const bold = anchor === -1 || lines[anchor].trimStart().startsWith('**');
+    lines.splice(at, 0, bold ? `**${label}:** ${value}` : `${label}: ${value}`);
+    fenced.splice(at, 0, false);
+  });
+  return lines.join('\n');
+}
+
 export function stateExtractField(content: string, fieldName: string): string | null {
   const escaped = escapeRegex(fieldName);
   // Bold line-start format: **FieldName:** value. Leading same-line whitespace
-  // matches the writer's established indented-field tolerance.
-  const boldPattern = new RegExp(`^[ \\t]*\\*\\*${escaped}:\\*\\*[ \\t]*(.+)`, 'im');
+  // matches the writer's established indented-field tolerance. #4998: both
+  // bold placements, `**FieldName:**` and `**FieldName**:` — stateReplaceField
+  // writes both (BOLD_FIELD_RE), so a field it updated must read back.
+  const boldPattern = new RegExp(`^[ \\t]*\\*\\*${escaped}(?::\\*\\*|\\*\\*:)[ \\t]*(.+)`, 'im');
   const boldMatch = content.match(boldPattern);
   if (boldMatch)
     return boldMatch[1].trim();
@@ -684,6 +756,10 @@ export function stateReplaceField(content: string, fieldName: string, newValue: 
       }
     }
   }
+  // #4998: the plain and table rungs refuse a line break too. Spliced in, it
+  // forges sibling lines exactly as the bold rung's refusal above prevents;
+  // falling through to them only moved the forgery one rung down.
+  if (/[\r\n]/.test(`${newValue}`)) return null;
   // Plain line-start format: FieldName: value (same same-line confinement as above)
   const plainPattern = new RegExp(`(^${escaped}:[ \\t]*)(.*)`, 'im');
   if (plainPattern.test(content)) {
