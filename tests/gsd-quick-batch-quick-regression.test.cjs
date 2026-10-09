@@ -114,6 +114,12 @@ function editsBeyondSharedDirective(base, file) {
     // sweep -- not quick-batch phase work. Any OTHER line still trips this row.
     if (body.includes('$ARGUMENTS') || body.includes('`<arguments>` block')) return false;
     if (body === '<arguments>$ARGUMENTS</arguments>' || body.startsWith('The text inside `<arguments>` is exactly what the user typed')) return false;
+    // #4941 fifth mechanical-sweep carve-out: the startup orphan sweep's call
+    // line changed from `2>/dev/null` to `>/dev/null` in all three callers
+    // (quick, quick-batch, executor-isolation-dispatch) so the residue paths
+    // it prints on stderr reach the operator. Exactly that one line, old or
+    // new form — any other quick edit still trips this row.
+    if (/^gsd_run query worktree\.reap-orphans (?:2)?>\/dev\/null \|\| true$/.test(body)) return false;
     return !importsDirectiveReference(body);
   });
 }
