@@ -1957,3 +1957,58 @@ describe('gsd-agent-isolation-guard.js: #4734 — a non-git project root is neve
     assert.equal(JSON.parse(r.stdout).decision, 'block');
   });
 });
+
+describe('gsd-agent-isolation-guard.js: #4885 — payload cwd is a project subdirectory', () => {
+  // The project-existence check used the RAW payload cwd while the sentinel
+  // was read from the resolved project root, so a dispatch from any
+  // subdirectory read as "not a GSD project" and was allowed inert before the
+  // sentinel was ever consulted. Every row dispatches from `<project>/src/deep`.
+  let harnessProject;
+  let unreadableConfigProject;
+
+  function subdirOf(project) {
+    const dir = path.join(project, 'src', 'deep');
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  before(() => {
+    harnessProject = mkProject('gsd-aig-4885-');
+    writeConfig(harnessProject, JSON.stringify({ runtime: 'claude' }));
+
+    unreadableConfigProject = mkProject('gsd-aig-4885-unreadable-');
+    // eslint-disable-next-line local/no-raw-rmsync-in-tests -- replacing a single fixture FILE with a directory (EISDIR), same as the applicability matrix above
+    fs.rmSync(path.join(unreadableConfigProject, '.planning', 'config.json'), { force: true });
+    fs.mkdirSync(path.join(unreadableConfigProject, '.planning', 'config.json'));
+  });
+
+  after(() => {
+    cleanup(harnessProject);
+    cleanup(unreadableConfigProject);
+  });
+
+  test('no sentinel, harness-worktree project, dispatch missing the flag -> DENY (was an inert allow)', () => {
+    const r = runHook(agentPayload({ cwd: subdirOf(harnessProject) }), subdirOf(harnessProject));
+    assert.equal(r.status, 2, `stdout: ${r.stdout} stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block');
+    assert.equal(out.reason_code, REASON_CODE.HARNESS_FLAG_MISSING);
+  });
+
+  test('fresh sentinel at the project root (isolation=none) is consulted from the subdirectory -> ALLOW', (t) => {
+    writeSentinel(harnessProject, { isolation: 'none' });
+    t.after(() => cleanup(path.join(harnessProject, '.gsd')));
+    const r = runHook(agentPayload({ cwd: subdirOf(harnessProject) }), subdirOf(harnessProject));
+    assert.equal(r.status, 0, `stdout: ${r.stdout} stderr: ${r.stderr}`);
+    assert.equal(r.stdout, '');
+  });
+
+  test('unreadable config -> DENY naming the resolved project root, not the subdirectory', () => {
+    const sub = subdirOf(unreadableConfigProject);
+    const r = runHook(agentPayload({ cwd: sub }), sub);
+    assert.equal(r.status, 2, `stdout: ${r.stdout} stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.reason_code, REASON_CODE.CONFIG_UNREADABLE);
+    assert.ok(!out.reason.includes(path.join('src', 'deep')), `reason must name the project root, got: ${out.reason}`);
+  });
+});

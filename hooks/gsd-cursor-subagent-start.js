@@ -70,7 +70,7 @@ const { allow } = require('./lib/hook-exit.js');
 // hooks/lib/cursor-workspace.js. Staged next to these scripts by
 // writeCursorHooksJson so the require always resolves post-install.
 const { resolveStatePath } = require('./lib/cursor-workspace.js');
-const { readSentinel, VALID_ISOLATION, extractDispatchIdentifiers, sentinelAppliesToDispatch, buildSentinelDiscard } = require('./lib/isolation-sentinel.js');
+const { readSentinel, resolveSentinelRoot, VALID_ISOLATION, extractDispatchIdentifiers, sentinelAppliesToDispatch, buildSentinelDiscard } = require('./lib/isolation-sentinel.js');
 const { REASON_CODE, describeSentinelDiscard } = require('./lib/isolation-deny-reason.js');
 // #3582: gsd-core/bin/lib/*.cjs (runtime-homes.cjs, worktree-safety.cjs,
 // runtime-name-policy.cjs, capability-registry.cjs — required below, inside
@@ -470,7 +470,13 @@ function resolveFallbackIsolation(root, configPath) {
  * workspace runs the identical check.
  */
 function evaluateRootIsolation(root, subagentType, { clock = Date, dispatchIds = null, realpath = fs.realpathSync } = {}) {
-  const configPath = path.join(root, '.planning', 'config.json');
+  // #4885: project existence, sentinel, and fallback config all resolve from
+  // the same root gsd-tools writes to, so a workspace root that is a project
+  // SUBDIRECTORY is still evaluated. Isolation evidence below stays on the raw
+  // workspace `root` — it asks where the workspace physically is, not where
+  // its project's `.planning/` lives.
+  const projectRoot = resolveSentinelRoot(root);
+  const configPath = path.join(projectRoot, '.planning', 'config.json');
   let isGsdProject;
   try {
     fs.accessSync(configPath, fs.constants.F_OK);
@@ -511,7 +517,7 @@ function evaluateRootIsolation(root, subagentType, { clock = Date, dispatchIds =
   // Hoisted (readSentinel never throws) so the "present, fresh, but did not
   // apply" case (#4594 row 15) can be reported on every deny path below
   // instead of silently discarded.
-  const sentinel = readSentinel(root, { clock });
+  const sentinel = readSentinel(projectRoot, { clock });
   const applies = sentinelAppliesToDispatch(sentinel, dispatchIds);
   const sentinelDiscarded = buildSentinelDiscard(sentinel, dispatchIds);
 
@@ -519,13 +525,13 @@ function evaluateRootIsolation(root, subagentType, { clock = Date, dispatchIds =
   try {
     declaredIsolation = (sentinel.present && !sentinel.stale && applies)
       ? sentinel.isolation
-      : resolveFallbackIsolation(root, configPath);
+      : resolveFallbackIsolation(projectRoot, configPath);
   } catch {
     return {
       action: 'deny',
       reason:
         `GSD subagent isolation guard: could not read or resolve this project's ` +
-        `dispatch-isolation configuration ('.planning/config.json' exists under "${root}"). ` +
+        `dispatch-isolation configuration ('.planning/config.json' exists under "${projectRoot}"). ` +
         `Refusing to allow this subagent to spawn without being able to verify whether ` +
         `isolation is required — a guard that cannot verify must not answer "safe" (#3050). ` +
         `Retry once the project configuration is readable.` +

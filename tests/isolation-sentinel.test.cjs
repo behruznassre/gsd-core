@@ -119,4 +119,34 @@ describe('hooks/lib/isolation-sentinel.js: resolveSentinelRoot self-heal reachab
     assert.equal(projectRootCalls, 0, 'a thrown RuntimeBuildError must short-circuit before findProjectRoot is ever reached');
     assert.equal(result, cwd, 'resolveSentinelRoot degrades to the raw cwd on a build failure, same as any other resolution failure');
   });
+
+  test('#4885: a staged lib without resolvePlanningWorktreeRoot falls back to resolveWorktreeRoot, not to raw cwd', (t) => {
+    const savedSeam = require.cache[SEAM_PATH];
+    const savedWorktreeSafety = require.cache[WORKTREE_SAFETY_PATH];
+    const savedProjectRoot = require.cache[PROJECT_ROOT_PATH];
+    const savedSentinel = require.cache[SENTINEL_RESOLVED];
+
+    t.after(() => {
+      const restore = (key, saved) => { if (saved) require.cache[key] = saved; else delete require.cache[key]; };
+      restore(SEAM_PATH, savedSeam);
+      restore(WORKTREE_SAFETY_PATH, savedWorktreeSafety);
+      restore(PROJECT_ROOT_PATH, savedProjectRoot);
+      restore(SENTINEL_RESOLVED, savedSentinel);
+    });
+
+    // A hooks/ tree newer than its staged gsd-core/bin/lib: the older
+    // worktree-safety.cjs exports only the pre-#4885 resolver.
+    require.cache[SEAM_PATH] = fakeModule(SEAM_PATH, { RuntimeBuildError: Error, ensureRuntimeBuild: () => {} });
+    require.cache[WORKTREE_SAFETY_PATH] = fakeModule(WORKTREE_SAFETY_PATH, {
+      resolveWorktreeRoot: () => ({ root: 'MAIN-WORKTREE-ROOT' }),
+    });
+    require.cache[PROJECT_ROOT_PATH] = fakeModule(PROJECT_ROOT_PATH, { findProjectRoot: (dir) => `${dir}/PROJECT` });
+    delete require.cache[SENTINEL_RESOLVED];
+    const { resolveSentinelRoot } = require(SENTINEL_MODULE_PATH);
+
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-iso-sentinel-oldlib-'));
+    t.after(() => cleanup(cwd));
+
+    assert.equal(resolveSentinelRoot(cwd), 'MAIN-WORKTREE-ROOT/PROJECT');
+  });
 });

@@ -141,9 +141,13 @@ function resolveSentinelRoot(cwd) {
     const { ensureRuntimeBuild } = require('../../gsd-core/bin/ensure-runtime-build.cjs');
     ensureRuntimeBuild();
     // #4885: the same resolver gsd-tools' root resolution uses, so a linked
-    // worktree carrying its own `.planning/` is read where it was written.
-    const { resolvePlanningWorktreeRoot } = require('../../gsd-core/bin/lib/worktree-safety.cjs');
-    const { root } = resolvePlanningWorktreeRoot(cwd);
+    // worktree carrying its own `.planning/` is read where it was written. A
+    // lib staged without that export (hooks newer than the lib) keeps the
+    // pre-#4885 main-worktree resolution rather than degrading to raw `cwd`.
+    const worktreeSafety = require('../../gsd-core/bin/lib/worktree-safety.cjs');
+    const { root } = typeof worktreeSafety.resolvePlanningWorktreeRoot === 'function'
+      ? worktreeSafety.resolvePlanningWorktreeRoot(cwd)
+      : worktreeSafety.resolveWorktreeRoot(cwd);
     const { findProjectRoot } = require('../../gsd-core/bin/lib/project-root.cjs');
     return findProjectRoot(root);
   } catch {

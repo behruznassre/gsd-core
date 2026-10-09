@@ -1074,3 +1074,38 @@ describe('gsd-cursor-subagent-start.js: #3582 cold tree — RuntimeBuildError su
     assert.ok(out.user_message.length > 0);
   });
 });
+
+describe('gsd-cursor-subagent-start.js: #4885 — workspace root is a project subdirectory', () => {
+  // Project existence was checked at the raw workspace root while the
+  // sentinel was read from the resolved project root, so a workspace opened
+  // on a subdirectory was allowed inert. Isolation evidence still uses the
+  // raw workspace root (it asks where the workspace physically is).
+  let harnessProject;
+  let subdir;
+
+  before(() => {
+    harnessProject = makeGitProject('gsd-cs-4885-', JSON.stringify({ runtime: 'cursor' }));
+    subdir = path.join(harnessProject, 'src', 'deep');
+    fs.mkdirSync(subdir, { recursive: true });
+  });
+
+  after(() => {
+    cleanup(harnessProject);
+  });
+
+  test('unisolated main-checkout subdirectory, harness-worktree, executor -> DENY (was an inert allow)', () => {
+    const r = runHook(subagentPayload([subdir]));
+    assert.equal(r.status, 0, `stdout: ${r.stdout} stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.permission, 'deny');
+    assert.match(out.user_message, /not an isolated Cursor worktree/);
+  });
+
+  test('fresh sentinel at the project root (isolation=none) is consulted from the subdirectory -> allow', (t) => {
+    writeSentinel(harnessProject, { isolation: 'none' });
+    t.after(() => cleanup(path.join(harnessProject, '.gsd')));
+    const r = runHook(subagentPayload([subdir]));
+    assert.equal(r.status, 0, `stdout: ${r.stdout} stderr: ${r.stderr}`);
+    assert.equal(JSON.parse(r.stdout).permission, undefined);
+  });
+});

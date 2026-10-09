@@ -958,5 +958,4 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     assert.equal(head(main), mainBefore, 'main checkout HEAD must not move');
     assert.notEqual(head(wt), wtBefore, 'the worktree the link points into must receive the commit');
   });
-
 });

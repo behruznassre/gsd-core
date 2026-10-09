@@ -71,7 +71,7 @@ if (require.main === module && !process.env.NODE_V8_COVERAGE) {
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { readSentinel, VALID_ISOLATION, extractDispatchIdentifiers, sentinelAppliesToDispatch, buildSentinelDiscard } = require('./lib/isolation-sentinel.js');
+const { readSentinel, resolveSentinelRoot, VALID_ISOLATION, extractDispatchIdentifiers, sentinelAppliesToDispatch, buildSentinelDiscard } = require('./lib/isolation-sentinel.js');
 const { REASON_CODE, describeSentinelDiscard } = require('./lib/isolation-deny-reason.js');
 const { HOOK_ON_CRASH, allow, deny, crash } = require('./lib/hook-exit.js');
 
@@ -408,7 +408,12 @@ function resolveRegistryIsolation(cwd, configPath) {
  * "a mismatch is 'no applicable sentinel', not an allow" (#3045 review).
  */
 function resolveIsolationState(cwd, { clock = Date, dispatchIds = null } = {}) {
-  const configPath = path.join(cwd, '.planning', 'config.json');
+  // #4885: the project-existence check uses the SAME root the sentinel is
+  // read from (and gsd-tools writes to). Checking the raw payload cwd made a
+  // dispatch from a project subdirectory read as "not a GSD project" (inert
+  // allow) before the correctly-resolved sentinel was ever consulted.
+  const root = resolveSentinelRoot(cwd);
+  const configPath = path.join(root, '.planning', 'config.json');
   let projectExists;
   try {
     fs.accessSync(configPath, fs.constants.F_OK);
@@ -420,7 +425,7 @@ function resolveIsolationState(cwd, { clock = Date, dispatchIds = null } = {}) {
     return { gsdProject: false, isolation: null, harnessFlag: null, error: null, sentinelDiscarded: null };
   }
 
-  const sentinel = readSentinel(cwd, { clock });
+  const sentinel = readSentinel(root, { clock });
   // Hoisted so the "sentinel was present/fresh but did not apply" case below
   // (#4594 row 15 — Postel's-Law finding) can distinguish itself from
   // "absent"/"stale" without re-deriving applicability.
@@ -460,6 +465,7 @@ function resolveIsolationState(cwd, { clock = Date, dispatchIds = null } = {}) {
         'cannot verify what parameter the dispatch must carry.'
       ),
       sentinelDiscarded: null,
+      root,
     };
   }
 
@@ -476,10 +482,10 @@ function resolveIsolationState(cwd, { clock = Date, dispatchIds = null } = {}) {
   const sentinelDiscarded = buildSentinelDiscard(sentinel, dispatchIds);
 
   try {
-    const { isolation, harnessFlag } = resolveRegistryIsolation(cwd, configPath);
+    const { isolation, harnessFlag } = resolveRegistryIsolation(root, configPath);
     return { gsdProject: true, isolation, harnessFlag, error: null, sentinelDiscarded };
   } catch (err) {
-    return { gsdProject: true, isolation: null, harnessFlag: null, error: err, sentinelDiscarded };
+    return { gsdProject: true, isolation: null, harnessFlag: null, error: err, sentinelDiscarded, root };
   }
 }
 
@@ -539,7 +545,7 @@ function evaluateDispatch(data, { clock = Date } = {}) {
         `the runtime library is built — a guard that cannot verify must not answer "safe" ` +
         `(#3050).`
       : `Agent isolation guard: could not read or resolve this project's dispatch-isolation ` +
-        `configuration ('.planning/config.json' under '${cwd}'). Refusing to dispatch ` +
+        `configuration ('.planning/config.json' under '${state.root}'). Refusing to dispatch ` +
         `subagent_type="${subagentType}" without being able to verify whether isolation is ` +
         `required — a guard that cannot verify must not answer "safe" (#3050). Retry once the ` +
         `project configuration is readable.`;
