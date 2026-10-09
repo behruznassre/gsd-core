@@ -2163,7 +2163,8 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // rather than None or nothing — which dropped the frontmatter
         // `stopped_at` and reset an authored Resume file. Later writes then
         // land on these bold lines first.
-        const carried = (field: string, fallback: string): string => stateExtractField(content, field) ?? fallback;
+        // Read from the body, as the sync does — never from frontmatter.
+        const carried = (field: string, fallback: string): string => stateExtractField(stripFrontmatter(content), field) ?? fallback;
         const scaffold = [
           '',
           '## Session',

@@ -22217,6 +22217,15 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.match(session(), /\*\*Stopped at:\*\* Phase 3/);
   });
 
+  test('no session heading: a field-like line in frontmatter is never the carried value', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', 'notes: |', '  **Stopped at:** example handoff', '---', '',
+      '# Project State', '', 'Stopped at: real handoff', ''].join('\n'));
+    const { json } = recordSession('--stopped-at', 'real handoff');
+    assert.match(session(), /\*\*Stopped at:\*\* real handoff/);
+    assert.strictEqual(frontmatterStoppedAt(), 'real handoff', readState());
+    assert.strictEqual(json.replacedRecord, undefined, JSON.stringify(json));
+  });
+
   test('no session heading: an archive section is never the insertion target', () => {
     fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
       '## Session Continuity Archive', '', 'Resume file: old-plan.md', ''].join('\n'));
