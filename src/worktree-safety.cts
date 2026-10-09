@@ -2759,7 +2759,9 @@ function findUnregisteredResidue(
   const results: ReapResult[] = [];
 
   // Only a main checkout scans. The common case is read off the path: a main
-  // checkout's git dir is `<top>/.git`. Any other git dir is either a linked
+  // checkout's git dir is `<top>/.git` with the cwd inside `<top>` (a
+  // `--separate-git-dir` that happens to be named `.git` sits elsewhere, so
+  // the cwd is not inside its parent). Any other git dir is either a linked
   // worktree's `<common>/worktrees/<id>` or a `--separate-git-dir` main
   // checkout, so git is asked which — a main checkout's git dir IS its common
   // dir — and names the top.
@@ -2767,7 +2769,8 @@ function findUnregisteredResidue(
     try { return fs.realpathSync.native(p); } catch { return path.resolve(p); }
   };
   let top: string;
-  if (path.basename(gitDirPath) === '.git') {
+  if (path.basename(gitDirPath) === '.git'
+      && isContainedIn(canonicalOrResolved(repoRoot), canonicalOrResolved(path.dirname(gitDirPath)))) {
     top = path.dirname(gitDirPath);
   } else {
     const commonDir = execGit(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
@@ -2904,18 +2907,25 @@ function cmdWorktreeReapOrphans(cwd: string, deps: RecordAgentCmdDeps & Worktree
   }
   // #4941: residue is named path by path on stderr — the workflow callers
   // discard the JSON, so stderr is the only place an operator sees it.
+  // Paths are JSON-quoted: a directory name is user-controlled, and a raw
+  // newline or escape sequence would forge lines or drive the terminal.
   const residue = result.filter((r) => r.reason === 'unregistered_residue');
   if (residue.length > 0) {
     writeErr(
       `[gsd] worktree.reap-orphans: ${residue.length} director${residue.length === 1 ? 'y' : 'ies'} under .claude/worktrees that git no longer tracks — not removed; delete once nothing in it is needed:\n` +
-      residue.map((r) => `[gsd]   ${r.path}\n`).join(''),
+      residue.map((r) => `[gsd]   ${JSON.stringify(r.path)}\n`).join(''),
     );
+  }
+  // A residue location that could not be read is "did not look", not "nothing
+  // there" — said on stderr too, since the callers discard the JSON.
+  if (scan && !['scanned', 'absent', 'not_main_checkout'].includes(scan.residue_dir)) {
+    writeErr(`[gsd] worktree.reap-orphans: .claude/worktrees was not scanned (${scan.residue_dir}; admin dir: ${scan.admin_dir})\n`);
   }
   const skippedCount = result.filter((r) => r.status === 'skipped' && r.reason !== 'unregistered_residue').length;
   if (skippedCount > 0) {
     // Surface skipped entries so operators are aware of unresolved orphans.
     // #4941 review: there is no DEBUG path here — the rows ARE the details.
-    writeErr(`[gsd] worktree.reap-orphans: ${skippedCount} orphan(s) skipped — see "entries" in the JSON output\n`);
+    writeErr(`[gsd] worktree.reap-orphans: ${skippedCount} orphan(s) skipped — run "gsd-tools query worktree.reap-orphans" and see "entries"\n`);
   }
   write(`${JSON.stringify({ ok: true, reaped: result.filter((r) => r.status === 'reaped').length, entries: result, scan }, null, 2)}\n`);
 }

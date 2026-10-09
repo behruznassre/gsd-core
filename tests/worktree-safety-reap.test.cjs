@@ -911,7 +911,7 @@ describe('#3057 cmdWorktreeReapOrphans / pruneOrphanedWorktrees output verdicts'
     });
 
     assert.deepStrictEqual(err, [
-      '[gsd] worktree.reap-orphans: 1 orphan(s) skipped — see "entries" in the JSON output\n',
+      '[gsd] worktree.reap-orphans: 1 orphan(s) skipped — run "gsd-tools query worktree.reap-orphans" and see "entries"\n',
     ]);
     const payload = JSON.parse(out.join(''));
     assert.strictEqual(payload.ok, true);
@@ -1239,7 +1239,7 @@ describe('#4941 regression: reap-orphans names unregistered .claude/worktrees re
     // itself — and residue is not double-counted in the generic skip line.
     assert.deepStrictEqual(err, [
       '[gsd] worktree.reap-orphans: 1 directory under .claude/worktrees that git no longer tracks — not removed; delete once nothing in it is needed:\n' +
-      `[gsd]   ${parsed.entries[0].path}\n`,
+      `[gsd]   ${JSON.stringify(parsed.entries[0].path)}\n`,
     ]);
   });
 
@@ -1290,6 +1290,62 @@ describe('#4941 regression: reap-orphans names unregistered .claude/worktrees re
     assert.deepStrictEqual(results, []);
     assert.strictEqual(scan.residue_dir, 'top_unresolved');
     assert.ok(fs.existsSync(residue));
+  });
+
+  test('a residue path is JSON-quoted on stderr, so a crafted name cannot forge a line or drive the terminal', (t) => {
+    if (process.platform === 'win32') {
+      t.skip('control characters are not valid in Windows file names');
+      return;
+    }
+    const repoDir = path.join(tmpBase, 'repo-ctrl');
+    initRepo(repoDir);
+    // A plain directory: no `.git`, not listed — residue by every test the scan
+    // applies (a branch name cannot carry these bytes, so no `worktree add`).
+    const residue = path.join(repoDir, '.claude', 'worktrees', 'agent-x\n[gsd] forged \u001b[2J');
+    fs.mkdirSync(residue, { recursive: true });
+    const out = [];
+    const err = [];
+    cmdWorktreeReapOrphans(repoDir, { write: (s) => out.push(s), writeErr: (s) => err.push(s), ...deadOwnerDeps() });
+    const stderr = err.join('');
+    assert.ok(!stderr.includes('\u001b'), 'no raw escape byte reaches stderr');
+    assert.strictEqual(stderr.split('\n').filter((l) => l.startsWith('[gsd] forged')).length, 0, 'no forged line');
+    const { entries } = JSON.parse(out.join(''));
+    assert.ok(entries[0].path.endsWith('agent-x\n[gsd] forged \u001b[2J'), 'the JSON keeps the exact name');
+    assert.ok(stderr.includes(JSON.stringify(entries[0].path)), 'stderr names it, quoted');
+    assert.ok(fs.existsSync(residue));
+  });
+
+  test('a --separate-git-dir whose directory is itself named .git still scans the checkout, not the metadata parent', () => {
+    const repoDir = path.join(tmpBase, 'repo-sepdotgit');
+    const meta = path.join(tmpBase, 'meta');
+    fs.mkdirSync(repoDir, { recursive: true });
+    fs.mkdirSync(meta, { recursive: true });
+    git(['init', `--separate-git-dir=${path.join(meta, '.git')}`], repoDir);
+    git(['config', 'user.email', 'test@test.com'], repoDir);
+    git(['config', 'user.name', 'Test'], repoDir);
+    git(['config', 'commit.gpgsign', 'false'], repoDir);
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# Test\n');
+    git(['add', '-A'], repoDir);
+    git(['commit', '-m', 'initial commit'], repoDir);
+    const residue = makeResidue(repoDir, 'agent-t1');
+    git(['worktree', 'prune'], repoDir);
+    // A decoy beside the metadata must never be reported.
+    fs.mkdirSync(path.join(meta, '.claude', 'worktrees', 'decoy'), { recursive: true });
+
+    const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+
+    assert.deepStrictEqual(rows(results), [[canonicalPath(residue), 'skipped', 'unregistered_residue']]);
+    assert.strictEqual(scan.residue_dir, 'scanned');
+  });
+
+  test('a residue location that could not be read is said on stderr, not only in the discarded JSON', () => {
+    const repoDir = path.join(tmpBase, 'repo-unreadable-cli');
+    initRepo(repoDir);
+    fs.mkdirSync(path.join(repoDir, '.claude'));
+    fs.writeFileSync(path.join(repoDir, '.claude', 'worktrees'), 'not a directory\n'); // readdir → ENOTDIR
+    const err = [];
+    cmdWorktreeReapOrphans(repoDir, { write: () => {}, writeErr: (s) => err.push(s), ...deadOwnerDeps() });
+    assert.deepStrictEqual(err, ['[gsd] worktree.reap-orphans: .claude/worktrees was not scanned (unreadable; admin dir: unlisted)\n']);
   });
 
   test('residue rows come back in name order, whatever order the filesystem lists them', () => {
