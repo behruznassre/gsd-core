@@ -1018,7 +1018,8 @@ any others.
 wrote `Bash(npx gsd-core *)`. GSD is published as `@opengsd/gsd-core`, and the
 unscoped `gsd-core` name on npm belongs to a different owner, so that rule let
 Claude Code run whatever is published under that name without asking. The next
-install or upgrade removes that one entry and leaves your other permissions alone.
+install or upgrade removes that exact entry; rules you wrote yourself, including
+scoped `@opengsd/gsd-core` ones, are kept.
 Install and upgrade with `npx @opengsd/gsd-core@latest`.
 
 **Secret-file protection moved from deny rules to a hook (#4221).** Earlier

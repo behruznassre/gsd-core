@@ -757,7 +757,7 @@ describe('#5054 regression: the unscoped Bash(npx gsd-core *) allow rule is reti
 
   test('no current allow rule runs the unscoped gsd-core package', () => {
     for (const entry of GSD_CLAUDE_ALLOW_PERMISSIONS) {
-      assert.doesNotMatch(entry, /\b(?:npx|bunx|pnpx)\s+(?:-y\s+)?gsd-core\b/,
+      assert.doesNotMatch(entry, /\b(?:npx|bunx|pnpx)\s+(?:(?:-y|--yes)\s+)?gsd-core\b/,
         `"${entry}" pre-authorizes the unscoped gsd-core npm package`);
     }
   });
@@ -813,12 +813,37 @@ describe('#5054 regression: the unscoped Bash(npx gsd-core *) allow rule is reti
     }
   });
 
+  test('--claude --local install over a pre-#5054 settings.local.json removes the rule', (t) => {
+    // Local installs have written permissions to settings.local.json since
+    // before #768 added them, so that is the file an old local install carries.
+    const root = createTempDir('gsd-claude-perm-5054-local-');
+    t.after(() => cleanup(root));
+    const localSettingsPath = path.join(root, '.claude', 'settings.local.json');
+    fs.mkdirSync(path.dirname(localSettingsPath), { recursive: true });
+    fs.writeFileSync(localSettingsPath, JSON.stringify({
+      permissions: { allow: ['Bash(npm test)', UNSCOPED_RULE, 'Read(.planning/*)'] },
+    }, null, 2) + '\n');
+
+    const env = { ...process.env, HOME: root, USERPROFILE: root };
+    delete env.GSD_TEST_MODE;
+    const result = runNode(
+      [INSTALL_SCRIPT, '--claude', '--local'],
+      { cwd: root, env, timeoutMs: SCOPED_INSTALL_TIMEOUT_MS },
+    );
+    assert.strictEqual(result.exitCode, 0,
+      `installer exited ${result.exitCode}\n${result.stdout}\n${result.stderr}`);
+
+    const allow = JSON.parse(fs.readFileSync(localSettingsPath, 'utf8')).permissions.allow;
+    assert.ok(!allow.includes(UNSCOPED_RULE), 'the local upgrade must remove the unscoped rule');
+    assert.ok(allow.includes('Bash(npm test)'), 'the user rule must survive');
+  });
+
   test('GEMINI.md install instructions never run the unscoped package', () => {
     const geminiPath = path.join(__dirname, '..', 'GEMINI.md');
     const offenders = fs.readFileSync(geminiPath, 'utf8').split(/\r?\n/)
       // Leading `>` (blockquote) and `$ ` (shell prompt) are part of how the
       // doc presents a command; the original offender sat in a blockquote.
-      .filter((line) => /^[\s>$]*(?:[A-Z_]+=\S+\s+)*npx\s+(?:-y\s+)?gsd-core\b/.test(line));
+      .filter((line) => /^[\s>$]*(?:[A-Z_]+=\S+\s+)*npx\s+(?:(?:-y|--yes)\s+)?gsd-core\b/.test(line));
     assert.deepStrictEqual(offenders, [],
       'GEMINI.md install commands must use the scoped @opengsd/gsd-core package');
   });
