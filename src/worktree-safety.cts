@@ -2172,9 +2172,11 @@ interface WorktreeCreateResult {
  * Since #4941 it also NAMES — but does not delete — directories under
  * `<repo>/.claude/worktrees/` that git no longer lists. Anything else, such
  * as an unlocked partial or one outside `.claude/worktrees/` whose admin entry
- * is pruned, is not reached by that sweep. The result is intentionally ignored and a throw is
- * swallowed: this is best-effort cleanup, never a new source of truth, and
- * must never mask or block the caller's own degraded-but-honest return.
+ * is pruned, is not reached by that sweep.
+ *
+ * The result is intentionally ignored and a throw is swallowed: this is
+ * best-effort cleanup, never a new source of truth, and must never mask or
+ * block the caller's own degraded-but-honest return.
  */
 function rollbackPartialWorktree(execGit: ExecGitFn, worktreePath: string, repoRoot: string): void {
   try {
@@ -2490,8 +2492,9 @@ interface ReapResult {
  * (`.git/worktrees/` missing or unreadable — the injectable reader does not
  * say which) | `git_dir_unresolved` | `default_branch_unresolved`.
  * `residue_dir`: `scanned` | `absent` (no `.claude/worktrees/`) | `unreadable`
- * | `outside_checkout` | `not_main_checkout` | `not_scanned` (an earlier
- * fail-closed bail-out).
+ * | `outside_checkout` | `not_main_checkout` | `top_unresolved` (git could not
+ * name the checkout top or common dir) | `not_scanned` (an earlier fail-closed
+ * bail-out).
  */
 interface ReapScan {
   admin_dir: string;
@@ -2583,11 +2586,7 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
   const listedResult = execGit(['worktree', 'list', '--porcelain'], { cwd: repoRoot });
   const canonicalToListed = new Map<string, string>();
   if (gitResultOk(listedResult)) {
-    const normalizedListed = listedResult.stdout.replace(/\r\n/g, '\n');
-    for (const block of normalizedListed.split('\n\n').filter(Boolean)) {
-      const wtLine = block.split('\n').find((l) => l.startsWith('worktree '));
-      if (!wtLine) continue;
-      const listed = wtLine.slice('worktree '.length).trim();
+    for (const { path: listed } of parseWorktreeEntries(listedResult.stdout.replace(/\r\n/g, '\n'))) {
       try {
         const canonical = fs.realpathSync.native(listed);
         canonicalToListed.set(canonical, listed);
@@ -2759,15 +2758,32 @@ function findUnregisteredResidue(
   const mtimeSafe = deps.mtimeSafe || defaultMtimeSafe;
   const results: ReapResult[] = [];
 
-  // Only a main checkout's git dir is `<top>/.git`; a linked worktree's is
-  // `.git/worktrees/<id>`, whose parent is not a checkout root.
-  if (path.basename(gitDirPath) !== '.git') return { results, status: 'not_main_checkout' };
-  const top = path.dirname(gitDirPath);
+  // Only a main checkout scans. The common case is read off the path: a main
+  // checkout's git dir is `<top>/.git`. Any other git dir is either a linked
+  // worktree's `<common>/worktrees/<id>` or a `--separate-git-dir` main
+  // checkout, so git is asked which — a main checkout's git dir IS its common
+  // dir — and names the top.
+  const canonicalOrResolved = (p: string) => {
+    try { return fs.realpathSync.native(p); } catch { return path.resolve(p); }
+  };
+  let top: string;
+  if (path.basename(gitDirPath) === '.git') {
+    top = path.dirname(gitDirPath);
+  } else {
+    const commonDir = execGit(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
+    const topLevel = execGit(['rev-parse', '--show-toplevel'], { cwd: repoRoot });
+    if (!gitResultOk(commonDir) || !gitResultOk(topLevel)) return { results, status: 'top_unresolved' };
+    if (canonicalOrResolved(path.resolve(repoRoot, commonDir.stdout.trim())) !== canonicalOrResolved(gitDirPath)) {
+      return { results, status: 'not_main_checkout' };
+    }
+    top = topLevel.stdout.trim();
+  }
   const residueDir = path.join(top, '.claude', 'worktrees');
 
   let names: string[];
   try {
-    names = fs.readdirSync(residueDir);
+    // Sorted so `entries` is the same on every filesystem.
+    names = fs.readdirSync(residueDir).sort();
   } catch (err) {
     // Absent is a real answer; any other failure is "could not look".
     return { results, status: (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : 'unreadable' };
@@ -2810,10 +2826,8 @@ function findUnregisteredResidue(
     return { results, status: 'scanned' };
   }
   const registered = new Set<string>();
-  for (const line of listed.stdout.replace(/\r\n/g, '\n').split('\n')) {
-    if (!line.startsWith('worktree ')) continue;
-    const listedPath = line.slice('worktree '.length).trim();
-    try { registered.add(fs.realpathSync.native(listedPath)); } catch { registered.add(path.resolve(listedPath)); }
+  for (const entry of parseWorktreeEntries(listed.stdout.replace(/\r\n/g, '\n'))) {
+    registered.add(canonicalOrResolved(entry.path));
   }
 
   for (const p of candidates) {
@@ -2888,7 +2902,16 @@ function cmdWorktreeReapOrphans(cwd: string, deps: RecordAgentCmdDeps & Worktree
     result = [];
     scan = null;
   }
-  const skippedCount = result.filter((r) => r.status === 'skipped').length;
+  // #4941: residue is named path by path on stderr — the workflow callers
+  // discard the JSON, so stderr is the only place an operator sees it.
+  const residue = result.filter((r) => r.reason === 'unregistered_residue');
+  if (residue.length > 0) {
+    writeErr(
+      `[gsd] worktree.reap-orphans: ${residue.length} director${residue.length === 1 ? 'y' : 'ies'} under .claude/worktrees that git no longer tracks — not removed; delete once nothing in it is needed:\n` +
+      residue.map((r) => `[gsd]   ${r.path}\n`).join(''),
+    );
+  }
+  const skippedCount = result.filter((r) => r.status === 'skipped' && r.reason !== 'unregistered_residue').length;
   if (skippedCount > 0) {
     // Surface skipped entries so operators are aware of unresolved orphans.
     // #4941 review: there is no DEBUG path here — the rows ARE the details.

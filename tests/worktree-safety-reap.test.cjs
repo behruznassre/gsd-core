@@ -1235,6 +1235,71 @@ describe('#4941 regression: reap-orphans names unregistered .claude/worktrees re
     assert.strictEqual(parsed.reaped, 0);
     assert.deepStrictEqual(parsed.entries.map((e) => e.reason), ['unregistered_residue']);
     assert.deepStrictEqual(parsed.scan, { admin_dir: 'unlisted', residue_dir: 'scanned' });
-    assert.match(err.join(''), /1 orphan\(s\) skipped/, 'the operator is told something is left on disk');
+    // The workflow callers discard stdout, so stderr must name the path
+    // itself — and residue is not double-counted in the generic skip line.
+    assert.deepStrictEqual(err, [
+      '[gsd] worktree.reap-orphans: 1 directory under .claude/worktrees that git no longer tracks — not removed; delete once nothing in it is needed:\n' +
+      `[gsd]   ${parsed.entries[0].path}\n`,
+    ]);
+  });
+
+  test('the three workflow callers keep stderr and discard only the JSON', () => {
+    const callers = [
+      'gsd-core/workflows/quick.md',
+      'gsd-core/workflows/quick-batch.md',
+      'gsd-core/workflows/execute-phase/steps/executor-isolation-dispatch.md',
+    ];
+    for (const rel of callers) {
+      const lines = fs.readFileSync(path.join(__dirname, '..', rel), 'utf8').split(/\r?\n/)
+        .filter((l) => l.includes('gsd_run query worktree.reap-orphans'));
+      assert.strictEqual(lines.length, 1, `${rel}: exactly one reap-orphans call`);
+      assert.ok(!lines[0].includes('2>/dev/null'), `${rel}: stderr carries the residue paths and must not be discarded`);
+      assert.match(lines[0], /reap-orphans >\/dev\/null \|\| true/, `${rel}: stdout JSON discarded, failure tolerated`);
+    }
+  });
+
+  function sepGitRepoWithResidue(name) {
+    const repoDir = path.join(tmpBase, `repo-${name}`);
+    fs.mkdirSync(repoDir, { recursive: true });
+    git(['init', `--separate-git-dir=${path.join(tmpBase, `${name}.git`)}`], repoDir);
+    git(['config', 'user.email', 'test@test.com'], repoDir);
+    git(['config', 'user.name', 'Test'], repoDir);
+    git(['config', 'commit.gpgsign', 'false'], repoDir);
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# Test\n');
+    git(['add', '-A'], repoDir);
+    git(['commit', '-m', 'initial commit'], repoDir);
+    const residue = makeResidue(repoDir, 'agent-t1');
+    git(['worktree', 'prune'], repoDir);
+    return { repoDir, residue };
+  }
+
+  test('a --separate-git-dir main checkout still scans its residue', () => {
+    const { repoDir, residue } = sepGitRepoWithResidue('sepgit');
+    const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+    assert.deepStrictEqual(rows(results), [[canonicalPath(residue), 'skipped', 'unregistered_residue']]);
+    assert.strictEqual(scan.residue_dir, 'scanned');
+  });
+
+  test('a checkout top git cannot name scans as top_unresolved, not not_main_checkout', () => {
+    const { repoDir, residue } = sepGitRepoWithResidue('notop');
+    const faultyGit = makeFaultyGit({
+      faults: [{ kind: 'exit', exitCode: 128, when: ['rev-parse', '--show-toplevel'] }],
+      passthrough: realExecGit,
+    });
+    const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps({ execGit: faultyGit }));
+    assert.deepStrictEqual(results, []);
+    assert.strictEqual(scan.residue_dir, 'top_unresolved');
+    assert.ok(fs.existsSync(residue));
+  });
+
+  test('residue rows come back in name order, whatever order the filesystem lists them', () => {
+    const repoDir = path.join(tmpBase, 'repo-order');
+    initRepo(repoDir);
+    const names = ['agent-c', 'agent-a', 'agent-b'];
+    const dirs = names.map((n) => makeResidue(repoDir, n));
+    git(['worktree', 'prune'], repoDir);
+    const results = reapOrphanWorktrees(repoDir, deadOwnerDeps());
+    assert.deepStrictEqual(results.map((r) => path.basename(r.path)), ['agent-a', 'agent-b', 'agent-c']);
+    for (const d of dirs) assert.ok(fs.existsSync(d));
   });
 });
