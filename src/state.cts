@@ -130,6 +130,7 @@ import {
   stateFieldContinuation,
   editedLineContinuation,
   insertMissingSessionFields,
+  readableEditedBoldLabel,
   stateReplaceField,
   KNOWN_TEMPLATE_DEFAULTS,
   stateReplaceFieldIfTemplate,
@@ -2032,7 +2033,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       if (!result) result = stateReplaceField(content, 'Stopped at', options.stopped_at);
       if (result) {
         stoppedAtMatched = true;
-        if (result !== content && !skipWrapped('Stopped At', content, result)) { content = result; updated.push('Stopped At'); }
+        if (result !== content && !skipWrapped('Stopped At', content, result)) { content = readableEditedBoldLabel(content, result); updated.push('Stopped At'); }
       }
     }
 
@@ -2045,7 +2046,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // Caller explicitly passed a value — always honour it.
       result = stateReplaceField(content, 'Resume File', options.resume_file);
       if (!result) result = stateReplaceField(content, 'Resume file', options.resume_file);
-      if (result && !skipWrapped('Resume File', content, result)) { content = result; updated.push('Resume File'); }
+      if (result && !skipWrapped('Resume File', content, result)) { content = readableEditedBoldLabel(content, result); updated.push('Resume File'); }
     } else {
       // No explicit value — only set 'None' when existing value is also a known default
       // (i.e. not executor-authored).
@@ -2120,29 +2121,18 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // `**Stopped at:**` above plain `Last session:` lines is a line the
       // template does not define. With no sibling present it goes right after
       // the heading in bold, the pre-#4998 shape. Every existing line is kept.
-      //
-      // `region` is a session section's body, or — with no session heading —
-      // the whole document, where the sync reads these fields too. Returns
-      // false, writing nothing, when `requireSibling` is set and no field of
-      // the three is present to insert beside.
-      type Region = { bodyStart: number; bodyEnd: number; body: string };
-      const insertMissingFields = (region: Region, requireSibling: boolean): boolean => {
-        const body = insertMissingSessionFields(region.body, [
-          ['Last session', needsLastSession, now],
-          ['Stopped at', !!needsStoppedAt, stoppedAtValue],
-          ['Resume file', needsResumeFile, resumeValue],
-        ], requireSibling);
-        if (body === null) return false;
-        content = content.slice(0, region.bodyStart) + body + content.slice(region.bodyEnd);
-        rewriteMatched = true;
-        return true;
-      };
       // A heading with no line terminator (at EOF) has no body to insert
       // into; leave rewriteMatched false rather than glue a field onto it.
       const insertIntoSection = (isTarget: (h: HeadingToken) => boolean): void => {
         const section = collectSection(content, isTarget, { levelBounded: true });
         if (!section || content[section.bodyStart - 1] !== '\n') return;
-        insertMissingFields(section, false);
+        const body = insertMissingSessionFields(section.body, [
+          ['Last session', needsLastSession, now],
+          ['Stopped at', !!needsStoppedAt, stoppedAtValue],
+          ['Resume file', needsResumeFile, resumeValue],
+        ]);
+        content = replaceSection(content, section, body);
+        rewriteMatched = true;
       };
 
       if (existingCanonicalSession) {
@@ -2165,20 +2155,22 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // a detected heading the writer then misses would report fields as
         // updated that were never written (`rewriteMatched` stays false).
         insertIntoSection((h) => h.level === 2 && h.text.trim().toLowerCase() === 'session continuity');
-      } else if (!insertMissingFields({ bodyStart: 0, bodyEnd: content.length, body: content }, true)) {
-        // No session heading and no session field anywhere — append a new
-        // canonical section. #4998: when some session field IS present
-        // without a heading, the missing ones were inserted beside it above
-        // instead: a new `## Session` would become the section the sync reads
-        // and shadow the existing lines, dropping a wrapped field's record and
-        // resetting an authored Resume file to None.
+      } else {
+        // No session heading exists at all — append a new canonical section.
+        // #4998: the appended section becomes the one the sync reads, so a
+        // field this call is not setting carries the value the sync reads
+        // today (a body line, a wrapped field's first line, a table row)
+        // rather than None or nothing — which dropped the frontmatter
+        // `stopped_at` and reset an authored Resume file. Later writes then
+        // land on these bold lines first.
+        const carried = (field: string, fallback: string): string => stateExtractField(content, field) ?? fallback;
         const scaffold = [
           '',
           '## Session',
           '',
           `**Last session:** ${now}`,
-          `**Stopped at:** ${stoppedAtValue}`,
-          `**Resume file:** ${resumeValue}`,
+          `**Stopped at:** ${needsStoppedAt ? stoppedAtValue : carried('Stopped At', stoppedAtValue)}`,
+          `**Resume file:** ${needsResumeFile ? resumeValue : carried('Resume File', resumeValue)}`,
           '',
         ].join('\n');
         content = content.trimEnd() + '\n' + scaffold;

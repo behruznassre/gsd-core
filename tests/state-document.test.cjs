@@ -24,6 +24,7 @@ const {
   editedLineContinuation,
   stateFieldContinuation,
   insertMissingSessionFields,
+  readableEditedBoldLabel,
 } = require('../gsd-core/bin/lib/state-document.cjs');
 const { scanFencedBlocks } = require('../gsd-core/bin/lib/markdown-sectionizer.cjs');
 
@@ -2713,12 +2714,21 @@ describe('#4998 review round: single-line writes, colon-outside reads, continuat
     assert.equal(stateReplaceField('Status: old', 'Status', 'new'), 'Status: new');
   });
 
-  test('stateExtractField and stateFieldContinuation read both bold placements', () => {
-    assert.equal(stateExtractField('**Stopped at**: Phase 2', 'Stopped at'), 'Phase 2');
-    assert.equal(stateExtractField('**Stopped at:** Phase 2', 'Stopped at'), 'Phase 2');
-    assert.equal(stateFieldContinuation('**Stopped at**: Phase 2\nmore of it', 'Stopped at'), 'more of it');
-    // Not a field: the colon is neither inside nor directly after the bold.
-    assert.equal(stateExtractField('**Stopped at** Phase 2: x', 'Stopped at'), null);
+  // The reader is NOT widened to `**Label**:` — that let a fenced example
+  // override a live field (Codex review). The writer respells instead.
+  test('a fenced **Status**: example never overrides the live Status field', () => {
+    const doc = 'Status: Executing\n\n```md\n**Status**: Complete\n```\n';
+    assert.equal(stateExtractField(doc, 'Status'), 'Executing');
+  });
+
+  test('readableEditedBoldLabel respells only the line the write changed', () => {
+    const before = '**Stopped at**: old\n```\n**Stopped at**: example\n```\n**Resume file**: None';
+    const after = '**Stopped at**: new\n```\n**Stopped at**: example\n```\n**Resume file**: None';
+    assert.equal(readableEditedBoldLabel(before, after),
+      '**Stopped at:** new\n```\n**Stopped at**: example\n```\n**Resume file**: None');
+    assert.equal(readableEditedBoldLabel(before, before), before, 'no change, nothing respelled');
+    assert.equal(readableEditedBoldLabel('Status: a', 'Status: b'), 'Status: b', 'plain lines are left alone');
+    assert.equal(readableEditedBoldLabel('**S:** a', '**S:** b'), '**S:** b', 'already readable');
   });
 
   // Continuation-run length 0 / 1 / 2: a blank line, end of file or a sibling ends it.
@@ -2771,15 +2781,15 @@ describe('insertMissingSessionFields (#4998)', () => {
   const FIELDS = (ls, sa, rf) => [['Last session', ls, 'V-LS'], ['Stopped at', sa, 'V-SA'], ['Resume file', rf, 'V-RF']];
 
   test('inserts beside the template-order sibling, plain beside plain, bold beside bold', () => {
-    assert.equal(insertMissingSessionFields('Last session: x\nResume file: y', FIELDS(false, true, false), false),
+    assert.equal(insertMissingSessionFields('Last session: x\nResume file: y', FIELDS(false, true, false)),
       'Last session: x\nStopped at: V-SA\nResume file: y');
-    assert.equal(insertMissingSessionFields('**Stopped at:** x', FIELDS(true, false, false), false),
+    assert.equal(insertMissingSessionFields('**Stopped at:** x', FIELDS(true, false, false)),
       '**Last session:** V-LS\n**Stopped at:** x');
   });
 
-  test('requireSibling: no field present → null; otherwise inserted', () => {
-    assert.equal(insertMissingSessionFields('prose\n```\nStopped at: example\n```', FIELDS(true, true, true), true), null);
-    assert.equal(insertMissingSessionFields('prose', FIELDS(true, false, false), false), '**Last session:** V-LS\nprose');
+  test('with no sibling outside a fence, the field goes at the top in bold', () => {
+    assert.equal(insertMissingSessionFields('prose\n```\nStopped at: example\n```', FIELDS(true, false, false)),
+      '**Last session:** V-LS\nprose\n```\nStopped at: example\n```');
   });
 
   // Property: every pre-existing line survives, in order; exactly the needed
@@ -2788,13 +2798,9 @@ describe('insertMissingSessionFields (#4998)', () => {
     const LINE = fc.constantFrom('', 'prose text', 'Last session: a', '**Stopped at:** b', 'Stopped at**: c',
       'Resume file: d', '```', '~~~', '````md', '  ```', '  - bullet', '    code', '**Other:** z', '## Heading');
     fc.assert(fc.property(
-      fc.array(LINE, { maxLength: 14 }), fc.boolean(), fc.boolean(), fc.boolean(), fc.boolean(),
-      (input, ls, sa, rf, requireSibling) => {
-        const out = insertMissingSessionFields(input.join('\n'), FIELDS(ls, sa, rf), requireSibling);
-        if (out === null) {
-          assert.ok(requireSibling, 'null only under requireSibling');
-          return;
-        }
+      fc.array(LINE, { maxLength: 14 }), fc.boolean(), fc.boolean(), fc.boolean(),
+      (input, ls, sa, rf) => {
+        const out = insertMissingSessionFields(input.join('\n'), FIELDS(ls, sa, rf));
         const lines = out.split('\n');
         const added = lines.map((l, i) => [l, i]).filter(([l]) => /V-(LS|SA|RF)$/.test(l));
         assert.deepStrictEqual(lines.filter((l) => !/V-(LS|SA|RF)$/.test(l)), input.join('\n').split('\n'));

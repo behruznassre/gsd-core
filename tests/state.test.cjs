@@ -22164,7 +22164,8 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     seed(['stopped_at: old handoff'], ['**Last session**: 2026-01-01', '**Stopped at**: old handoff', '**Resume file**: None'], '## Session');
     const { json } = recordSession('--stopped-at', 'new handoff');
     assert.ok(json.updated.includes('Stopped At'), JSON.stringify(json));
-    assert.ok(session().includes('**Stopped at**: new handoff'), session());
+    // Respelled to the readable form on the line written; siblings untouched.
+    assert.ok(session().includes('**Stopped at:** new handoff\n**Resume file**: None'), session());
     assert.strictEqual(frontmatterStoppedAt(), 'new handoff', readState());
   });
 
@@ -22182,24 +22183,47 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.ok(session().includes('Stopped at: Phase 3\n  **Resume file:** plan.md'), session());
   });
 
-  test('(d) no session heading, a wrapped field and a frontmatter stopped_at: no shadowing section is appended', () => {
+  test('(d) no session heading, a wrapped field and a frontmatter stopped_at: the appended section keeps the record', () => {
     fs.writeFileSync(statePath(), ['---', 'status: executing', 'stopped_at: old handoff', '---', '', '# Project State', '',
       'Stopped at: old handoff', 'its continuation', ''].join('\n'));
     const { json } = recordSession('--stopped-at', 'new handoff', '--resume-file', 'plan.md');
     assert.deepStrictEqual(json.skipped.map((s) => s.field), ['Stopped At']);
-    const after = readState();
-    assert.ok(!/^## Session/m.test(after), `no section may be appended: ${after}`);
-    assert.match(after, /\nLast session: \S+\nStopped at: old handoff\nits continuation\nResume file: plan.md\n/);
-    assert.strictEqual(frontmatterStoppedAt(), 'old handoff', 'the record the sync reads is unchanged');
+    assert.ok(!json.updated.includes('Stopped At'), JSON.stringify(json));
+    assert.ok(readState().includes('Stopped at: old handoff\nits continuation\n'), 'the wrapped field is whole');
+    assert.match(session(), /\*\*Stopped at:\*\* old handoff\n\*\*Resume file:\*\* plan\.md/);
+    assert.strictEqual(frontmatterStoppedAt(), 'old handoff', 'the frontmatter record survives');
   });
 
-  test('no session heading: a missing field goes beside the existing ones; an authored Resume file is not shadowed', () => {
+  test('no session heading: an authored Resume file is carried into the appended section, not reset to None', () => {
     fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
       'Stopped at: Phase 2', 'Resume file: .planning/phases/02/02-01-PLAN.md', ''].join('\n'));
     recordSession('--stopped-at', 'Phase 3');
-    const after = readState();
-    assert.ok(!/^## Session/m.test(after), after);
-    assert.match(after, /\nLast session: \S+\nStopped at: Phase 3\nResume file: \.planning\/phases\/02\/02-01-PLAN\.md\n/);
+    assert.match(session(), /\*\*Stopped at:\*\* Phase 3\n\*\*Resume file:\*\* \.planning\/phases\/02\/02-01-PLAN\.md/);
+  });
+
+  test('no session heading: a table-only Resume file is carried, not shadowed by None', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
+      '| Field | Value |', '| --- | --- |', '| Resume file | .planning/phases/02/02-01-PLAN.md |', ''].join('\n'));
+    recordSession('--stopped-at', 'Phase 3');
+    assert.match(session(), /\*\*Resume file:\*\* \.planning\/phases\/02\/02-01-PLAN\.md/);
+  });
+
+  test('no session heading: nothing is inserted into frontmatter, even a block scalar holding a field-like line', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', 'handoff_notes: |', '  Resume file: old-plan.md', '  keep this', '---', '',
+      '# Project State', ''].join('\n'));
+    recordSession('--stopped-at', 'Phase 3');
+    const fm = frontmatterLib.extractFrontmatter(readState());
+    assert.match(String(fm.handoff_notes), /Resume file: old-plan\.md\s+keep this/, readState());
+    assert.match(session(), /\*\*Stopped at:\*\* Phase 3/);
+  });
+
+  test('no session heading: an archive section is never the insertion target', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
+      '## Session Continuity Archive', '', 'Resume file: old-plan.md', ''].join('\n'));
+    recordSession('--stopped-at', 'Phase 3');
+    const archive = collectSection(readState(), (h) => h.text.trim() === 'Session Continuity Archive', { levelBounded: true }).body;
+    assert.ok(!archive.includes('Phase 3'), archive);
+    assert.match(readState(), /\n## Session\n\n\*\*Last session:\*\* \S+\n\*\*Stopped at:\*\* Phase 3\n/);
   });
 
   test('no session heading and no session field: the canonical section is still appended', () => {

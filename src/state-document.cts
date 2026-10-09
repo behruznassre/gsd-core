@@ -382,7 +382,7 @@ export function stateFieldContinuation(content: string, fieldName: string): stri
   // is deliberately absent: a `| Field | value |` row is bounded by its closing
   // pipe and cannot wrap.
   const match =
-    new RegExp(`^[ \\t]*\\*\\*${escaped}(?::\\*\\*|\\*\\*:)[ \\t]*(.+)`, 'im').exec(content) ??
+    new RegExp(`^[ \\t]*\\*\\*${escaped}:\\*\\*[ \\t]*(.+)`, 'im').exec(content) ??
     new RegExp(`^${escaped}:[ \\t]*(.+)`, 'im').exec(content);
   if (!match) return null;
 
@@ -412,6 +412,26 @@ export function editedLineContinuation(before: string, after: string): string | 
   // edited line borrow a later table row's pipe.
   if (before.slice(lineStart, lineEnd === -1 ? before.length : lineEnd).trimStart().startsWith('|')) return null;
   return lineEnd === -1 ? null : continuationAfter(before, lineEnd);
+}
+
+/**
+ * #4998: `after` with the line a single-line write changed respelled from
+ * `**Label**:` to `**Label:**` — the spelling `stateExtractField` reads — so a
+ * value `state record-session` just wrote reads back into the frontmatter
+ * sync. `stateReplaceField` keeps the author's spelling by contract (#5007);
+ * this is applied by the one writer whose lines the sync must read, to the
+ * one line it wrote. Any other line is untouched.
+ */
+export function readableEditedBoldLabel(before: string, after: string): string {
+  if (before === after) return after;
+  const limit = Math.min(before.length, after.length);
+  let i = 0;
+  while (i < limit && before.charCodeAt(i) === after.charCodeAt(i)) i++;
+  const lineStart = i === 0 ? 0 : after.lastIndexOf('\n', i - 1) + 1;
+  const lineEnd = after.indexOf('\n', lineStart);
+  const end = lineEnd === -1 ? after.length : lineEnd;
+  const line = after.slice(lineStart, end).replace(/^([ \t]*)\*\*([^*\r\n]+)\*\*:/, '$1**$2:**');
+  return after.slice(0, lineStart) + line + after.slice(end);
 }
 
 /** The continuation lines following the line that ends at `afterValue`. */
@@ -458,14 +478,8 @@ export type SessionFieldInsert = readonly [label: string, needed: boolean, value
  * order, and lines inside a fenced block are examples: never an anchor, never
  * an insertion point.
  *
- * Returns `null`, inserting nothing, when `requireSibling` is set and no field
- * of `fields` appears in `body` outside a fence.
  */
-export function insertMissingSessionFields(
-  body: string,
-  fields: readonly SessionFieldInsert[],
-  requireSibling: boolean,
-): string | null {
+export function insertMissingSessionFields(body: string, fields: readonly SessionFieldInsert[]): string {
   const lines = body.split('\n');
   const fenced = lines.map(() => false);
   for (const block of scanFencedBlocks(lines)) {
@@ -476,7 +490,6 @@ export function insertMissingSessionFields(
   const labelRe = (label: string): RegExp =>
     new RegExp(`^[ \\t]*(?:\\*\\*)?${escapeRegex(label)}(?::\\*\\*|\\*\\*:|:)(?:\\s|$)`, 'i');
   const lineOf = (label: string): number => lines.findIndex((l, i) => !fenced[i] && labelRe(label).test(l));
-  if (requireSibling && fields.every(([label]) => lineOf(label) === -1)) return null;
   fields.forEach(([label, needed, value], k) => {
     if (!needed) return;
     let anchor = -1;
@@ -505,10 +518,8 @@ export function insertMissingSessionFields(
 export function stateExtractField(content: string, fieldName: string): string | null {
   const escaped = escapeRegex(fieldName);
   // Bold line-start format: **FieldName:** value. Leading same-line whitespace
-  // matches the writer's established indented-field tolerance. #4998: both
-  // bold placements, `**FieldName:**` and `**FieldName**:` — stateReplaceField
-  // writes both (BOLD_FIELD_RE), so a field it updated must read back.
-  const boldPattern = new RegExp(`^[ \\t]*\\*\\*${escaped}(?::\\*\\*|\\*\\*:)[ \\t]*(.+)`, 'im');
+  // matches the writer's established indented-field tolerance.
+  const boldPattern = new RegExp(`^[ \\t]*\\*\\*${escaped}:\\*\\*[ \\t]*(.+)`, 'im');
   const boldMatch = content.match(boldPattern);
   if (boldMatch)
     return boldMatch[1].trim();
