@@ -1000,7 +1000,6 @@ Since v1.3.1, the installer pre-populates `~/.claude/settings.json` (or
 {
   "permissions": {
     "allow": [
-      "Bash(npx gsd-core *)",
       "Read(.planning/*)",
       "Edit(.planning/*)",
       "Read(STATE.md)",
@@ -1014,6 +1013,13 @@ These entries eliminate first-run approval prompts for GSD's own tool calls. The
 merge is non-destructive — your existing permissions are preserved and GSD entries
 are only appended. Uninstalling GSD removes exactly these entries and preserves
 any others.
+
+**The unscoped `npx gsd-core` rule is retired (#5054).** Earlier versions also
+wrote `Bash(npx gsd-core *)`. GSD is published as `@opengsd/gsd-core`, and the
+unscoped `gsd-core` name on npm belongs to a different owner, so that rule let
+Claude Code run whatever is published under that name without asking. The next
+install or upgrade removes that one entry and leaves your other permissions alone.
+Install and upgrade with `npx @opengsd/gsd-core@latest`.
 
 **Secret-file protection moved from deny rules to a hook (#4221).** Earlier
 versions also wrote three `permissions.deny` rules — `Read(.env)`,

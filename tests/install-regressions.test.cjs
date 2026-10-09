@@ -428,11 +428,11 @@ describe('mergeClaudePermissions (#768): fresh settings object', () => {
     }
   });
 
-  test('includes Bash(npx gsd-core *) in allow', () => {
+  test('never writes the unscoped Bash(npx gsd-core *) rule (#5054)', () => {
     const settings = {};
     mergeClaudePermissions(settings);
-    assert.ok(settings.permissions.allow.includes('Bash(npx gsd-core *)'),
-      'permissions.allow must contain Bash(npx gsd-core *)');
+    assert.ok(!settings.permissions.allow.includes('Bash(npx gsd-core *)'),
+      'permissions.allow must NOT contain Bash(npx gsd-core *): the unscoped npm name is not this project');
   });
 
   test('includes planning path entries in allow (#2278: Edit, not Write)', () => {
@@ -483,7 +483,7 @@ describe('mergeClaudePermissions (#768): non-destructive merge', () => {
     assert.ok(settings.permissions.deny.includes('WebSearch'),
       'existing deny entries must be preserved');
     // GSD allow entries must be added; the retired deny rules must not be
-    assert.ok(settings.permissions.allow.includes('Bash(npx gsd-core *)'),
+    assert.ok(settings.permissions.allow.includes('Read(.planning/*)'),
       'GSD allow entry must be added');
     assert.ok(!settings.permissions.deny.includes('Read(.env)'),
       'the retired Read(.env) deny rule must not be added (#4221)');
@@ -524,7 +524,7 @@ describe('mergeClaudePermissions (#768): non-destructive merge', () => {
     mergeClaudePermissions(settings);
     assert.ok(Array.isArray(settings.permissions.allow));
     assert.ok(Array.isArray(settings.permissions.deny));
-    assert.ok(settings.permissions.allow.includes('Bash(npx gsd-core *)'));
+    assert.ok(settings.permissions.allow.includes('Read(.planning/*)'));
   });
 
   test('handles settings that are not plain objects (returns unchanged)', () => {
@@ -542,13 +542,13 @@ describe('mergeClaudePermissions (#768): non-destructive merge', () => {
 // pre-populated allow-rules must use `Edit(pattern)`, and a merge against an
 // existing install must retire the stale unmatched `Write(...)` forms.
 describe('mergeClaudePermissions (#2278): legacy Write(...) → Edit(...) migration', () => {
-  test('GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS is exported and lists the stale Write(...) forms', () => {
+  test('GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS is exported and lists the retired allow forms (#2278, #5054)', () => {
     assert.ok(Array.isArray(GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS),
       'GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS must be an array');
     assert.deepStrictEqual(
       [...GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS].sort(),
-      ['Write(.planning/*)', 'Write(STATE.md)'].sort(),
-      'GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS must contain exactly the retired Write(...) forms'
+      ['Write(.planning/*)', 'Write(STATE.md)', 'Bash(npx gsd-core *)'].sort(),
+      'GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS must contain exactly the retired Write(...) forms and the unscoped npx rule'
     );
   });
 
@@ -746,6 +746,84 @@ describe('mergeClaudePermissions (#4221): legacy Read(.env*) deny-rule retiremen
   });
 });
 
+// ─── #5054 — the unscoped `gsd-core` npm name is not this project's package
+// (the project publishes `@opengsd/gsd-core`), so a standing
+// `Bash(npx gsd-core *)` allow rule pre-authorizes whatever that name's owner
+// publishes next. The installer must stop writing it, and an install or
+// upgrade over an existing settings file must remove it, not just stop
+// re-adding it.
+describe('#5054 regression: the unscoped Bash(npx gsd-core *) allow rule is retired', () => {
+  const UNSCOPED_RULE = 'Bash(npx gsd-core *)';
+
+  test('no current allow rule runs the unscoped gsd-core package', () => {
+    for (const entry of GSD_CLAUDE_ALLOW_PERMISSIONS) {
+      assert.doesNotMatch(entry, /\b(?:npx|bunx|pnpx)\s+(?:-y\s+)?gsd-core\b/,
+        `"${entry}" pre-authorizes the unscoped gsd-core npm package`);
+    }
+  });
+
+  test('a merge over an existing install removes the rule and keeps every other entry in order', () => {
+    const settings = {
+      permissions: {
+        allow: ['Bash(git *)', UNSCOPED_RULE, 'Read(.planning/*)', 'Edit(.planning/*)',
+          'Read(STATE.md)', 'Edit(STATE.md)', 'WebFetch'],
+      },
+    };
+    mergeClaudePermissions(settings);
+    assert.deepStrictEqual(settings.permissions.allow, [
+      'Bash(git *)', 'Read(.planning/*)', 'Edit(.planning/*)', 'Read(STATE.md)', 'Edit(STATE.md)', 'WebFetch',
+    ]);
+  });
+
+  test('only the byte-equal rule is removed; a scoped or differently spelled user rule survives', () => {
+    const userRules = [
+      'Bash(npx @opengsd/gsd-core *)',
+      'Bash(npx -y --package=@opengsd/gsd-core*)',
+      'Bash(npx gsd-core)',
+      'Bash(npx gsd-core:*)',
+    ];
+    const settings = { permissions: { allow: [...userRules, UNSCOPED_RULE] } };
+    mergeClaudePermissions(settings);
+    for (const rule of userRules) {
+      assert.ok(settings.permissions.allow.includes(rule), `user rule "${rule}" must survive`);
+    }
+    assert.ok(!settings.permissions.allow.includes(UNSCOPED_RULE));
+  });
+
+  test('--claude --global install over a pre-#5054 settings.json removes the rule', (t) => {
+    const root = createTempDir('gsd-claude-perm-5054-');
+    t.after(() => cleanup(root));
+    const settingsPath = path.join(root, 'settings.json');
+    fs.writeFileSync(settingsPath, JSON.stringify({
+      permissions: { allow: ['Bash(git *)', UNSCOPED_RULE, 'Read(.planning/*)'] },
+    }, null, 2) + '\n');
+
+    const result = runNode(
+      [INSTALL_SCRIPT, '--claude', '--global', '--config-dir', root],
+      { env: { ...process.env, HOME: root, USERPROFILE: root }, timeoutMs: INSTALL_TIMEOUT_MS },
+    );
+    assert.strictEqual(result.exitCode, 0,
+      `installer exited ${result.exitCode}\n${result.stdout}\n${result.stderr}`);
+
+    const allow = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).permissions.allow;
+    assert.ok(!allow.includes(UNSCOPED_RULE), 'the upgrade must remove the unscoped rule');
+    assert.ok(allow.includes('Bash(git *)'), 'the user rule must survive');
+    for (const entry of GSD_CLAUDE_ALLOW_PERMISSIONS) {
+      assert.ok(allow.includes(entry), `current GSD rule "${entry}" must still be present`);
+    }
+  });
+
+  test('GEMINI.md install instructions never run the unscoped package', () => {
+    const geminiPath = path.join(__dirname, '..', 'GEMINI.md');
+    const offenders = fs.readFileSync(geminiPath, 'utf8').split(/\r?\n/)
+      // Leading `>` (blockquote) and `$ ` (shell prompt) are part of how the
+      // doc presents a command; the original offender sat in a blockquote.
+      .filter((line) => /^[\s>$]*(?:[A-Z_]+=\S+\s+)*npx\s+(?:-y\s+)?gsd-core\b/.test(line));
+    assert.deepStrictEqual(offenders, [],
+      'GEMINI.md install commands must use the scoped @opengsd/gsd-core package');
+  });
+});
+
 describe('mergeClaudePermissions (#768): end-to-end install writes permissions to settings.json', () => {
   test('--claude --global install writes GSD allow/deny entries to settings.json', (t) => {
     const root = createTempDir('gsd-claude-perm-install-');
@@ -768,8 +846,8 @@ describe('mergeClaudePermissions (#768): end-to-end install writes permissions t
     assert.strictEqual(settings.permissions.deny, undefined,
       'a fresh install must not write permissions.deny at all (#4221)');
 
-    assert.ok(settings.permissions.allow.includes('Bash(npx gsd-core *)'),
-      'settings.json permissions.allow must include Bash(npx gsd-core *)');
+    assert.ok(!settings.permissions.allow.includes('Bash(npx gsd-core *)'),
+      'settings.json permissions.allow must NOT include the unscoped Bash(npx gsd-core *) (#5054)');
     assert.ok(settings.permissions.allow.includes('Read(.planning/*)'),
       'settings.json permissions.allow must include Read(.planning/*)');
   });
@@ -843,12 +921,13 @@ describe('mergeClaudePermissions (#768): end-to-end install writes permissions t
     // Verify permissions were written
     const settingsPath = path.join(root, 'settings.json');
     const afterInstall = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-    assert.ok((afterInstall.permissions?.allow ?? []).includes('Bash(npx gsd-core *)'),
+    assert.ok((afterInstall.permissions?.allow ?? []).includes('Read(.planning/*)'),
       'permissions.allow must contain GSD entry after install');
 
     // Now add a user permission to make sure we don't nuke it, and simulate
-    // a pre-#4221 install that still carries the retired deny rules.
-    afterInstall.permissions.allow.push('Bash(git *)');
+    // a pre-#4221 install that still carries the retired deny rules and a
+    // pre-#5054 install that still carries the unscoped npx allow rule.
+    afterInstall.permissions.allow.push('Bash(git *)', 'Bash(npx gsd-core *)');
     afterInstall.permissions.deny = ['Read(.env)', 'Read(.env.*)', 'Read(.secrets)', 'WebSearch'];
     fs.writeFileSync(settingsPath, JSON.stringify(afterInstall, null, 2) + '\n');
 
@@ -865,7 +944,7 @@ describe('mergeClaudePermissions (#768): end-to-end install writes permissions t
 
     // GSD entries must be removed
     assert.ok(!allow.includes('Bash(npx gsd-core *)'),
-      'GSD Bash allow entry must be removed by uninstall');
+      'the retired unscoped Bash(npx gsd-core *) allow entry must be removed by uninstall (#5054)');
     assert.ok(!allow.includes('Read(.planning/*)'),
       'GSD Read(.planning/*) allow entry must be removed by uninstall');
     for (const entry of GSD_CLAUDE_LEGACY_DENY_PERMISSIONS) {
