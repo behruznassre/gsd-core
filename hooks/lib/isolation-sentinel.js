@@ -145,14 +145,9 @@ function resolveSentinelRoot(cwd) {
     // lib staged without that export (hooks newer than the lib) keeps the
     // pre-#4885 main-worktree resolution rather than degrading to raw `cwd`.
     const worktreeSafety = require('../../gsd-core/bin/lib/worktree-safety.cjs');
-    // #4885: walk from where `cwd` physically is. The project-root walk is
-    // lexical, so a symlink inside a GSD project pointing into another
-    // repository otherwise resolved to the GSD project and its isolation was
-    // enforced on a dispatch in the other repository.
-    const physicalCwd = fs.realpathSync.native(cwd);
     const { root } = typeof worktreeSafety.resolvePlanningWorktreeRoot === 'function'
-      ? worktreeSafety.resolvePlanningWorktreeRoot(physicalCwd)
-      : worktreeSafety.resolveWorktreeRoot(physicalCwd);
+      ? worktreeSafety.resolvePlanningWorktreeRoot(cwd)
+      : worktreeSafety.resolveWorktreeRoot(cwd);
     const { findProjectRoot } = require('../../gsd-core/bin/lib/project-root.cjs');
     return findProjectRoot(root);
   } catch {

@@ -1110,55 +1110,53 @@ describe('gsd-cursor-subagent-start.js: #4885 — workspace root is a project su
   });
 });
 
-describe('#4885: a symlink inside a GSD project that points into another repository', () => {
-  // Root resolution walks from where the workspace physically is. A lexical
-  // walk from `<project>/external-link` found the GSD project, so both guards
-  // enforced its isolation on a dispatch running in the other repository.
-  // Lives beside the symlink spoofing test above (same Windows skip), and
-  // drives both guards so the agent-guard file needs no symlink of its own.
-  let harnessProject;
-  let otherRepo;
-  let link;
+describe('#4885: the guards read the sentinel where gsd-tools wrote it, through a .planning symlink', () => {
+  // The supported external-planning convention: `.planning` is a symlink to a
+  // separate store (src/project-root.cts, #4815). gsd-tools' root walk is
+  // lexical, so a decision recorded from `<project>/.planning/phases/01` lands
+  // in `<project>`. A reader that canonicalized the cwd first resolved into the
+  // store instead, missed the sentinel, and allowed a dispatch the recorded
+  // `harness-worktree` decision blocks. Lives beside the symlink spoofing test
+  // above (same Windows skip).
+  let store;
+  let project;
+  let phaseDir;
   let symlinkError = null;
 
   before(() => {
-    harnessProject = makeGitProject('gsd-cs-4885-link-', JSON.stringify({ runtime: 'claude' }));
-    otherRepo = createTempDir('gsd-cs-4885-other-');
-    git(['init'], otherRepo);
-    fs.mkdirSync(path.join(otherRepo, 'src'));
-    link = path.join(harnessProject, 'external-link');
+    store = createTempDir('gsd-cs-4885-store-');
+    git(['init'], store);
+    fs.writeFileSync(path.join(store, 'config.json'), JSON.stringify({ runtime: 'claude' }));
+    fs.mkdirSync(path.join(store, 'phases', '01'), { recursive: true });
+    project = createTempDir('gsd-cs-4885-proj-');
+    git(['init'], project);
     try {
-      fs.symlinkSync(path.join(otherRepo, 'src'), link, 'dir');
+      fs.symlinkSync(store, path.join(project, '.planning'), 'dir');
     } catch (err) {
       symlinkError = err;
     }
+    phaseDir = path.join(project, '.planning', 'phases', '01');
   });
 
   after(() => {
-    cleanup(harnessProject);
-    cleanup(otherRepo);
+    cleanup(project);
+    cleanup(store);
   });
 
-  test('Claude guard: a dispatch through the link is not governed by the GSD project', (t) => {
+  test('a harness-worktree decision recorded from inside the linked .planning blocks an unflagged dispatch there', (t) => {
     if (symlinkError) {
       t.skip('directory symlinks require elevated privileges on this platform');
       return;
     }
+    const { TOOLS_PATH: toolsPath, TEST_ENV_BASE } = require('./helpers.cjs');
+    const rec = runNode([toolsPath, 'query', 'record-dispatch-isolation', '--isolation', 'harness-worktree',
+      '--harness-flag', 'isolation="worktree"', '--json', '--cwd', phaseDir],
+    { cwd: phaseDir, env: { ...process.env, ...TEST_ENV_BASE }, timeoutMs: PROBE_TIMEOUT_MS });
+    assert.equal(rec.exitCode, 0, rec.stderr);
+    assert.equal(JSON.parse(rec.stdout).recorded, true);
+
     const { evaluateDispatch } = require('../hooks/gsd-agent-isolation-guard.js');
-    const dispatch = (cwd) => evaluateDispatch({ tool_name: 'Agent', cwd, tool_input: { subagent_type: 'gsd-executor' } });
-    assert.equal(dispatch(link).action, 'allow');
-    // Control: the project itself still enforces.
-    assert.equal(dispatch(harnessProject).action, 'block');
-  });
-
-  test('Cursor guard: a workspace root through the link is not governed by the GSD project', (t) => {
-    if (symlinkError) {
-      t.skip('directory symlinks require elevated privileges on this platform');
-      return;
-    }
-    fs.writeFileSync(path.join(harnessProject, '.planning', 'config.json'), JSON.stringify({ runtime: 'cursor' }));
-    t.after(() => fs.writeFileSync(path.join(harnessProject, '.planning', 'config.json'), JSON.stringify({ runtime: 'claude' })));
-    assert.equal(JSON.parse(runHook(subagentPayload([link])).stdout).permission, undefined);
-    assert.equal(JSON.parse(runHook(subagentPayload([harnessProject])).stdout).permission, 'deny');
+    const r = evaluateDispatch({ tool_name: 'Agent', cwd: phaseDir, tool_input: { subagent_type: 'gsd-executor' } });
+    assert.equal(r.action, 'block', JSON.stringify(r));
   });
 });
