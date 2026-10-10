@@ -9,8 +9,9 @@
  */
 
 import fs from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import path from 'node:path';
-import { execGit as execGitSeam, posixNormalize, type SpawnResultOutput } from './shell-command-projection.cjs';
+import { execGit as execGitSeam, posixNormalize, retryRenameSync, type SpawnResultOutput } from './shell-command-projection.cjs';
 import { isContainedIn } from './security.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import io = require('./io.cjs');
@@ -2887,14 +2888,28 @@ function findUnregisteredResidue(
   }
   if (candidates.length === 0) return { results, status: 'scanned' };
 
-  const listed = execGit(['worktree', 'list', '--porcelain'], { cwd: repoRoot });
+  // `-z`: NUL-terminated fields, so a worktree path holding a newline is read
+  // whole — a newline-split listing truncated it and a registered, live
+  // worktree read as unregistered (Codex review). An older git without `-z`
+  // fails the call, which keeps every candidate.
+  const listed = execGit(['worktree', 'list', '--porcelain', '-z'], { cwd: repoRoot });
   if (!gitResultOk(listed)) {
     for (const p of candidates) results.push({ path: p, status: 'skipped', reason: 'worktree_list_failed' });
     return { results, status: 'scanned' };
   }
   const registered = new Set<string>();
-  for (const entry of parseWorktreeEntries(listed.stdout.replace(/\r\n/g, '\n'))) {
-    registered.add(comparablePath(entry.path));
+  for (const field of String(listed.stdout).split('\0')) {
+    if (field.startsWith('worktree ')) registered.add(comparablePath(field.slice('worktree '.length)));
+  }
+  // Child names under `.claude/worktrees` that git tracks a file in, Unicode-
+  // normalized and case-folded: a directory renamed to another normalization
+  // form (NFC/NFD) or case is the same directory to the filesystem (Codex
+  // review). Index paths use `/` only. A failed listing keeps everything.
+  const trackedList = execGit(['ls-files', '-z', '--', '.claude/worktrees'], { cwd: top });
+  const trackedNames = new Set<string>();
+  for (const file of gitResultOk(trackedList) ? String(trackedList.stdout).split('\0') : []) {
+    const name = file.split('/')[2];
+    if (name) trackedNames.add(name.normalize('NFC').toLowerCase());
   }
   const hasBranch = (branch: string): boolean =>
     gitResultOk(execGit(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: top }));
@@ -2923,7 +2938,8 @@ function findUnregisteredResidue(
       continue;
     }
     const tracked = execGit(['ls-files', '-z', '--', `:(icase,literal).claude/worktrees/${name}`], { cwd: top });
-    if (!gitResultOk(tracked) || tracked.stdout.length > 0) {
+    if (!gitResultOk(trackedList) || !gitResultOk(tracked) || tracked.stdout.length > 0
+        || trackedNames.has(name.normalize('NFC').toLowerCase())) {
       results.push({ path: p, status: 'skipped', reason: 'residue_tracked' });
       continue;
     }
@@ -2948,10 +2964,33 @@ function findUnregisteredResidue(
       results.push({ path: p, status: 'skipped', reason: 'residue_unreadable' });
       continue;
     }
+    // Rename to an unguessable name inside the verified directory, re-verify
+    // that it landed there, and remove THAT: a parent swapped for a link after
+    // this point can only redirect the removal to a path that does not exist
+    // (Codex review). A rename that went anywhere else is renamed back.
+    const doomed = path.join(residueDir, `.gsd-reap-${randomBytes(8).toString('hex')}`);
     try {
-      removeDir(target);
+      retryRenameSync(target, doomed);
+    } catch {
+      results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
+      continue;
+    }
+    let landed = false;
+    try {
+      landed = chainIsReal() && realDirectory(doomed) === true && fs.realpathSync.native(doomed) === doomed;
+    } catch {
+      landed = false;
+    }
+    if (!landed) {
+      try { retryRenameSync(doomed, target); } catch { /* left under its .gsd-reap name, reported */ }
+      results.push({ path: p, status: 'skipped', reason: 'residue_unreadable' });
+      continue;
+    }
+    try {
+      removeDir(doomed);
       results.push({ path: p, status: 'reaped', reason: 'unregistered_residue' });
     } catch {
+      try { retryRenameSync(doomed, target); } catch { /* left under its .gsd-reap name */ }
       results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
     }
   }
@@ -2984,9 +3023,11 @@ function repositoryInside(dir: string): 'none' | 'found' | 'unknown' {
     }
     seen += entries.length;
     if (seen > RESIDUE_WALK_LIMIT) return 'unknown';
-    const names = new Set(entries.map((e) => e.name));
+    // Case-folded: on a case-insensitive filesystem `.GIT` is still the
+    // repository's pointer to git (Codex review).
+    const names = new Set(entries.map((e) => e.name.toLowerCase()));
     if (names.has('.git')) return 'found';
-    if (names.has('HEAD') && names.has('objects') && names.has('refs')) return 'found';
+    if (names.has('head') && names.has('objects') && names.has('refs')) return 'found';
     for (const entry of entries) {
       if (entry.isDirectory() && !entry.isSymbolicLink()) {
         pending.push(path.join(current, entry.name));

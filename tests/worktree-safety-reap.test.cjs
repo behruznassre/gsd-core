@@ -1253,6 +1253,75 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(fs.existsSync(path.join(victim, 'work.txt')), 'the sibling repository\'s directory survives');
   });
 
+  // Codex review round 3 (user-approved), each reproduced against 8b1d5b951.
+  test('a swap of .claude/worktrees at the moment of removal moves nothing outside and deletes nothing', () => {
+    const { repoDir, residue } = repoWithResidue('renameswap');
+    const outside = path.join(tmpBase, 'rs-outside');
+    fs.mkdirSync(path.join(outside, 'agent-t1', 'keep'), { recursive: true });
+    const residueDir = path.join(repoDir, '.claude', 'worktrees');
+    const moved = path.join(tmpBase, 'rs-moved');
+    const realRename = fs.renameSync;
+    let swapped = false;
+    const results = withFaultyFs({
+      renameSync: (from, to) => {
+        // The swap lands just before the reaper's own rename.
+        if (!swapped && String(to).includes('.gsd-reap-')) {
+          swapped = true;
+          realRename(residueDir, moved);
+          fs.symlinkSync(outside, residueDir, 'junction');
+        }
+        return realRename(from, to);
+      },
+    }, () => reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.ok(swapped, 'the swap ran');
+    assert.ok(!results.some((r) => r.status === 'reaped'), JSON.stringify(results));
+    assert.ok(fs.existsSync(path.join(outside, 'agent-t1', 'keep')), 'the outside directory is back under its own name');
+    assert.ok(fs.existsSync(path.join(moved, path.basename(residue))), 'the residue survives');
+  });
+
+  test('a repository pointer named .GIT (any case) keeps the residue', () => {
+    const { repoDir, residue } = repoWithResidue('gitcase');
+    const inner = path.join(residue, 'project');
+    fs.mkdirSync(inner, { recursive: true });
+    fs.writeFileSync(path.join(inner, '.GIT'), 'gitdir: /elsewhere/.git\n');
+    fs.writeFileSync(path.join(inner, 'work.txt'), 'uncommitted\n');
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_contains_repository']);
+    assert.ok(fs.existsSync(path.join(inner, 'work.txt')));
+  });
+
+  test('a registered worktree under a checkout whose path holds a newline is never residue', (t) => {
+    if (process.platform === 'win32') {
+      t.skip('a newline is not a valid Windows path character');
+      return;
+    }
+    const repoDir = path.join(tmpBase, 'repo\nline');
+    initRepo(repoDir);
+    const live = makeResidue(repoDir, 'agent-live'); // .git file gone, NOT pruned: still registered
+    fs.writeFileSync(path.join(live, 'work.txt'), 'uncommitted\n');
+    const faultyGit = makeFaultyGit({ faults: [{ kind: 'exit', exitCode: 1, when: ['worktree', 'prune'] }], passthrough: realExecGit });
+    const results = reapOrphanWorktrees(repoDir, deadOwnerDeps({ execGit: faultyGit }));
+    assert.ok(!results.some((r) => r.status === 'reaped'), JSON.stringify(results));
+    assert.ok(fs.existsSync(path.join(live, 'work.txt')));
+  });
+
+  test('a tracked directory renamed to another Unicode normalization form is still tracked', () => {
+    const repoDir = path.join(tmpBase, 'repo-nfd');
+    initRepo(repoDir);
+    git(['config', 'core.precomposeunicode', 'false'], repoDir);
+    const nfc = 'agent-café';
+    const nfd = 'agent-café';
+    plainChild(repoDir, nfc);
+    git(['add', '-A'], repoDir);
+    git(['commit', '-m', 'track'], repoDir);
+    const wt = path.join(repoDir, '.claude', 'worktrees');
+    fs.renameSync(path.join(wt, nfc), path.join(wt, 'agent-tmp'));
+    fs.renameSync(path.join(wt, 'agent-tmp'), path.join(wt, nfd));
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ execGit: branchExists(() => true) })));
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_tracked']);
+    assert.ok(fs.readdirSync(wt).length === 1 && fs.existsSync(path.join(wt, fs.readdirSync(wt)[0], 'file.txt')));
+  });
+
   for (const [label, plant] of [
     ['a bare repository', (dir) => git(['init', '-q', '--bare', dir], tmpBase)],
     ['a repository nested inside it', (dir) => {
