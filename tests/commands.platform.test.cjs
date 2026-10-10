@@ -37,6 +37,8 @@
  * - "a --cwd that is a symlink from main into the worktree still commits in the worktree" — creates a real directory symlink/junction from the main checkout into a linked worktree (symlink-keyword)
  * - "the root comes back in the cwd's own spelling when it names the same directory" — creates a real directory symlink/junction to a linked worktree (symlink-keyword)
  * - "a symlinked alias into a linked worktree is still a project to the isolation guards" — creates a real directory symlink/junction into a linked worktree (symlink-keyword)
+ * - "an alias to a config-less .planning/ inside a project is blocked like the real path" — creates a real directory symlink/junction inside a project (symlink-keyword)
+ * - "an alias into a non-git project is evaluated like the real path" — creates a real directory symlink/junction into a project (symlink-keyword)
  * - "a worktree whose path ends in a space still owns its subdirectory" — a trailing space is not a valid Windows path component (process-platform)
  */
 
@@ -1004,6 +1006,45 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     fs.mkdirSync(sub);
     assert.equal(ownWorktreePlanningRoot(sub).root, path.resolve(wt));
     assert.equal(resolveMainWorktreeCwd(sub), path.resolve(wt));
+  });
+
+  // Codex review round 3: an alias must reach the same verdict as the path it
+  // names. git reports a relative common dir against the physical cwd, so the
+  // alias case resolved it under the alias and read as "another repository".
+  test('an alias to a config-less .planning/ inside a project is blocked like the real path', () => {
+    const { evaluateDispatch } = require('../hooks/gsd-agent-isolation-guard.js');
+    // A MAIN checkout: there git reports the common dir relative (`../.git`).
+    const { main } = mainWithWorktree();
+    fs.writeFileSync(path.join(main, '.planning', 'config.json'), JSON.stringify({ runtime: 'claude' }));
+    const shadow = path.join(main, 'shadow');
+    fs.mkdirSync(path.join(shadow, '.planning'), { recursive: true });
+    fs.mkdirSync(path.join(main, 'aliases'));
+    const link = path.join(main, 'aliases', 'link');
+    fs.symlinkSync(shadow, link, 'junction');
+    const payload = (cwd) => ({ tool_name: 'Agent', cwd, tool_input: { subagent_type: 'gsd-executor' } });
+    const direct = evaluateDispatch(payload(shadow));
+    const viaLink = evaluateDispatch(payload(link));
+    assert.equal(direct.action, 'block', JSON.stringify(direct));
+    assert.deepEqual([viaLink.action, viaLink.reasonCode], [direct.action, direct.reasonCode]);
+  });
+
+  test('an alias into a non-git project is evaluated like the real path', () => {
+    const { evaluateDispatch } = require('../hooks/gsd-agent-isolation-guard.js');
+    const project = createTempDir('gsd-4885-nongit-');
+    dirs.push(project);
+    fs.mkdirSync(path.join(project, '.planning'), { recursive: true });
+    fs.writeFileSync(path.join(project, '.planning', 'config.json'), '{ not json');
+    const deep = path.join(project, 'src', 'deep');
+    fs.mkdirSync(deep, { recursive: true });
+    const aliasParent = createTempDir('gsd-4885-nongit-alias-');
+    dirs.push(aliasParent);
+    const alias = path.join(aliasParent, 'alias');
+    fs.symlinkSync(deep, alias, 'junction');
+    const payload = (cwd) => ({ tool_name: 'Agent', cwd, tool_input: { subagent_type: 'gsd-executor' } });
+    const direct = evaluateDispatch(payload(deep));
+    const viaAlias = evaluateDispatch(payload(alias));
+    assert.equal(direct.action, 'block', JSON.stringify(direct));
+    assert.deepEqual([viaAlias.action, viaAlias.reasonCode], [direct.action, direct.reasonCode]);
   });
 
   // Codex review: an alias whose lexical ancestors hold no project was

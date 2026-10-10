@@ -56,6 +56,8 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
+const { classifyGitProbe, BLOCKING_GUARD_PROBE_TIMEOUT_MS } = require('./git-probe.js');
 const { parseDispatchIdentity } = require('./dispatch-identity.js');
 
 // Isolation modes ADR-1239 declares (mirrors gsd-tools.cjs
@@ -217,7 +219,11 @@ function nearestProjectConfigDir(cwd) {
  *   - anything else is the resolver's own deliberate "not a project" (`$HOME`).
  */
 function resolveGuardProject(cwd) {
+  // `from` is the spelling the project was found under: the lexical cwd, or —
+  // when only the canonical path leads to a project (a symlinked alias) — the
+  // canonical one, so resolution walks the same path the probe did.
   let base = path.resolve(cwd);
+  let from = cwd;
   let anchor = nearestProjectConfigDir(base);
   if (anchor === null) {
     try {
@@ -227,29 +233,33 @@ function resolveGuardProject(cwd) {
     }
     anchor = nearestProjectConfigDir(base);
     if (anchor === null) return { project: false };
+    from = base;
   }
-  if (anchor === base) return { project: true, root: cwd, sentinelRoot: cwd };
+  if (anchor === base) return { project: true, root: from, sentinelRoot: from };
   const unresolved = (message) => ({ project: true, root: null, error: new Error(message) });
+  // #2843: an independent repository nested in the project is not the
+  // project's. Decided by git directly — before any runtime build, so an
+  // unbuildable runtime never turns that boundary into a denial. The project's
+  // own `.planning` is never such a boundary, even when it is a symlink to an
+  // external store with a repository of its own (#4815, as findProjectRoot).
+  const inPlanning = path.relative(path.join(anchor, '.planning'), base);
+  if (inPlanning.startsWith('..') || path.isAbsolute(inPlanning)) {
+    const ownRepo = gitCommonDirOf(base);
+    const projectRepo = gitCommonDirOf(anchor);
+    if (ownRepo.undetermined || projectRepo.undetermined) {
+      return unresolved(`git could not say which repository '${cwd}' belongs to (${ownRepo.undetermined || projectRepo.undetermined}).`);
+    }
+    if (ownRepo.dir !== projectRepo.dir) return { project: false };
+  }
   let resolved;
   try {
-    resolved = resolveProjectRootOrThrow(cwd);
+    resolved = resolveProjectRootOrThrow(from);
   } catch (error) {
     return { project: true, root: null, error };
   }
   if (resolved.reason === 'git_timed_out') return unresolved(`git timed out resolving which checkout '${cwd}' belongs to.`);
   const root = resolved.root;
   if (fs.existsSync(path.join(root, '.planning', 'config.json'))) return { project: true, root, sentinelRoot: root };
-  let ownRepo;
-  let projectRepo;
-  try {
-    const { gitCommonDir } = require('../../gsd-core/bin/lib/worktree-safety.cjs');
-    ownRepo = gitCommonDir(base);
-    projectRepo = gitCommonDir(anchor);
-  } catch (error) {
-    return { project: true, root: null, error };
-  }
-  if (ownRepo.timedOut || projectRepo.timedOut) return unresolved(`git timed out resolving which repository '${cwd}' belongs to.`);
-  if (ownRepo.dir !== projectRepo.dir) return { project: false };
   if (isDirectory(path.join(root, '.planning'))) {
     return unresolved(`'${root}' holds a .planning/ with no config.json, inside the GSD project at '${anchor}'.`);
   }
@@ -258,6 +268,27 @@ function resolveGuardProject(cwd) {
     return unresolved(`'${cwd}' is ${levels} directories below the GSD project at '${anchor}', past the ${resolved.maxDepth ?? 10} that project-root resolution walks.`);
   }
   return { project: false };
+}
+
+/**
+ * The canonical git common directory `dir` belongs to — the repository itself,
+ * shared by a checkout and every worktree linked to it — or `null` outside any
+ * repository; `undetermined` (a reason) when git did not answer. git reports a
+ * relative common dir against the PHYSICAL cwd, so it is resolved against
+ * `dir`'s realpath, never its lexical spelling (an alias would misplace it).
+ */
+function gitCommonDirOf(dir) {
+  const result = spawnSync('git', ['rev-parse', '--git-common-dir'], {
+    cwd: dir, encoding: 'utf8', timeout: BLOCKING_GUARD_PROBE_TIMEOUT_MS, windowsHide: true,
+  });
+  const probe = classifyGitProbe(result);
+  if (!probe.determined) return { dir: null, undetermined: probe.reason };
+  if (result.status !== 0) return { dir: null, undetermined: null };
+  try {
+    return { dir: fs.realpathSync.native(path.resolve(fs.realpathSync.native(dir), String(result.stdout).trim())), undetermined: null };
+  } catch {
+    return { dir: null, undetermined: null };
+  }
 }
 
 /** Whether `p` is a directory (through a symlink, as findProjectRoot's check is). */

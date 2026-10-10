@@ -160,8 +160,6 @@ describe('hooks/lib/isolation-sentinel.js: resolveSentinelRoot self-heal reachab
 // row OBSERVES which steps ran.
 describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', () => {
   function withFakes(t, { ensureRuntimeBuild, resolvePlanningWorktreeRoot, findProjectRoot, maxDepth = 10 }) {
-    // The real repository probe, captured before the module is substituted.
-    const { gitCommonDir } = require(WORKTREE_SAFETY_PATH);
     const saved = [SEAM_PATH, WORKTREE_SAFETY_PATH, PROJECT_ROOT_PATH, SENTINEL_RESOLVED].map((k) => [k, require.cache[k]]);
     t.after(() => {
       for (const [key, value] of saved) { if (value) require.cache[key] = value; else delete require.cache[key]; }
@@ -174,7 +172,6 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
     });
     require.cache[WORKTREE_SAFETY_PATH] = fakeModule(WORKTREE_SAFETY_PATH, {
       resolvePlanningWorktreeRoot: (cwd) => { calls.worktree += 1; return resolvePlanningWorktreeRoot(cwd); },
-      gitCommonDir,
     });
     require.cache[PROJECT_ROOT_PATH] = fakeModule(PROJECT_ROOT_PATH, {
       findProjectRoot: (dir) => { calls.projectRoot += 1; return findProjectRoot(dir); },

@@ -2107,6 +2107,25 @@ describe('gsd-agent-isolation-guard.js: #4885 review (2026-10-10) — subdirecto
     assert.equal(block(runHook(agentPayload({ cwd: sub }), sub)).reason_code, REASON_CODE.CONFIG_UNREADABLE);
   });
 
+  // Codex review round 3: the #2843 boundary is decided before any runtime
+  // build, so an unbuildable runtime never turns it into a denial.
+  test('cold runtime library, dispatch from an independent repository nested in a project -> ALLOW', (t) => {
+    const cold = buildColdInstallTree();
+    t.after(cold.cleanup);
+    const project = mkProject('gsd-aig-4885r-coldnest-');
+    t.after(() => cleanup(project));
+    writeConfig(project, JSON.stringify({ runtime: 'claude' }));
+    const child = path.join(project, 'vendor', 'child');
+    fs.mkdirSync(child, { recursive: true });
+    git(['init', '-q'], child);
+    const env = { ...process.env };
+    delete env.GSD_RUNTIME;
+    const r = toLegacyResult(runHookSeam(path.join(cold.hooksDir, 'gsd-agent-isolation-guard.js'), [], {
+      input: JSON.stringify(agentPayload({ cwd: child })), cwd: child, env, timeoutMs: PROBE_TIMEOUT_MS,
+    }));
+    assert.equal(r.status, 0, `stdout: ${r.stdout} stderr: ${r.stderr}`);
+  });
+
   // Codex review / #2843: an independent repository nested in a project, with
   // no .planning of its own, is not that project's — base allowed it, and so
   // does the guard (findProjectRoot's boundary stands).

@@ -1210,5 +1210,8 @@ describe('#4885: the guards read the sentinel where gsd-tools wrote it, through 
     const { evaluateDispatch } = require('../hooks/gsd-agent-isolation-guard.js');
     const r = evaluateDispatch({ tool_name: 'Agent', cwd: phaseDir, tool_input: { subagent_type: 'gsd-executor' } });
     assert.equal(r.action, 'block', JSON.stringify(r));
+    // Codex review round 3: the Cursor guard reads the same recorded decision.
+    const cursorVerdict = require('../hooks/gsd-cursor-subagent-start.js').evaluateRootIsolation(phaseDir, 'gsd-executor');
+    assert.equal(cursorVerdict.action, 'deny', JSON.stringify(cursorVerdict));
   });
 });

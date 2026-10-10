@@ -332,24 +332,6 @@ function spelledAs(lexical: string, real: string): string {
 }
 
 /**
- * #4885: the canonical git common directory `cwd` belongs to — the repository
- * itself, the same for a checkout and every worktree linked to it — or `null`
- * outside any repository; `timedOut` when git did not answer. Two directories
- * with different common dirs are in independent repositories.
- */
-function gitCommonDir(cwd: string, deps: WorktreeDeps = {}): { dir: string | null; timedOut: boolean } {
-  const execGit = deps.execGit || execGitDefault;
-  const r = execGit(['rev-parse', '--git-common-dir'], { cwd });
-  if (r.timedOut) return { dir: null, timedOut: true };
-  if (r.exitCode !== 0) return { dir: null, timedOut: false };
-  try {
-    return { dir: fs.realpathSync.native(path.resolve(cwd, String(r.stdout).trim())), timedOut: false };
-  } catch {
-    return { dir: null, timedOut: false };
-  }
-}
-
-/**
  * #4885: the ONE answer to "which worktree root owns `.planning/` for `cwd`" —
  * `resolveWorktreeRoot`, except that a linked worktree carrying its own
  * `.planning/` resolves to that (`ownWorktreePlanningRoot`), not to the main
@@ -3274,6 +3256,5 @@ export = {
   resolveWorktreeRoot,
   ownWorktreePlanningRoot,
   resolvePlanningWorktreeRoot,
-  gitCommonDir,
   pruneOrphanedWorktrees,
 };
