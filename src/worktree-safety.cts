@@ -178,10 +178,13 @@ function readWorktreeList(repoRoot: string, deps: WorktreeDeps = {}): WorktreeLi
   };
 }
 
+/** Why a worktree root resolved where it did — the closed set the root resolvers return. */
+type WorktreeRootReason = 'has_local_planning' | 'linked_worktree' | 'main_worktree' | 'not_git_repo' | 'git_timed_out';
+
 interface WorktreeContextResult {
   effectiveRoot: string;
   mode: string;
-  reason: string;
+  reason: WorktreeRootReason;
 }
 
 /**
@@ -246,7 +249,9 @@ function resolveWorktreeLinkage(cwd: string, deps: WorktreeDeps = {}): WorktreeC
 /**
  * #4885: the directory that owns `.planning/` inside `cwd`'s OWN linked
  * worktree — the nearest one between `cwd` and that worktree's top level
- * (inclusive) — or null when the worktree has none of its own.
+ * (inclusive) — or null when the worktree has none of its own. `.planning`
+ * must be a directory, as `findProjectRoot` requires (#4885 review): a
+ * regular file of that name is walked past.
  *
  * `resolveWorktreeLinkage` answers "which main checkout does this linked
  * worktree belong to" — right for the isolation guard (#3045), wrong as a
@@ -257,10 +262,14 @@ function resolveWorktreeLinkage(cwd: string, deps: WorktreeDeps = {}): WorktreeC
  * untracked, so it lives only in the main checkout) still answers null here,
  * so that remap is unchanged.
  *
- * The returned directory is canonical (realpath) and IS the project root:
- * handing back `cwd` for a later lexical, depth-bounded ancestor walk to
- * rediscover would let a symlinked `--cwd` walk into the main checkout, and
- * a cwd deeper than that walk's bound miss the worktree's `.planning/`.
+ * The returned directory IS the project root: handing back `cwd` for a later
+ * lexical, depth-bounded ancestor walk to rediscover would let a symlinked
+ * `--cwd` walk into the main checkout, and a cwd deeper than that walk's
+ * bound miss the worktree's `.planning/`. The walk runs on the canonical
+ * path (realpath); the directory is returned in `cwd`'s own spelling when
+ * that names the same directory (a symlinked `/tmp` prefix), so a
+ * subdirectory resolves to the spelling its project root itself resolves to,
+ * and canonical only when a symlinked component makes the two differ.
  *
  * The walk stops at the worktree's own top level, so a worktree nested inside
  * the main checkout (e.g. `.claude/worktrees/agent-*`) never sees the main
@@ -270,7 +279,6 @@ function resolveWorktreeLinkage(cwd: string, deps: WorktreeDeps = {}): WorktreeC
  */
 function ownWorktreePlanningRoot(cwd: string, deps: WorktreeDeps = {}): { root: string | null; timedOut: boolean } {
   const execGit = deps.execGit || execGitDefault;
-  const existsSync = deps.existsSync || fs.existsSync;
   const none = { root: null, timedOut: false };
 
   const top = execGit(['rev-parse', '--show-toplevel'], { cwd });
@@ -291,13 +299,34 @@ function ownWorktreePlanningRoot(cwd: string, deps: WorktreeDeps = {}): { root: 
   }
   if (!isContainedIn(start, ownTop)) return none;
 
+  // `lexical` walks up in step with `d`, in the caller's spelling.
   let d = start;
+  let lexical = path.resolve(cwd);
   for (;;) {
-    if (existsSync(path.join(d, '.planning'))) return { root: d, timedOut: false };
+    if (isDirectory(path.join(d, '.planning'))) return { root: spelledAs(lexical, d), timedOut: false };
     if (d === ownTop) return none;
     const next = path.dirname(d);
     if (next === d) return none;
     d = next;
+    lexical = path.dirname(lexical);
+  }
+}
+
+/** Whether `p` is a directory (through a symlink, as `findProjectRoot`'s check is). */
+function isDirectory(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** `lexical` when it is another spelling of the canonical `real`, else `real`. */
+function spelledAs(lexical: string, real: string): string {
+  try {
+    return fs.realpathSync.native(lexical) === real ? lexical : real;
+  } catch {
+    return real;
   }
 }
 
@@ -314,10 +343,10 @@ function ownWorktreePlanningRoot(cwd: string, deps: WorktreeDeps = {}): { root: 
 function resolvePlanningWorktreeRoot(
   cwd: string,
   deps: {
-    resolveWorktreeRoot?: (cwd: string) => { root: string; reason: string };
+    resolveWorktreeRoot?: (cwd: string) => { root: string; reason: WorktreeRootReason };
     ownWorktreePlanningRoot?: (cwd: string) => { root: string | null; timedOut: boolean };
   } = {}
-): { root: string; reason: string } {
+): { root: string; reason: WorktreeRootReason } {
   const resolveRoot = deps.resolveWorktreeRoot || resolveWorktreeRoot;
   const ownRoot = deps.ownWorktreePlanningRoot || ownWorktreePlanningRoot;
   const resolved = resolveRoot(cwd);
@@ -3149,7 +3178,7 @@ void parseWorktreeListPaths;
  * reason must still reach the caller so it can surface the risk instead of
  * silently trusting the wrong root.
  */
-function resolveWorktreeRoot(cwd: string, deps: WorktreeDeps = {}): { root: string; reason: string } {
+function resolveWorktreeRoot(cwd: string, deps: WorktreeDeps = {}): { root: string; reason: WorktreeRootReason } {
   const context = resolveWorktreeContext(cwd, {
     existsSync: deps.existsSync || fs.existsSync,
     execGit: deps.execGit,

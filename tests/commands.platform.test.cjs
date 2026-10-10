@@ -35,6 +35,7 @@
  * - "a cherry-pick in progress keeps its pre-existing outcome" — runs a real executable pre-commit hook installed with a POSIX mode bit (chmod-mode-bit)
  * - "a revert in progress still reports nothing_to_commit, not the hook rejection" — runs a real executable pre-commit hook installed with a POSIX mode bit (chmod-mode-bit)
  * - "a --cwd that is a symlink from main into the worktree still commits in the worktree" — creates a real directory symlink/junction from the main checkout into a linked worktree (symlink-keyword)
+ * - "the root comes back in the cwd's own spelling when it names the same directory" — creates a real directory symlink/junction to a linked worktree (symlink-keyword)
  */
 
 const { test, describe, after, beforeEach, afterEach } = require('node:test');
@@ -957,5 +958,24 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     assert.ok(res.success, `commit failed: ${res.error}`);
     assert.equal(head(main), mainBefore, 'main checkout HEAD must not move');
     assert.notEqual(head(wt), wtBefore, 'the worktree the link points into must receive the commit');
+  });
+
+  // trek-e review 2026-10-10, Minor 3: one spelling per root. A cwd reached
+  // through a link to the worktree resolves to the root in the cwd's own
+  // spelling — what the root resolves to from itself — and the --cwd-link
+  // row above (a link whose lexical parents are NOT the worktree's) still
+  // gets the canonical one.
+  test('the root comes back in the cwd\'s own spelling when it names the same directory', () => {
+    const { ownWorktreePlanningRoot } = require('../gsd-core/bin/lib/worktree-safety.cjs');
+    const { resolveMainWorktreeCwd } = require('../gsd-core/bin/gsd-tools.cjs');
+    const { wt, sub } = mainWithWorktree();
+    const linkParent = createTempDir('gsd-4885-spell-');
+    dirs.push(linkParent);
+    const link = path.join(linkParent, 'wt-link');
+    fs.symlinkSync(wt, link, 'junction');
+    const viaLink = path.join(link, path.relative(wt, sub));
+    assert.equal(ownWorktreePlanningRoot(viaLink).root, link);
+    assert.equal(resolveMainWorktreeCwd(viaLink), link);
+    assert.equal(ownWorktreePlanningRoot(sub).root, path.resolve(wt), 'an unlinked cwd keeps its spelling too');
   });
 });

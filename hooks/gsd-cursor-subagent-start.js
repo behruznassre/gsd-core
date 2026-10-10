@@ -70,7 +70,7 @@ const { allow } = require('./lib/hook-exit.js');
 // hooks/lib/cursor-workspace.js. Staged next to these scripts by
 // writeCursorHooksJson so the require always resolves post-install.
 const { resolveStatePath } = require('./lib/cursor-workspace.js');
-const { readSentinel, resolveSentinelRoot, VALID_ISOLATION, extractDispatchIdentifiers, sentinelAppliesToDispatch, buildSentinelDiscard } = require('./lib/isolation-sentinel.js');
+const { readSentinel, resolveGuardProject, VALID_ISOLATION, extractDispatchIdentifiers, sentinelAppliesToDispatch, buildSentinelDiscard } = require('./lib/isolation-sentinel.js');
 const { REASON_CODE, describeSentinelDiscard } = require('./lib/isolation-deny-reason.js');
 // #3582: gsd-core/bin/lib/*.cjs (runtime-homes.cjs, worktree-safety.cjs,
 // runtime-name-policy.cjs, capability-registry.cjs — required below, inside
@@ -474,8 +474,28 @@ function evaluateRootIsolation(root, subagentType, { clock = Date, dispatchIds =
   // the same root gsd-tools writes to, so a workspace root that is a project
   // SUBDIRECTORY is still evaluated. Isolation evidence below stays on the raw
   // workspace `root` — it asks where the workspace physically is, not where
-  // its project's `.planning/` lives.
-  const projectRoot = resolveSentinelRoot(root);
+  // its project's `.planning/` lives. A workspace root inside a project whose
+  // governing root could not be resolved fails closed (#3050).
+  const project = resolveGuardProject(root);
+  if (!project.project) return { action: 'allow' };
+  if (project.error) {
+    const isBuildFailure = project.error instanceof RuntimeBuildError;
+    return {
+      action: 'deny',
+      reason: isBuildFailure
+        ? `GSD subagent isolation guard: cannot resolve this project's dispatch-isolation ` +
+          `configuration because the GSD runtime library failed to self-build. ${project.error.message} ` +
+          `Refusing to allow this subagent to spawn until the runtime library is built — a guard ` +
+          `that cannot verify must not answer "safe" (#3050).`
+        : `GSD subagent isolation guard: workspace root "${root}" is inside a GSD project, but which ` +
+          `project root governs it could not be resolved (${project.error.message}). Refusing to allow ` +
+          `this subagent to spawn without being able to verify whether isolation is required — a ` +
+          `guard that cannot verify must not answer "safe" (#3050).`,
+      reasonCode: isBuildFailure ? REASON_CODE.RUNTIME_BUILD_FAILED : REASON_CODE.CONFIG_UNREADABLE,
+      sentinelDiscarded: null,
+    };
+  }
+  const projectRoot = project.root;
   const configPath = path.join(projectRoot, '.planning', 'config.json');
   let isGsdProject;
   try {

@@ -584,6 +584,8 @@ gsd-tools query inspect-dispatch-isolation --json
 
 (`inspect-dispatch-isolation` is the read-only form. The `dispatch-isolation` query is the executor-dispatch resolver: it records its decision to the isolation sentinel as a deliberate side effect, so it is not an inspection command.)
 
+**Which project the isolation guards evaluate.** The Claude and Cursor dispatch guards resolve the dispatch's working directory to its project the way `gsd-tools` does, so a dispatch from a project **subdirectory** — at any depth, or inside a linked worktree — is checked against that project's configuration and isolation sentinel, and can be blocked; before #4885 such a dispatch was let through unchecked. A linked worktree with its own `.planning/` is its own project; one without uses its main checkout's. A directory with no `.planning/config.json` in it or above it is not a GSD project and is not checked (no build, no git). When a directory is inside a project but the guard cannot resolve which root governs it — the runtime library will not build, or git times out — the dispatch is blocked rather than allowed.
+
 ## Code Quality Settings
 
 The `code_quality.*` namespace gates optional structural-analysis tooling that augments `/gsd-code-review`. Settings are additive: each tool is independently opt-in and off by default.

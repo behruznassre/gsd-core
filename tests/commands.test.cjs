@@ -6416,6 +6416,66 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     assert.equal(sentinel.isolation, 'none');
   });
 
+  // trek-e review 2026-10-10, Minor 2: `.planning` must be a directory, as
+  // findProjectRoot requires — a regular file of that name is walked past.
+  // (A directory with no config.json still owns planning for the writer, as
+  // the monorepo row above pins; the guards treat it separately.)
+  test('a regular file named .planning inside the worktree is walked past: the worktree\'s own project is the root', () => {
+    const { wt } = mainWithWorktree({ trackPlanning: true });
+    const planted = path.join(wt, 'pkg');
+    fs.mkdirSync(planted);
+    fs.writeFileSync(path.join(planted, '.planning'), 'x\n');
+    const below = path.join(planted, 'src');
+    fs.mkdirSync(below);
+    assert.equal(fs.realpathSync(ownWorktreePlanningRoot(below).root), fs.realpathSync(wt));
+  });
+
+  test('a regular file as the worktree\'s only .planning answers null, keeping the main-checkout remap', () => {
+    const { main, wt, sub } = mainWithWorktree({ trackPlanning: false });
+    fs.writeFileSync(path.join(wt, '.planning'), 'x\n');
+    assert.equal(ownWorktreePlanningRoot(sub).root, null);
+    assert.equal(fs.realpathSync(resolveMainWorktreeCwd(sub)), fs.realpathSync(main));
+  });
+
+  // The two early answers of ownWorktreePlanningRoot that need no git failure.
+  test('a cwd that cannot be canonicalized, or lies outside the toplevel git reports, answers null', () => {
+    const top = { exitCode: 0, stdout: '/repo/wt\n', stderr: '', timedOut: false };
+    assert.deepEqual(ownWorktreePlanningRoot('/no/such/dir-4885', { execGit: () => top, existsSync: () => true }),
+      { root: null, timedOut: false }, 'realpath failure');
+    const { wt, sub } = mainWithWorktree({ trackPlanning: true });
+    const elsewhere = { exitCode: 0, stdout: `${path.dirname(fs.realpathSync(wt))}${path.sep}other\n`, stderr: '', timedOut: false };
+    fs.mkdirSync(path.join(path.dirname(wt), 'other'));
+    assert.deepEqual(ownWorktreePlanningRoot(sub, { execGit: () => elsewhere }), { root: null, timedOut: false }, 'not contained');
+  });
+
+  // Nit 3: resolvePlanningWorktreeRoot's whole mapping, as a property: only a
+  // linked worktree consults the own-worktree probe; its root wins when found,
+  // a probe timeout reports git_timed_out at the main root, and every other
+  // input passes resolveWorktreeRoot's answer through unchanged.
+  test('property: resolvePlanningWorktreeRoot maps (reason, own root, timeout) as specified', () => {
+    const fc = require('fast-check');
+    const { resolvePlanningWorktreeRoot } = require('../gsd-core/bin/lib/worktree-safety.cjs');
+    const REASONS = ['has_local_planning', 'linked_worktree', 'main_worktree', 'not_git_repo', 'git_timed_out'];
+    fc.assert(fc.property(fc.constantFrom(...REASONS), fc.option(fc.constant('/repo/wt/pkg')), fc.boolean(),
+      (reason, ownRoot, timedOut) => {
+        let probed = 0;
+        const out = resolvePlanningWorktreeRoot('/repo/wt/pkg/src', {
+          resolveWorktreeRoot: () => ({ root: '/repo', reason }),
+          ownWorktreePlanningRoot: () => { probed += 1; return { root: ownRoot, timedOut: ownRoot ? false : timedOut }; },
+        });
+        if (reason !== 'linked_worktree') {
+          assert.equal(probed, 0);
+          assert.deepEqual(out, { root: '/repo', reason });
+        } else if (ownRoot) {
+          assert.deepEqual(out, { root: ownRoot, reason: 'linked_worktree' });
+        } else if (timedOut) {
+          assert.deepEqual(out, { root: '/repo', reason: 'git_timed_out' });
+        } else {
+          assert.deepEqual(out, { root: '/repo', reason: 'linked_worktree' });
+        }
+      }));
+  });
+
   test('a git failure answers root null, keeping the existing main-checkout remap', () => {
     const failed = { exitCode: 128, stdout: '', stderr: 'fatal', timedOut: false };
     const timedOut = { exitCode: null, stdout: '', stderr: '', timedOut: true };

@@ -150,3 +150,120 @@ describe('hooks/lib/isolation-sentinel.js: resolveSentinelRoot self-heal reachab
     assert.equal(resolveSentinelRoot(cwd), 'MAIN-WORKTREE-ROOT/PROJECT');
   });
 });
+
+// ─── #4885 review (trek-e 2026-10-10): the guard's project verdict ───────────
+// `resolveSentinelRoot` degrades any failure to the raw cwd — safe for reading
+// a sentinel, unsafe as the guards' "is this a GSD project" answer (Major 1).
+// `resolveGuardProject` reports the failure instead, and only builds or runs
+// git when a project exists above the cwd at all (Major 2). The seam, the lib
+// and project-root are substituted through require.cache as above, so each
+// row OBSERVES which steps ran.
+describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', () => {
+  function withFakes(t, { ensureRuntimeBuild, resolvePlanningWorktreeRoot, findProjectRoot, maxDepth = 10 }) {
+    const saved = [SEAM_PATH, WORKTREE_SAFETY_PATH, PROJECT_ROOT_PATH, SENTINEL_RESOLVED].map((k) => [k, require.cache[k]]);
+    t.after(() => {
+      for (const [key, value] of saved) { if (value) require.cache[key] = value; else delete require.cache[key]; }
+    });
+    const calls = { build: 0, worktree: 0, projectRoot: 0 };
+    class FakeRuntimeBuildError extends Error {}
+    require.cache[SEAM_PATH] = fakeModule(SEAM_PATH, {
+      RuntimeBuildError: FakeRuntimeBuildError,
+      ensureRuntimeBuild: () => { calls.build += 1; if (ensureRuntimeBuild) ensureRuntimeBuild(FakeRuntimeBuildError); },
+    });
+    require.cache[WORKTREE_SAFETY_PATH] = fakeModule(WORKTREE_SAFETY_PATH, {
+      resolvePlanningWorktreeRoot: (cwd) => { calls.worktree += 1; return resolvePlanningWorktreeRoot(cwd); },
+    });
+    require.cache[PROJECT_ROOT_PATH] = fakeModule(PROJECT_ROOT_PATH, {
+      findProjectRoot: (dir) => { calls.projectRoot += 1; return findProjectRoot(dir); },
+      FIND_PROJECT_ROOT_MAX_DEPTH: maxDepth,
+    });
+    delete require.cache[SENTINEL_RESOLVED];
+    return { calls, FakeRuntimeBuildError, resolveGuardProject: require(SENTINEL_MODULE_PATH).resolveGuardProject };
+  }
+
+  function projectTree(t, depth) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-guard-project-'));
+    t.after(() => cleanup(root));
+    fs.mkdirSync(path.join(root, '.planning'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.planning', 'config.json'), '{}');
+    const sub = path.join(root, ...'abcdefghijklmnop'.slice(0, depth).split(''));
+    fs.mkdirSync(sub, { recursive: true });
+    return { root, sub };
+  }
+
+  const identity = (cwd) => ({ root: cwd, reason: 'not_git_repo' });
+
+  test('Major 2: no .planning/config.json at or above cwd -> not a project, and nothing is built or run', (t) => {
+    const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-guard-nogsd-'));
+    t.after(() => cleanup(cwd));
+    assert.deepEqual(resolveGuardProject(cwd), { project: false });
+    assert.deepEqual(calls, { build: 0, worktree: 0, projectRoot: 0 });
+  });
+
+  test('cwd holding .planning/config.json is its own root, with nothing built or run', (t) => {
+    const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+    const { root } = projectTree(t, 0);
+    assert.deepEqual(resolveGuardProject(root), { project: true, root });
+    assert.deepEqual(calls, { build: 0, worktree: 0, projectRoot: 0 });
+  });
+
+  test('Major 1: a project subdirectory whose runtime build fails -> unresolved (the error), never "not a project"', (t) => {
+    const { calls, FakeRuntimeBuildError, resolveGuardProject } = withFakes(t, {
+      ensureRuntimeBuild: (E) => { throw new E('fake cold tree'); },
+      resolvePlanningWorktreeRoot: identity,
+      findProjectRoot: (d) => d,
+    });
+    const { sub } = projectTree(t, 2);
+    const verdict = resolveGuardProject(sub);
+    assert.equal(verdict.project, true);
+    assert.equal(verdict.root, null);
+    assert.ok(verdict.error instanceof FakeRuntimeBuildError, String(verdict.error));
+    assert.equal(calls.worktree, 0, 'nothing past the failed build runs');
+  });
+
+  test('Major 1: a failed require or a throwing resolver is unresolved too', (t) => {
+    const { resolveGuardProject } = withFakes(t, {
+      resolvePlanningWorktreeRoot: () => { throw new Error('git unavailable'); },
+      findProjectRoot: (d) => d,
+    });
+    const { sub } = projectTree(t, 1);
+    const verdict = resolveGuardProject(sub);
+    assert.deepEqual([verdict.project, verdict.root, verdict.error && verdict.error.message], [true, null, 'git unavailable']);
+  });
+
+  test('Minor 1: a git timeout resolving the checkout is unresolved, not a silent read of main', (t) => {
+    const { resolveGuardProject } = withFakes(t, {
+      resolvePlanningWorktreeRoot: () => ({ root: '/some/main', reason: 'git_timed_out' }),
+      findProjectRoot: (d) => d,
+    });
+    const { sub } = projectTree(t, 1);
+    const verdict = resolveGuardProject(sub);
+    assert.equal(verdict.root, null);
+    assert.match(verdict.error.message, /git timed out/);
+  });
+
+  test('a resolved root holding the config is the project root', (t) => {
+    const { root, sub } = projectTree(t, 3);
+    const { resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: () => root });
+    assert.deepEqual(resolveGuardProject(sub), { project: true, root });
+  });
+
+  // Majors 3 and 4: when the resolved root holds no config — findProjectRoot
+  // stopped at its ten-ancestor bound or a nested repository, or the resolver
+  // stopped at a `.planning/` with no config (which a branch can commit) — the
+  // nearest project above cwd governs, never an inert "not a project".
+  test('Majors 3/4: a resolved root holding no config falls to the nearest project above cwd', (t) => {
+    const { root, sub } = projectTree(t, 11);
+    const { resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+    assert.deepEqual(resolveGuardProject(sub), { project: true, root });
+  });
+
+  test('Major 4: a resolved root that is a .planning/ with no config does not shadow the project above', (t) => {
+    const { root, sub } = projectTree(t, 3);
+    const shadow = path.join(root, 'a');
+    fs.mkdirSync(path.join(shadow, '.planning'));
+    const { resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: () => shadow });
+    assert.deepEqual(resolveGuardProject(sub), { project: true, root });
+  });
+});

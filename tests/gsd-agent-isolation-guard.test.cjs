@@ -2012,3 +2012,129 @@ describe('gsd-agent-isolation-guard.js: #4885 — payload cwd is a project subdi
     assert.ok(!out.reason.includes(path.join('src', 'deep')), `reason must name the project root, got: ${out.reason}`);
   });
 });
+
+describe('gsd-agent-isolation-guard.js: #4885 review (2026-10-10) — subdirectory dispatches resolve, or fail closed', () => {
+  const { buildColdInstallTree } = require('./helpers/cold-runtime-lib-fixture.cjs');
+  const block = (r) => {
+    assert.equal(r.status, 2, `expected a block; stdout: ${r.stdout} stderr: ${r.stderr}`);
+    return JSON.parse(r.stdout);
+  };
+  const git = (args, cwd) => gitOrThrow(args, { cwd, timeoutMs: GIT_FIXTURE_TIMEOUT_MS });
+
+  // A main checkout whose .planning/ is COMMITTED (so a linked worktree has
+  // its own copy), resolving harness-worktree, plus a linked worktree of it.
+  function repoWithWorktree(t, { trackPlanning = true } = {}) {
+    const main = mkProject('gsd-aig-4885r-main-');
+    t.after(() => cleanup(main));
+    writeConfig(main, JSON.stringify({ runtime: 'claude' }));
+    if (!trackPlanning) {
+      fs.writeFileSync(path.join(main, '.gitignore'), '.planning/\n');
+      git(['rm', '-r', '-q', '--cached', '--ignore-unmatch', '.planning'], main);
+    }
+    git(['add', '-A'], main);
+    git(['commit', '-q', '-m', 'seed'], main);
+    const parent = createTempDir('gsd-aig-4885r-wt-');
+    t.after(() => cleanup(parent));
+    const wt = path.join(parent, 'wt');
+    git(['worktree', 'add', '-q', '-b', `wt-${path.basename(parent)}`, wt], main);
+    return { main, wt };
+  }
+
+  // Major 1 — reproduced on base and head: a cold tree denied a project-ROOT
+  // dispatch (runtime_build_failed) but allowed the same dispatch from a
+  // subdirectory, because the build failure degraded the root to the raw cwd.
+  test('Major 1: cold runtime library, dispatch from a project subdirectory -> DENY runtime_build_failed', (t) => {
+    const cold = buildColdInstallTree();
+    t.after(cold.cleanup);
+    const project = mkProject('gsd-aig-4885r-cold-');
+    t.after(() => cleanup(project));
+    writeConfig(project, JSON.stringify({ runtime: 'claude' }));
+    const sub = path.join(project, 'src', 'deep');
+    fs.mkdirSync(sub, { recursive: true });
+    const env = { ...process.env };
+    delete env.GSD_RUNTIME;
+    const r = toLegacyResult(runHookSeam(path.join(cold.hooksDir, 'gsd-agent-isolation-guard.js'), [], {
+      input: JSON.stringify(agentPayload({ cwd: sub })), cwd: sub, env, timeoutMs: PROBE_TIMEOUT_MS,
+    }));
+    assert.equal(block(r).reason_code, REASON_CODE.RUNTIME_BUILD_FAILED);
+  });
+
+  test('control: cold runtime library, dispatch from a non-GSD directory -> ALLOW (nothing to verify)', (t) => {
+    const cold = buildColdInstallTree();
+    t.after(cold.cleanup);
+    const dir = createTempDir('gsd-aig-4885r-nogsd-');
+    t.after(() => cleanup(dir));
+    const env = { ...process.env };
+    delete env.GSD_RUNTIME;
+    const r = toLegacyResult(runHookSeam(path.join(cold.hooksDir, 'gsd-agent-isolation-guard.js'), [], {
+      input: JSON.stringify(agentPayload({ cwd: dir })), cwd: dir, env, timeoutMs: PROBE_TIMEOUT_MS,
+    }));
+    assert.equal(r.status, 0, `stdout: ${r.stdout} stderr: ${r.stderr}`);
+  });
+
+  // Major 3: the guard answered "not a project" 11+ levels down (findProjectRoot's
+  // bound). limit-1 / limit / limit+1 / limit+2 all reach the same verdict now.
+  for (const depth of [9, 10, 11, 12]) {
+    test(`Major 3: a dispatch ${depth} levels below a harness-worktree project root -> DENY harness_flag_missing`, (t) => {
+      const project = mkProject(`gsd-aig-4885r-d${depth}-`);
+      t.after(() => cleanup(project));
+      writeConfig(project, JSON.stringify({ runtime: 'claude' }));
+      const deep = path.join(project, ...'abcdefghijkl'.slice(0, depth).split(''));
+      fs.mkdirSync(deep, { recursive: true });
+      assert.equal(block(runHook(agentPayload({ cwd: deep }), deep)).reason_code, REASON_CODE.HARNESS_FLAG_MISSING);
+    });
+  }
+
+  // Minor 4: the guard driven from a subdirectory of a real LINKED worktree.
+  test('linked worktree with its own .planning/: a subdirectory dispatch reads THAT worktree\'s sentinel', (t) => {
+    const { main, wt } = repoWithWorktree(t);
+    const sub = path.join(wt, 'src', 'deep');
+    fs.mkdirSync(sub, { recursive: true });
+    assert.equal(block(runHook(agentPayload({ cwd: sub }), sub)).reason_code, REASON_CODE.HARNESS_FLAG_MISSING,
+      'no sentinel anywhere: the harness-worktree config applies');
+    writeSentinel(main, { isolation: 'none' });
+    assert.equal(block(runHook(agentPayload({ cwd: sub }), sub)).reason_code, REASON_CODE.HARNESS_FLAG_MISSING,
+      'a sentinel in MAIN is not this worktree\'s');
+    writeSentinel(wt, { isolation: 'none' });
+    const r = runHook(agentPayload({ cwd: sub }), sub);
+    assert.equal(r.status, 0, `the worktree's own sentinel must be the one read; stdout: ${r.stdout}`);
+  });
+
+  // Major 4 / Minor 2: an entry merely NAMED .planning — a committed regular
+  // file, or a directory with no config.json — must not become the root and
+  // switch the guard off for dispatches below it.
+  for (const [label, plant] of [
+    ['a committed .planning regular file', (d) => fs.writeFileSync(path.join(d, '.planning'), 'not a directory\n')],
+    ['a committed .planning/ with no config.json', (d) => {
+      fs.mkdirSync(path.join(d, '.planning'));
+      fs.writeFileSync(path.join(d, '.planning', 'note.md'), 'x\n');
+    }],
+  ]) {
+    test(`Major 4: ${label} inside the worktree does not shadow the project`, (t) => {
+      const { wt } = repoWithWorktree(t);
+      const planted = path.join(wt, 'sub');
+      fs.mkdirSync(planted);
+      plant(planted);
+      git(['add', '-A'], wt);
+      git(['commit', '-q', '-m', 'plant'], wt);
+      const below = path.join(planted, 'deep');
+      fs.mkdirSync(below);
+      assert.equal(block(runHook(agentPayload({ cwd: below }), below)).reason_code, REASON_CODE.HARNESS_FLAG_MISSING);
+    });
+  }
+
+  // A nested worktree (the harness's own `.claude/worktrees/agent-*` shape)
+  // whose `.planning/` holds STATE.md but no config.json: it is not a project
+  // of its own, so the main checkout's harness-worktree config governs it —
+  // it no longer shadows main as an inert "project" with no config.
+  test('Major 4: a nested worktree whose .planning/ has no config.json is governed by the main checkout', (t) => {
+    const { main } = repoWithWorktree(t, { trackPlanning: false });
+    const nested = path.join(main, '.claude', 'worktrees', 'agent-1');
+    git(['worktree', 'add', '-q', '-b', `nested-${path.basename(main)}`, nested], main);
+    fs.mkdirSync(path.join(nested, '.planning'));
+    fs.writeFileSync(path.join(nested, '.planning', 'STATE.md'), '# State\n');
+    const sub = path.join(nested, 'src');
+    fs.mkdirSync(sub);
+    assert.equal(block(runHook(agentPayload({ cwd: sub }), sub)).reason_code, REASON_CODE.HARNESS_FLAG_MISSING);
+  });
+});
