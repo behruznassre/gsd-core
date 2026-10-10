@@ -1020,8 +1020,10 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     fs.symlinkSync(sub, alias, 'junction');
     const verdict = resolveGuardProject(alias);
     assert.equal(verdict.project, true, JSON.stringify(verdict));
-    assert.equal(fs.realpathSync(verdict.root), fs.realpathSync(wt));
-    assert.equal(fs.realpathSync(verdict.sentinelRoot), fs.realpathSync(resolveMainWorktreeCwd(alias)),
+    // `.native` on both sides: plain realpathSync keeps a Windows 8.3 short
+    // name (RUNNER~1) that the resolver's `.native` expands.
+    assert.equal(fs.realpathSync.native(verdict.root), fs.realpathSync.native(wt));
+    assert.equal(fs.realpathSync.native(verdict.sentinelRoot), fs.realpathSync.native(resolveMainWorktreeCwd(alias)),
       'the sentinel is read where gsd-tools writes it from the same cwd');
   });
 });
