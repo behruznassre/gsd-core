@@ -2900,6 +2900,10 @@ describe('writeOutsideFences / maskFencedLines (#4998): a fenced example is neve
     assert.equal(writeOutsideFences('S: a\n```\nT: ex\n```', (m) => m.replace('\n     \n', '\n    \n')), null);
   });
 
+  test('an edit to a whitespace-only fenced line is refused too (Codex review round 2)', () => {
+    assert.equal(writeOutsideFences('S: a\n```\n     \n```', (m) => m.replace('\n     \n', '\n    \n')), null);
+  });
+
   test('stateReplaceFieldInSession never writes a fenced example (#4998, the session writers agree with the readers)', () => {
     const { stateReplaceFieldInSession } = require('../gsd-core/bin/lib/state-document.cjs');
     const doc = '## Session\n\n```md\nStopped at: example\n```\nStopped at: real\n';

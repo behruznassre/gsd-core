@@ -22402,6 +22402,34 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.strictEqual(json.replacedRecord['Resume File'], 'plan.md', JSON.stringify(json));
   });
 
+  // Codex review round 2.
+  test('(Codex r2) `state patch --"Stopped At"` writes the live session line, not a fenced example', () => {
+    seed([], ['```md', 'Stopped at: example', '```', 'Stopped at: real', 'Resume file: None'], '## Session');
+    const rec = runTool('state', 'patch', '--Stopped At', 'new');
+    assert.strictEqual(rec.exitCode, 0, rec.stderr);
+    assert.ok(session().includes('```md\nStopped at: example\n```'), session());
+    assert.match(session(), /\nStopped at: new\n/);
+    assert.strictEqual(frontmatterStoppedAt(), 'new', readState());
+  });
+
+  test('(Codex r2) no session heading: `**Label**:` values are carried, a skipped wrapped one included', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
+      '**Last session**: started', 'continued here', '**Resume file**: plan.md', ''].join('\n'));
+    const { json } = recordSession('--stopped-at', 'X');
+    assert.deepStrictEqual(json.skipped.map((s) => s.field), ['Last session']);
+    assert.match(session(), /\*\*Last session:\*\* started\n\*\*Stopped at:\*\* X\n\*\*Resume file:\*\* plan\.md\n/);
+  });
+
+  test('(Codex r2) no session heading and an unclosed fence: nothing is appended into it, and the call says why', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '', '```md', 'Stopped at: example', ''].join('\n'));
+    const before = readState();
+    const { json, stderr } = recordSession('--stopped-at', 'new');
+    assert.strictEqual(json.recorded, false, JSON.stringify(json));
+    assert.ok(json.skipped.every((s) => s.reason === 'unclosed_fence'), JSON.stringify(json));
+    assert.match(stderr, /unclosed code fence/);
+    assert.strictEqual(readState(), before);
+  });
+
   // Minor 4: `None` is the template placeholder, not a displaced record.
   for (const [where, fm, lines] of [
     ['frontmatter', ['stopped_at: None'], ['Last session: 2026-01-01']],

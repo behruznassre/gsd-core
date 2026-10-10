@@ -503,10 +503,12 @@ export function writeOutsideFences(content: string, write: (masked: string) => s
   while (p < limit && masked.charCodeAt(p) === result.charCodeAt(p)) p++;
   let s = 0;
   while (s < limit - p && masked.charCodeAt(masked.length - 1 - s) === result.charCodeAt(result.length - 1 - s)) s++;
-  // The span the write replaced must be unfenced text, identical in the masked
-  // copy and the real one — an edit that consumed masked (fenced) bytes cannot
-  // be carried back, even when re-masking the result would hide it.
-  if (content.slice(p, content.length - s) !== masked.slice(p, masked.length - s)) return null;
+  // The span the write replaced must lie on unfenced lines — an edit that
+  // touched a fenced line cannot be carried back, even when the masked and
+  // real bytes there happen to agree (a whitespace-only fenced line).
+  const lineOf = (offset: number): number => content.slice(0, offset).split('\n').length - 1;
+  const fenced = fencedLineFlags(content.split('\n'));
+  for (let line = lineOf(p); line <= lineOf(content.length - s); line++) if (fenced[line]) return null;
   const spliced = content.slice(0, p) + result.slice(p, result.length - s) + content.slice(content.length - s);
   return maskFencedLines(spliced) === result ? spliced : null;
 }

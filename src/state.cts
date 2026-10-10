@@ -140,7 +140,7 @@ import {
   stateReplaceFieldIfTemplate,
   stateCurrentPositionSlice,
 } from './state-document.cjs';
-import { tokenizeHeadings, collectSection, collectSections, replaceSection, stripFencedCode } from './markdown-sectionizer.cjs';
+import { tokenizeHeadings, collectSection, collectSections, replaceSection, stripFencedCode, scanFencedBlocks } from './markdown-sectionizer.cjs';
 import type { HeadingToken } from './markdown-sectionizer.cjs';
 import { parseMarkdownTable, updateTableCell, deleteTableRow, insertTableRow, splitTableRow, isDelimiterRow } from './markdown-table.cjs';
 import { textEncodingError } from './validate.cjs';
@@ -1998,7 +1998,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
   // which are a separate note directly below it cannot be told apart, so the
   // write leaves the field whole and says so rather than deleting either.
   // Also (`line_separator`): a carried value the appended section leaves out.
-  const skippedFields: { field: string; reason: 'wrapped_value' | 'line_separator'; continuation?: string }[] = [];
+  const skippedFields: { field: string; reason: 'wrapped_value' | 'line_separator' | 'unclosed_fence'; continuation?: string }[] = [];
   const skipWrapped = (field: string, before: string, after: string): boolean => {
     const continuation = editedLineContinuation(before, after);
     if (continuation === null) return false;
@@ -2207,7 +2207,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // skipped field never comes back carrying the new value.
         // Read from the body, as the sync does — never from frontmatter, and
         // never from a fenced example.
-        const syncBody = maskFencedLines(stripFrontmatter(content));
+        const syncBody = readableBoldLabels(maskFencedLines(stripFrontmatter(content)));
         const carried = (fields: readonly string[], fallback: string): string => {
           for (const field of fields) {
             const value = stateExtractField(syncBody, field);
@@ -2231,9 +2231,15 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
           if (FIELD_LINE_BREAK_RE.test(value)) skippedFields.push({ field: label, reason: 'line_separator' });
           else scaffoldLines.push(`**${label}:** ${value}`);
         }
-        const scaffold = ['', '## Session', '', ...scaffoldLines, ''].join('\n');
-        content = content.trimEnd() + '\n' + scaffold;
-        rewriteMatched = true;
+        // A document that ends inside an unclosed fence would swallow the
+        // appended section — nothing reads it there. Write nothing, and say so.
+        if (scanFencedBlocks(content.split('\n')).some((b) => b.closeLineIdx === -1)) {
+          for (const [label] of scaffoldFields) skippedFields.push({ field: label, reason: 'unclosed_fence' });
+        } else {
+          const scaffold = ['', '## Session', '', ...scaffoldLines, ''].join('\n');
+          content = content.trimEnd() + '\n' + scaffold;
+          rewriteMatched = true;
+        }
       }
 
       // #2450 defensive invariant: only report sessionCreated/updated when the
@@ -2272,8 +2278,11 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     ? `state record-session left ${field} unchanged — its value continues onto the next line ` +
       `(${formatDiagnosticToken(continuation ?? '')}), and a single-line write would leave that line behind. ` +
       'Fold the value onto one line, or put a blank line before that line if it is a separate note, then re-run.'
-    : `state record-session left ${field} out of the new ## Session section — its existing value holds a ` +
-      'line separator (U+2028/U+2029), which would split the line it is written on. Remove the separator, then re-run.'));
+    : reason === 'line_separator'
+      ? `state record-session left ${field} out of the new ## Session section — its existing value holds a ` +
+        'line separator (U+2028/U+2029), which would split the line it is written on. Remove the separator, then re-run.'
+      : `state record-session did not write ${field} — STATE.md has no session section and ends inside an unclosed ` +
+        'code fence, which would swallow a new ## Session section. Close the fence, then re-run.'));
 
   if (reconciledUpdated.length > 0) {
     const result: Record<string, unknown> = { recorded: true, updated: reconciledUpdated };
@@ -2316,7 +2325,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     declineNoOp(
       raw,
       'recorded',
-      'every session field to update has a value that continues onto the next line — left unchanged',
+      'every session field to update was left unchanged — see skipped',
       skippedDisclosure.join('\n[gsd-tools] WARNING: '),
       { skipped: skippedRows },
     );
