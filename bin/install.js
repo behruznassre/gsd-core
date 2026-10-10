@@ -190,7 +190,7 @@ function isCodexHooksFeatureKey(key) {
 // GSD_CLAUDE_LEGACY_DENY_PERMISSIONS below.)
 //
 // Format: each string uses Claude Code's documented permission rule syntax \u2014
-//   "Tool(pattern)"  e.g. "Bash(npx gsd-core *)", "Read(.planning/*)"
+//   "Tool(pattern)"  e.g. "Read(.planning/*)", "Edit(STATE.md)"
 //   "Tool"           (bare tool name, no pattern)
 //
 // Merge policy: additive, non-destructive \u2014 existing user entries are preserved;
@@ -199,7 +199,6 @@ function isCodexHooksFeatureKey(key) {
 // instead of scattered literal 'claude' defaults/rosters (#2086).
 const DEFAULT_RUNTIME = 'claude';
 const GSD_CLAUDE_ALLOW_PERMISSIONS = Object.freeze([
-  'Bash(npx gsd-core *)',
   'Read(.planning/*)',
   'Edit(.planning/*)',
   'Read(STATE.md)',
@@ -232,9 +231,14 @@ const GSD_CLAUDE_LEGACY_DENY_PERMISSIONS = Object.freeze([
 // mergeClaudePermissions and uninstall cleanup retire those stale entries on
 // existing installs while the current GSD_CLAUDE_ALLOW_PERMISSIONS above
 // carries the working `Edit(...)` forms.
+// #5054 — `Bash(npx gsd-core *)` is retired the same way. The project ships
+// as `@opengsd/gsd-core`; the unscoped `gsd-core` npm name belongs to someone
+// else, so the rule pre-authorized whatever that name's owner publishes next.
+// GSD never runs the bare form (update.md uses `--package=@opengsd/gsd-core`).
 const GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS = Object.freeze([
   'Write(.planning/*)',
   'Write(STATE.md)',
+  'Bash(npx gsd-core *)',
 ]);
 
 /**
@@ -249,6 +253,7 @@ const GSD_CLAUDE_LEGACY_ALLOW_PERMISSIONS = Object.freeze([
  * `Write(...)` forms from before the fix) is removed from permissions.allow,
  * so existing installs end up with the working `Edit(...)` forms instead of
  * both the dead legacy entry and its replacement sitting side by side.
+ * The same filter retires the unscoped `Bash(npx gsd-core *)` rule (#5054).
  *
  * Migration (#4221): the retired GSD_CLAUDE_LEGACY_DENY_PERMISSIONS entries
  * are removed from permissions.deny (byte-equal only). Nothing is added to
