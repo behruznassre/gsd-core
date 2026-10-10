@@ -1510,6 +1510,16 @@ Known limit: the kill terminates `git`, not the hook process it spawned. A hook 
 
 ---
 
+### Orphan sweep
+
+```bash
+# Reap orphaned agent worktrees; run at the start of /gsd-quick, /gsd-quick-batch and execute-phase.
+# Returns JSON: { ok: true, reaped, entries: [{ path, status, reason }], scan: { admin_dir, residue_dir } }
+gsd-tools query worktree.reap-orphans
+```
+
+It reaps locked worktrees in `.git/worktrees/` whose owner process is dead and whose branch is merged, and removes `.claude/worktrees/agent-*` directories a harness teardown left behind (no `.git` entry, not in `git worktree list`, older than five minutes, no git-tracked file, not empty, inside the checkout). A child that fails a check is listed with `status: "skipped"` and the check's `reason`, and left on disk. `scan` says which locations were read, so `reaped: 0` never stands for "did not look": `admin_dir` is `scanned`, `absent`, `unreadable`, `git_dir_unresolved` or `default_branch_unresolved`; `residue_dir` is `scanned`, `absent`, `unreadable`, `outside_checkout`, `not_main_checkout` (run from a linked worktree — the sweep runs from the main checkout), `top_unresolved` or `not_scanned`. The workflow callers discard the JSON and keep stderr, which names removed directories (escaped, at most five), counts kept ones by reason, and says when `.claude/worktrees` was not swept. Wave cleanup blocks an entry whose directory exists with no `.git` entry as `reason: "worktree_unregistered"`.
+
 ## Graphify
 
 Build, query, and inspect the project knowledge graph in `.planning/graphs/`. Requires `graphify.enabled: true` in `config.json` (see [Configuration Reference](CONFIGURATION.md#graphify-settings)).
