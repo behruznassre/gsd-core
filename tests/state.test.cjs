@@ -22356,6 +22356,52 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.match(session(), /\*\*Stopped at:\*\* X\n/);
   });
 
+  // Codex review (round 1 of this update): the other session writers and the
+  // snapshot read agree with the fence rule too.
+  test('(Codex 1) `state update "Stopped At"` writes the live line, not a fenced example, and the sync reads it', () => {
+    seed([], ['```md', 'Stopped at: example', '```', 'Stopped at: real', 'Resume file: None'], '## Session');
+    const rec = runTool('state', 'update', 'Stopped At', 'new');
+    assert.strictEqual(rec.exitCode, 0, rec.stderr);
+    assert.ok(session().includes('```md\nStopped at: example\n```'), session());
+    assert.match(session(), /\nStopped at: new\n/);
+    assert.strictEqual(frontmatterStoppedAt(), 'new', readState());
+  });
+
+  test('(Codex 2) a `## Session` heading that is only a fenced example is not a section: the real one is appended', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
+      '```md', '## Session', 'Last session: example', 'Stopped at: example', 'Resume file: None', '```', ''].join('\n'));
+    const { json } = recordSession('--stopped-at', 'new');
+    assert.strictEqual(json.recorded, true, JSON.stringify(json));
+    // Non-blank lines: the write path's own spacing may add blanks in a fence.
+    const lines = readState().split(/\r?\n/).filter(Boolean);
+    const open = lines.indexOf('```md');
+    assert.deepStrictEqual(lines.slice(open, open + 6),
+      ['```md', '## Session', 'Last session: example', 'Stopped at: example', 'Resume file: None', '```'], readState());
+    assert.match(readState(), /\n## Session\n\n\*\*Last session:\*\* \S+\n\*\*Stopped at:\*\* new\n/);
+    assert.strictEqual(frontmatterStoppedAt(), 'new');
+  });
+
+  test('(Codex 3) `state snapshot` reads the live session lines, not fenced examples', () => {
+    seed([], ['```md', 'Stopped at: example', 'Resume file: example.md', '```', 'Stopped at: live', 'Resume file: plan.md'], '## Session');
+    const rec = runTool('state-snapshot');
+    assert.strictEqual(rec.exitCode, 0, rec.stderr);
+    const snap = JSON.parse(rec.stdout);
+    assert.deepStrictEqual([snap.session.stopped_at, snap.session.resume_file], ['live', 'plan.md']);
+  });
+
+  test('(Codex 4) an authored `**Resume file**: plan.md` survives a call without --resume-file', () => {
+    seed([], ['**Last session:** 2026-01-01', '**Stopped at:** old', '**Resume file**: plan.md'], '## Session');
+    const { json } = recordSession('--stopped-at', 'new');
+    assert.ok(!json.updated.includes('Resume File'), JSON.stringify(json));
+    assert.ok(session().includes('**Resume file**: plan.md'), session());
+  });
+
+  test('(Codex 4) a `**Resume file**: plan.md` that --resume-file replaces is reported in replacedRecord', () => {
+    seed([], ['**Last session:** 2026-01-01', '**Stopped at:** old', '**Resume file**: plan.md'], '## Session');
+    const { json } = recordSession('--stopped-at', 'new', '--resume-file', 'next.md');
+    assert.strictEqual(json.replacedRecord['Resume File'], 'plan.md', JSON.stringify(json));
+  });
+
   // Minor 4: `None` is the template placeholder, not a displaced record.
   for (const [where, fm, lines] of [
     ['frontmatter', ['stopped_at: None'], ['Last session: 2026-01-01']],

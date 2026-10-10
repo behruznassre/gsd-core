@@ -2895,6 +2895,26 @@ describe('writeOutsideFences / maskFencedLines (#4998): a fenced example is neve
     assert.equal(writeOutsideFences(doc, (m) => m.replace(/\n {5}\n/, '\nT: forged\n')), null);
   });
 
+  // Codex review: re-masking hid an edit that consumed masked bytes.
+  test('an edit that shortens a masked (fenced) line is refused, even when re-masking would hide it', () => {
+    assert.equal(writeOutsideFences('S: a\n```\nT: ex\n```', (m) => m.replace('\n     \n', '\n    \n')), null);
+  });
+
+  test('stateReplaceFieldInSession never writes a fenced example (#4998, the session writers agree with the readers)', () => {
+    const { stateReplaceFieldInSession } = require('../gsd-core/bin/lib/state-document.cjs');
+    const doc = '## Session\n\n```md\nStopped at: example\n```\nStopped at: real\n';
+    assert.equal(stateReplaceFieldInSession(doc, 'Stopped At', 'Stopped at', 'new'),
+      '## Session\n\n```md\nStopped at: example\n```\nStopped at: new\n');
+    assert.equal(stateReplaceFieldInSession('## Session\n\n```\nStopped at: example\n```\n', 'Stopped At', 'Stopped at', 'new'),
+      '## Session\n\n```\nStopped at: example\n```\n', 'only a fenced example: a miss, content unchanged');
+  });
+
+  test('readableBoldLabels respells `**Label**:` for reading only', () => {
+    const { readableBoldLabels } = require('../gsd-core/bin/lib/state-document.cjs');
+    assert.equal(readableBoldLabels('**Resume file**: plan.md\n  **S**: x\n**T:** y\nsee **this**: z'),
+      '**Resume file:** plan.md\n  **S:** x\n**T:** y\nsee **this**: z');
+  });
+
   test('maskFencedLines keeps length and line terminators and blanks only fenced lines', () => {
     const doc = 'a\r\n```\r\nb\r\n```\r\nc';
     const masked = maskFencedLines(doc);

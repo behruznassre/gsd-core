@@ -503,8 +503,24 @@ export function writeOutsideFences(content: string, write: (masked: string) => s
   while (p < limit && masked.charCodeAt(p) === result.charCodeAt(p)) p++;
   let s = 0;
   while (s < limit - p && masked.charCodeAt(masked.length - 1 - s) === result.charCodeAt(result.length - 1 - s)) s++;
+  // The span the write replaced must be unfenced text, identical in the masked
+  // copy and the real one — an edit that consumed masked (fenced) bytes cannot
+  // be carried back, even when re-masking the result would hide it.
+  if (content.slice(p, content.length - s) !== masked.slice(p, masked.length - s)) return null;
   const spliced = content.slice(0, p) + result.slice(p, result.length - s) + content.slice(content.length - s);
   return maskFencedLines(spliced) === result ? spliced : null;
+}
+
+/**
+ * #4998: `content` with every `**Label**:` line respelled `**Label:**`, for
+ * READING a field the way the writer finds it: `stateReplaceField` matches
+ * both spellings, `stateExtractField` only the second, so a `**Resume
+ * file**: plan.md` read as absent while the writer could still replace it.
+ * Never written back.
+ */
+export function readableBoldLabels(content: string): string {
+  // allow-adhoc-markdown: a read-only copy for stateExtractField, never written back — not a document mutation
+  return content.replace(/^([ \t]*)\*\*([^*\r\n]+)\*\*:/gm, '$1**$2:**');
 }
 
 /** The continuation lines following the line that ends at `afterValue`. */
@@ -896,14 +912,18 @@ export function stateReplaceFieldWithFallback(content: string, primary: string, 
  * Replace-only (no insertion): returns `content` unchanged when no session
  * section exists or the field is absent from it, so a STATE.md layout without
  * the line keeps its shape and the post-sync preservation pass decides the
- * frontmatter value (see #3374).
+ * frontmatter value (see #3374). Lines inside a fenced block are examples and
+ * are never the occurrence replaced (#4998, `writeOutsideFences`).
  */
 export function stateReplaceFieldInSession(content: string, primary: string, fallback: string | null | undefined, value: string): string {
   const isSession = (h: HeadingToken): boolean => h.level === 2 && h.text.trim().toLowerCase() === 'session';
   const isSessionContinuity = (h: HeadingToken): boolean => h.level === 2 && h.text.trim().toLowerCase() === 'session continuity';
   const hasCanonicalSession = collectSection(content, isSession, { levelBounded: true }) !== null;
   const target = hasCanonicalSession ? isSession : isSessionContinuity;
-  return withSection(content, target, (sectionBody) => stateReplaceFieldWithFallback(sectionBody, primary, fallback, value));
+  // #4998: a fenced example line is never the field written, as the session
+  // readers (state.cts sessionFieldScope) never read one.
+  return withSection(content, target, (sectionBody) =>
+    writeOutsideFences(sectionBody, (visible) => stateReplaceFieldWithFallback(visible, primary, fallback, value)) ?? sectionBody);
 }
 
 /**

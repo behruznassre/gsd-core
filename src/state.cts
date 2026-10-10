@@ -134,6 +134,7 @@ import {
   FIELD_LINE_BREAK_RE,
   maskFencedLines,
   writeOutsideFences,
+  readableBoldLabels,
   stateReplaceField,
   KNOWN_TEMPLATE_DEFAULTS,
   stateReplaceFieldIfTemplate,
@@ -2016,8 +2017,9 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     // #4998: a line inside a fenced block is an example, not a field — the
     // writers below skip fences (`writeOutsideFences`), so the capture reads
     // the same unfenced text they write.
+    // A `**Label**:` line the writer can replace is read too (readableBoldLabels).
     const capturePrior = (fieldName: string): string | undefined => {
-      const visible = maskFencedLines(content);
+      const visible = readableBoldLabels(maskFencedLines(content));
       const first = stateExtractField(visible, fieldName);
       if (first === null) return undefined;
       const cont = stateFieldContinuation(visible, fieldName);
@@ -2035,8 +2037,14 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     // below does — a fenced example line is never the occurrence replaced.
     const replaceField = (fieldName: string, value: string): string | null =>
       writeOutsideFences(content, (visible) => stateReplaceField(visible, fieldName, value));
-    const replaceFieldIfTemplate = (fieldName: string, defaults: string[], value: string): string =>
-      writeOutsideFences(content, (visible) => stateReplaceFieldIfTemplate(visible, fieldName, defaults, value)) ?? content;
+    // The template check reads the field the way the writer finds it: an
+    // authored `**Resume file**: plan.md` read as absent and was reset to None.
+    const replaceFieldIfTemplate = (fieldName: string, defaults: string[], value: string): string => {
+      const current = stateExtractField(readableBoldLabels(maskFencedLines(content)), fieldName);
+      if (current !== null && current.trim() !== ''
+          && !defaults.some((d) => d.toLowerCase() === current.trim().toLowerCase())) return content;
+      return writeOutsideFences(content, (visible) => stateReplaceFieldIfTemplate(visible, fieldName, defaults, value)) ?? content;
+    };
 
     // Update Last session / Last Date
     let result = replaceField('Last session', now);
@@ -2128,8 +2136,10 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // (workstream.cts, gsd2-import.cts, templates/state.md) instead emit
       // `## Session Continuity`. Treat each separately so we never append a
       // duplicate section alongside an existing one.
-      const existingCanonicalSession = /^## Session[ \t]*$/im.test(content);
-      const existingSessionContinuity = /^## Session Continuity[ \t]*$/im.test(content);
+      // #4998: a heading inside a fenced example is not a section.
+      const headingScan = maskFencedLines(content);
+      const existingCanonicalSession = /^## Session[ \t]*$/im.test(headingScan);
+      const existingSessionContinuity = /^## Session Continuity[ \t]*$/im.test(headingScan);
 
       // Track whether the chosen branch's rewrite actually matched. The detector
       // regexes (existingCanonicalSession/existingSessionContinuity) are CRLF-
@@ -2632,7 +2642,8 @@ function cmdStateSnapshot(cwd: string, raw: boolean): void {
   // `## Session Continuity` heading. See matchSessionSection for the anchoring.
   const sessionMatch = matchSessionSection(body);
   if (sessionMatch !== null) {
-    const sessionSection = sessionMatch;
+    // #4998: fenced example lines are not fields (as for sessionFieldScope).
+    const sessionSection = maskFencedLines(sessionMatch);
     // Accept both `**Last Date:**` (canonical template form) and `**Last session:**`
     // (the form written by the DWIM auto-create / normalize path added for #944).
     const lastDateMatch = sessionSection.match(/\*\*Last Date:\*\*\s*(.+)/i)
