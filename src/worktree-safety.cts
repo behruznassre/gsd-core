@@ -2805,7 +2805,7 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
  *     target `git worktree add` accepts);
  *   - no repository lies inside it — no `.git` entry at any depth and no bare
  *     repository layout (`residue_contains_repository`), walked without
- *     following links and without descending `node_modules`, and bounded
+ *     following links, `node_modules` included, and bounded
  *     (`residue_unverified` past the bound).
  * Removal is `fs.rmSync(p, { recursive: true })`, which unlinks a symlink or
  * junction found inside rather than following it (pinned by a junction test).
@@ -2827,15 +2827,19 @@ function findUnregisteredResidue(
   // worktree's is `<common>/worktrees/<id>`. Asked of git, as is the top —
   // the git dir's location says nothing reliable about the checkout's, since
   // `--separate-git-dir` can put it anywhere, under any name.
+  // The top comes from `--show-cdup` (the `../` steps from repoRoot), not
+  // `--show-toplevel`: a top-level path may end in whitespace, which the
+  // subprocess seam's stdout trim would strip — pointing the sweep at a
+  // sibling directory (Codex review). `../` steps survive trimming intact.
   const commonDir = execGit(['rev-parse', '--git-common-dir'], { cwd: repoRoot });
-  const topLevel = execGit(['rev-parse', '--show-toplevel'], { cwd: repoRoot });
-  if (!gitResultOk(commonDir) || !gitResultOk(topLevel)) return { results, status: 'top_unresolved' };
+  const cdup = execGit(['rev-parse', '--show-cdup'], { cwd: repoRoot });
+  if (!gitResultOk(commonDir) || cdup.timedOut || cdup.exitCode !== 0) return { results, status: 'top_unresolved' };
   if (comparablePath(path.resolve(repoRoot, commonDir.stdout.trim())) !== comparablePath(gitDirPath)) {
     return { results, status: 'not_main_checkout' };
   }
   let top: string;
   try {
-    top = fs.realpathSync.native(topLevel.stdout.trim());
+    top = fs.realpathSync.native(path.resolve(fs.realpathSync.native(repoRoot), String(cdup.stdout).trim()));
   } catch {
     return { results, status: 'top_unresolved' };
   }
@@ -2928,14 +2932,24 @@ function findUnregisteredResidue(
       results.push({ path: p, status: 'skipped', reason: inner === 'found' ? 'residue_contains_repository' : 'residue_unverified' });
       continue;
     }
-    // Right before removing: the chain is still real directories and the
-    // child is still one with no `.git` — `p` is built from that chain.
-    if (!chainIsReal() || isBareDirectory(p) !== true) {
+    // Right before removing: the chain is still real directories, the child is
+    // still one with no `.git`, and — resolved NOW, after those checks — it is
+    // still inside the checkout's `.claude/worktrees`; the resolved path is the
+    // one removed, so a parent swapped for a link after the checks is refused,
+    // not followed (Codex review). What remains is the instant between this
+    // resolution and the unlink: only a process that can already write the
+    // checkout could use it, and it could delete the checkout outright.
+    let target: string;
+    try {
+      if (!chainIsReal() || isBareDirectory(p) !== true) throw new Error('changed');
+      target = fs.realpathSync.native(p);
+      if (path.dirname(target) !== residueDir) throw new Error('moved');
+    } catch {
       results.push({ path: p, status: 'skipped', reason: 'residue_unreadable' });
       continue;
     }
     try {
-      removeDir(p);
+      removeDir(target);
       results.push({ path: p, status: 'reaped', reason: 'unregistered_residue' });
     } catch {
       results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
@@ -2944,15 +2958,18 @@ function findUnregisteredResidue(
   return { results, status: 'scanned' };
 }
 
-/** At most this many entries are walked looking for a repository inside a residue (`node_modules` is not descended). */
-const RESIDUE_WALK_LIMIT = 50_000;
+/**
+ * At most this many entries are walked looking for a repository inside a
+ * residue. Large enough for a full `node_modules`, which is walked too (a
+ * package installed from a local repository keeps its `.git`).
+ */
+const RESIDUE_WALK_LIMIT = 1_000_000;
 
 /**
  * #4941: whether a repository lies inside `dir` — a `.git` entry at any depth,
  * or a bare repository layout (`HEAD` file beside `objects/` and `refs/`), the
- * directory itself included. Links are never followed; `node_modules` is not
- * descended. `unknown` when a directory cannot be read or the walk passes
- * RESIDUE_WALK_LIMIT entries.
+ * directory itself included. Links are never followed. `unknown` when a
+ * directory cannot be read or the walk passes RESIDUE_WALK_LIMIT entries.
  */
 function repositoryInside(dir: string): 'none' | 'found' | 'unknown' {
   const pending = [dir];
@@ -2971,7 +2988,7 @@ function repositoryInside(dir: string): 'none' | 'found' | 'unknown' {
     if (names.has('.git')) return 'found';
     if (names.has('HEAD') && names.has('objects') && names.has('refs')) return 'found';
     for (const entry of entries) {
-      if (entry.isDirectory() && !entry.isSymbolicLink() && entry.name !== 'node_modules') {
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
         pending.push(path.join(current, entry.name));
       }
     }

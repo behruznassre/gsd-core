@@ -231,7 +231,7 @@ describe('#3057 reapOrphanWorktrees: default-branch discovery verdicts', () => {
     // Distinguishes this bail-out from the --git-dir one above: --git-dir DID
     // run and succeed, and nothing on the admin path ran after the listing.
     // #4941: the residue scan then asks git which checkout it is in.
-    assert.deepStrictEqual(argvOf(faultyGit), ['rev-parse --git-dir', 'rev-parse --git-common-dir', 'rev-parse --show-toplevel']);
+    assert.deepStrictEqual(argvOf(faultyGit), ['rev-parse --git-dir', 'rev-parse --git-common-dir', 'rev-parse --show-cdup']);
   });
 
   test('returns no rows for a repo that has no linked worktrees at all', () => {
@@ -1199,6 +1199,60 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(fs.existsSync(path.join(moved, path.basename(residue))), 'and so does the moved residue');
   });
 
+  // Codex review round 2 (each reproduced against the previous head).
+  test('a swap of .claude/worktrees for an outside link AFTER the final checks is refused, not followed', () => {
+    const { repoDir, residue } = repoWithResidue('lateswap');
+    const outside = path.join(tmpBase, 'late-outside');
+    fs.mkdirSync(path.join(outside, 'agent-t1', 'keep'), { recursive: true });
+    const residueDir = path.join(repoDir, '.claude', 'worktrees');
+    const moved = path.join(tmpBase, 'late-moved');
+    const gitProbe = path.join(canonicalPath(residueDir), 'agent-t1', '.git');
+    let probes = 0;
+    const realLstat = fs.lstatSync;
+    const results = withFaultyFs({
+      lstatSync: (p, ...rest) => {
+        // The child's `.git` is probed at discovery and again in the final
+        // check; swap the parent during that final probe.
+        if (p === gitProbe && ++probes === 2) {
+          fs.renameSync(residueDir, moved);
+          fs.symlinkSync(outside, residueDir, 'junction');
+        }
+        return realLstat(p, ...rest);
+      },
+    }, () => reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.strictEqual(probes >= 2, true, 'the final check ran');
+    assert.ok(!results.some((r) => r.status === 'reaped'), JSON.stringify(results));
+    assert.ok(fs.existsSync(path.join(outside, 'agent-t1', 'keep')), 'the outside directory survives');
+    assert.ok(fs.existsSync(path.join(moved, path.basename(residue))), 'and so does the moved residue');
+  });
+
+  test('a repository inside node_modules keeps the residue (node_modules is walked)', () => {
+    const { repoDir, residue } = repoWithResidue('nm-repo');
+    const pkg = path.join(residue, 'node_modules', 'local-package');
+    fs.mkdirSync(pkg, { recursive: true });
+    git(['init', '-q'], pkg);
+    fs.writeFileSync(path.join(pkg, 'work.txt'), 'uncommitted\n');
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_contains_repository']);
+    assert.ok(fs.existsSync(path.join(pkg, 'work.txt')));
+  });
+
+  test('a checkout whose path ends in a space sweeps itself, never a same-named sibling', (t) => {
+    if (process.platform === 'win32') {
+      t.skip('a trailing space is not a valid Windows path component');
+      return;
+    }
+    const spaced = path.join(tmpBase, 'checkout ');
+    const sibling = path.join(tmpBase, 'checkout');
+    initRepo(spaced);
+    initRepo(sibling);
+    const victim = makeResidue(sibling, 'agent-demo');
+    fs.writeFileSync(path.join(victim, 'work.txt'), 'sibling work\n');
+    const { results, scan } = reapOrphanWorktreesWithScan(spaced, deadOwnerDeps());
+    assert.deepStrictEqual([results, scan.residue_dir], [[], 'absent']);
+    assert.ok(fs.existsSync(path.join(victim, 'work.txt')), 'the sibling repository\'s directory survives');
+  });
+
   for (const [label, plant] of [
     ['a bare repository', (dir) => git(['init', '-q', '--bare', dir], tmpBase)],
     ['a repository nested inside it', (dir) => {
@@ -1466,7 +1520,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('a checkout top git cannot name scans as top_unresolved, and touches nothing', () => {
     const { repoDir, residue } = sepGitRepoWithResidue('notop');
     const faultyGit = makeFaultyGit({
-      faults: [{ kind: 'exit', exitCode: 128, when: ['rev-parse', '--show-toplevel'] }],
+      faults: [{ kind: 'exit', exitCode: 128, when: ['rev-parse', '--show-cdup'] }],
       passthrough: realExecGit,
     });
     const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps({ execGit: faultyGit }));
