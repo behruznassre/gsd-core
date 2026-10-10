@@ -6374,8 +6374,10 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     fs.mkdirSync(path.join(pkg, '.planning'), { recursive: true });
     const deep = path.join(pkg, 'src');
     fs.mkdirSync(deep);
-    assert.equal(ownWorktreePlanningRoot(deep).root, fs.realpathSync(pkg));
-    assert.equal(resolveMainWorktreeCwd(deep), fs.realpathSync(pkg));
+    // In the caller's own spelling (#4885 review, Minor 3), whatever the OS
+    // makes of the temp root.
+    assert.equal(ownWorktreePlanningRoot(deep).root, path.resolve(pkg));
+    assert.equal(resolveMainWorktreeCwd(deep), path.resolve(pkg));
   });
 
   // Codex review: handing cwd to findProjectRoot's lexical, ten-ancestor walk
@@ -6437,15 +6439,11 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     assert.equal(fs.realpathSync(resolveMainWorktreeCwd(sub)), fs.realpathSync(main));
   });
 
-  // The two early answers of ownWorktreePlanningRoot that need no git failure.
-  test('a cwd that cannot be canonicalized, or lies outside the toplevel git reports, answers null', () => {
-    const top = { exitCode: 0, stdout: '/repo/wt\n', stderr: '', timedOut: false };
-    assert.deepEqual(ownWorktreePlanningRoot('/no/such/dir-4885', { execGit: () => top, existsSync: () => true }),
+  // The early answer of ownWorktreePlanningRoot that needs no git failure.
+  test('a cwd that cannot be canonicalized answers null', () => {
+    const cdup = { exitCode: 0, stdout: '../\n', stderr: '', timedOut: false };
+    assert.deepEqual(ownWorktreePlanningRoot('/no/such/dir-4885', { execGit: () => cdup }),
       { root: null, timedOut: false }, 'realpath failure');
-    const { wt, sub } = mainWithWorktree({ trackPlanning: true });
-    const elsewhere = { exitCode: 0, stdout: `${path.dirname(fs.realpathSync(wt))}${path.sep}other\n`, stderr: '', timedOut: false };
-    fs.mkdirSync(path.join(path.dirname(wt), 'other'));
-    assert.deepEqual(ownWorktreePlanningRoot(sub, { execGit: () => elsewhere }), { root: null, timedOut: false }, 'not contained');
   });
 
   // Nit 3: resolvePlanningWorktreeRoot's whole mapping, as a property: only a

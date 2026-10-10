@@ -191,28 +191,30 @@ function nearestProjectConfigDir(cwd) {
  * not answer "safe"):
  *
  *   { project: false }                          no project applies to `cwd`
- *   { project: true, root, sentinelRoot }       evaluate: the sentinel is read
- *                                               at `sentinelRoot`, the config
- *                                               at `root`
- *   { project: true, root: null, error }        a project exists above `cwd`,
- *                                               but which root applies could
- *                                               not be resolved — deny
+ *   { project: true, root, sentinelRoot: root } evaluate the project at `root`
+ *   { project: true, root: null, error }        `cwd` is inside a GSD project,
+ *                                               but which root governs it
+ *                                               could not be verified — deny
+ *
+ * The root is always the one gsd-tools writes the sentinel under
+ * (`resolveProjectRootOrThrow`): the sentinel and the config are read from the
+ * same place, and no other root's configuration is ever substituted.
  *
  * A pure-fs probe runs first — the lexical path, then (only when that finds
  * nothing, so a `.planning` symlink to an external store keeps its #4815
- * lexical meaning) the canonical one, so a symlinked alias into a project is
- * still seen. With no `.planning/config.json` at or above either, nothing is
- * built, git never runs, and the dispatch is not a GSD project's — the
- * pre-#4885 answer. `cwd` itself holding one is its own root, as before.
- *
- * Otherwise `sentinelRoot` is ALWAYS the root gsd-tools writes the sentinel
- * under (`resolveProjectRootOrThrow`), so a recorded decision is read where it
- * was recorded; a failure there, or a git timeout, is unresolved. The CONFIG
- * comes from that same root when it holds one. When it does not, the resolver
- * either stopped at a `.planning/` with no config (which a branch can commit)
- * or ran out of its ancestor bound — in both cases the nearest project above
- * governs. Any other "no project" from the resolver is its deliberate
- * boundary (an independent nested repository, #2843; `$HOME`) and stands.
+ * lexical meaning) the canonical one. With no `.planning/config.json` at or
+ * above either, nothing is built, git never runs, and the dispatch is not a
+ * GSD project's — the pre-#4885 answer. `cwd` itself holding one is its own
+ * root, as before. Otherwise:
+ *   - a resolution failure or git timeout is unresolved (deny);
+ *   - the writer's root holding `.planning/config.json` is the project;
+ *   - `cwd` in a different repository from the project above (an independent
+ *     nested repository, #2843) is not that project's;
+ *   - the writer's root holding a `.planning/` with no config, or `cwd` past
+ *     the ancestor bound `findProjectRoot` walks (so it found nothing), is a
+ *     directory inside a GSD project whose governing configuration cannot be
+ *     read — unresolved (deny), never an inert "not a project";
+ *   - anything else is the resolver's own deliberate "not a project" (`$HOME`).
  */
 function resolveGuardProject(cwd) {
   let base = path.resolve(cwd);
@@ -227,26 +229,34 @@ function resolveGuardProject(cwd) {
     if (anchor === null) return { project: false };
   }
   if (anchor === base) return { project: true, root: cwd, sentinelRoot: cwd };
+  const unresolved = (message) => ({ project: true, root: null, error: new Error(message) });
   let resolved;
   try {
     resolved = resolveProjectRootOrThrow(cwd);
   } catch (error) {
     return { project: true, root: null, error };
   }
-  if (resolved.reason === 'git_timed_out') {
-    return {
-      project: true,
-      root: null,
-      error: new Error(`git timed out resolving which checkout '${cwd}' belongs to.`),
-    };
+  if (resolved.reason === 'git_timed_out') return unresolved(`git timed out resolving which checkout '${cwd}' belongs to.`);
+  const root = resolved.root;
+  if (fs.existsSync(path.join(root, '.planning', 'config.json'))) return { project: true, root, sentinelRoot: root };
+  let ownRepo;
+  let projectRepo;
+  try {
+    const { gitCommonDir } = require('../../gsd-core/bin/lib/worktree-safety.cjs');
+    ownRepo = gitCommonDir(base);
+    projectRepo = gitCommonDir(anchor);
+  } catch (error) {
+    return { project: true, root: null, error };
   }
-  const sentinelRoot = resolved.root;
-  if (fs.existsSync(path.join(sentinelRoot, '.planning', 'config.json'))) {
-    return { project: true, root: sentinelRoot, sentinelRoot };
+  if (ownRepo.timedOut || projectRepo.timedOut) return unresolved(`git timed out resolving which repository '${cwd}' belongs to.`);
+  if (ownRepo.dir !== projectRepo.dir) return { project: false };
+  if (isDirectory(path.join(root, '.planning'))) {
+    return unresolved(`'${root}' holds a .planning/ with no config.json, inside the GSD project at '${anchor}'.`);
   }
   const levels = path.relative(anchor, base).split(path.sep).length;
-  const shadowed = isDirectory(path.join(sentinelRoot, '.planning'));
-  if (shadowed || levels > (resolved.maxDepth ?? 10)) return { project: true, root: anchor, sentinelRoot };
+  if (levels > (resolved.maxDepth ?? 10)) {
+    return unresolved(`'${cwd}' is ${levels} directories below the GSD project at '${anchor}', past the ${resolved.maxDepth ?? 10} that project-root resolution walks.`);
+  }
   return { project: false };
 }
 

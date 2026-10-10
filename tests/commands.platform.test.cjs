@@ -37,6 +37,7 @@
  * - "a --cwd that is a symlink from main into the worktree still commits in the worktree" — creates a real directory symlink/junction from the main checkout into a linked worktree (symlink-keyword)
  * - "the root comes back in the cwd's own spelling when it names the same directory" — creates a real directory symlink/junction to a linked worktree (symlink-keyword)
  * - "a symlinked alias into a linked worktree is still a project to the isolation guards" — creates a real directory symlink/junction into a linked worktree (symlink-keyword)
+ * - "a worktree whose path ends in a space still owns its subdirectory" — a trailing space is not a valid Windows path component (process-platform)
  */
 
 const { test, describe, after, beforeEach, afterEach } = require('node:test');
@@ -978,6 +979,31 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     assert.equal(ownWorktreePlanningRoot(viaLink).root, link);
     assert.equal(resolveMainWorktreeCwd(viaLink), link);
     assert.equal(ownWorktreePlanningRoot(sub).root, path.resolve(wt), 'an unlinked cwd keeps its spelling too');
+  });
+
+  // Codex review: a worktree whose top-level path ends in whitespace is a legal
+  // POSIX path; git's `--show-toplevel` answer lost it to the subprocess seam's
+  // stdout trim, and the subdirectory resolved to main again (#4885 itself).
+  test('a worktree whose path ends in a space still owns its subdirectory', (t) => {
+    if (process.platform === 'win32') {
+      t.skip('a trailing space is not a valid Windows path component');
+      return;
+    }
+    const { ownWorktreePlanningRoot } = require('../gsd-core/bin/lib/worktree-safety.cjs');
+    const { resolveMainWorktreeCwd } = require('../gsd-core/bin/gsd-tools.cjs');
+    const main = createTempGitProject('gsd-4885-space-');
+    dirs.push(main);
+    fs.writeFileSync(path.join(main, '.planning', 'STATE.md'), '# State\n');
+    gitOrThrow(['add', '-A'], { cwd: main });
+    gitOrThrow(['commit', '-m', 'seed'], { cwd: main });
+    const parent = createTempDir('gsd-4885-space-wt-');
+    dirs.push(parent);
+    const wt = path.join(parent, 'wt ');
+    gitOrThrow(['worktree', 'add', '-b', 'space-branch', wt], { cwd: main });
+    const sub = path.join(wt, 'src');
+    fs.mkdirSync(sub);
+    assert.equal(ownWorktreePlanningRoot(sub).root, path.resolve(wt));
+    assert.equal(resolveMainWorktreeCwd(sub), path.resolve(wt));
   });
 
   // Codex review: an alias whose lexical ancestors hold no project was

@@ -281,23 +281,24 @@ function ownWorktreePlanningRoot(cwd: string, deps: WorktreeDeps = {}): { root: 
   const execGit = deps.execGit || execGitDefault;
   const none = { root: null, timedOut: false };
 
-  const top = execGit(['rev-parse', '--show-toplevel'], { cwd });
-  if (top.timedOut) return { root: null, timedOut: true };
-  if (top.exitCode !== 0 || !String(top.stdout).trim()) return none;
+  // `--show-cdup` (the `../` steps from cwd to the worktree top), not
+  // `--show-toplevel`: a top-level path ending in whitespace is legal, and the
+  // subprocess seam trims stdout; `../` steps survive trimming intact.
+  const cdup = execGit(['rev-parse', '--show-cdup'], { cwd });
+  if (cdup.timedOut) return { root: null, timedOut: true };
+  if (cdup.exitCode !== 0) return none;
 
   let start: string;
   let ownTop: string;
   try {
-    // --show-toplevel prints a realpath; compare against cwd's realpath so a
-    // symlinked cwd (macOS /tmp -> /private/tmp) stays inside the walk.
-    // `.native`: only it reliably expands Windows 8.3 short names, so a
-    // `RUNNER~1` cwd still compares equal to git's long-form top.
+    // git counts the steps from cwd's realpath, so the walk runs on it (a
+    // symlinked cwd — macOS /tmp -> /private/tmp — stays inside the walk).
+    // `.native`: only it reliably expands Windows 8.3 short names.
     start = fs.realpathSync.native(cwd);
-    ownTop = fs.realpathSync.native(String(top.stdout).trim());
+    ownTop = path.resolve(start, String(cdup.stdout).trim());
   } catch {
     return none;
   }
-  if (!isContainedIn(start, ownTop)) return none;
 
   // `lexical` walks up in step with `d`, in the caller's spelling.
   let d = start;
@@ -327,6 +328,24 @@ function spelledAs(lexical: string, real: string): string {
     return fs.realpathSync.native(lexical) === real ? lexical : real;
   } catch {
     return real;
+  }
+}
+
+/**
+ * #4885: the canonical git common directory `cwd` belongs to — the repository
+ * itself, the same for a checkout and every worktree linked to it — or `null`
+ * outside any repository; `timedOut` when git did not answer. Two directories
+ * with different common dirs are in independent repositories.
+ */
+function gitCommonDir(cwd: string, deps: WorktreeDeps = {}): { dir: string | null; timedOut: boolean } {
+  const execGit = deps.execGit || execGitDefault;
+  const r = execGit(['rev-parse', '--git-common-dir'], { cwd });
+  if (r.timedOut) return { dir: null, timedOut: true };
+  if (r.exitCode !== 0) return { dir: null, timedOut: false };
+  try {
+    return { dir: fs.realpathSync.native(path.resolve(cwd, String(r.stdout).trim())), timedOut: false };
+  } catch {
+    return { dir: null, timedOut: false };
   }
 }
 
@@ -3255,5 +3274,6 @@ export = {
   resolveWorktreeRoot,
   ownWorktreePlanningRoot,
   resolvePlanningWorktreeRoot,
+  gitCommonDir,
   pruneOrphanedWorktrees,
 };
