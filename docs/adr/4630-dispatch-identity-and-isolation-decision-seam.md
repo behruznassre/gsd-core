@@ -206,7 +206,10 @@ test now resolves the dispatch `cwd` to the root the sentinel is written under
 a subdirectory dispatch is evaluated rather than allowed inert. Its answer is a verdict, not a
 path: no `.planning/config.json` at or above `cwd` is "not a project" (decided without a build
 or git); a resolution failure or git timeout inside a project is "unresolved" and the guard
-denies (#3050); a resolved root with no config defers to the nearest project above `cwd`. The
+denies (#3050). The sentinel is always read under the root gsd-tools writes it to; the
+configuration comes from that root, or — when that root holds none because the resolver hit
+its ancestor bound or a config-less `.planning/` — from the nearest project above `cwd`. The
+resolver's other "not a project" answers (an independent nested repository, #2843) stand. The
 sentinel's transport and the degrade rules above are unchanged.
 
 ## Phase mapping

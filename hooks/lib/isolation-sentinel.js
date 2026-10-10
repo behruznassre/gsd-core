@@ -157,8 +157,8 @@ function resolveProjectRootOrThrow(cwd) {
   const { ensureRuntimeBuild } = require('../../gsd-core/bin/ensure-runtime-build.cjs');
   ensureRuntimeBuild();
   const { root, reason } = planningWorktreeRoot(require('../../gsd-core/bin/lib/worktree-safety.cjs'), cwd);
-  const { findProjectRoot } = require('../../gsd-core/bin/lib/project-root.cjs');
-  return { root: findProjectRoot(root), reason };
+  const projectRootLib = require('../../gsd-core/bin/lib/project-root.cjs');
+  return { root: projectRootLib.findProjectRoot(root), reason, maxDepth: projectRootLib.FIND_PROJECT_ROOT_MAX_DEPTH };
 }
 
 /**
@@ -190,29 +190,43 @@ function nearestProjectConfigDir(cwd) {
  * project here" from "could not tell" (#3050: a guard that cannot verify must
  * not answer "safe"):
  *
- *   { project: false }                       no project applies to `cwd`
- *   { project: true, root }                  evaluate the project at `root`
- *   { project: true, root: null, error }     a project exists above `cwd`, but
- *                                            which root applies could not be
- *                                            resolved — the guard denies
+ *   { project: false }                          no project applies to `cwd`
+ *   { project: true, root, sentinelRoot }       evaluate: the sentinel is read
+ *                                               at `sentinelRoot`, the config
+ *                                               at `root`
+ *   { project: true, root: null, error }        a project exists above `cwd`,
+ *                                               but which root applies could
+ *                                               not be resolved — deny
  *
- * A pure-fs probe runs first: with no `.planning/config.json` in `cwd` or any
- * ancestor, nothing is built and git is never run, and the dispatch is not a
- * GSD project's — the pre-#4885 answer for every such cwd. `cwd` itself
- * holding one is its own root, as before #4885. Otherwise the root is the one
- * gsd-tools writes the sentinel to (`resolveProjectRootOrThrow`) when that
- * root holds `.planning/config.json` — a linked worktree's own project, or
- * its main checkout's; a failure there, or a git timeout, is unresolved. When
- * that root holds no config, the nearest project above `cwd` governs: the
- * resolver stopped short of it (its ten-ancestor bound, a nested repository)
- * or stopped at an entry that is not a project (a `.planning/` with no
- * config, which a branch can commit) — and a directory inside a project is
- * never an inert "not a project" to the guard.
+ * A pure-fs probe runs first — the lexical path, then (only when that finds
+ * nothing, so a `.planning` symlink to an external store keeps its #4815
+ * lexical meaning) the canonical one, so a symlinked alias into a project is
+ * still seen. With no `.planning/config.json` at or above either, nothing is
+ * built, git never runs, and the dispatch is not a GSD project's — the
+ * pre-#4885 answer. `cwd` itself holding one is its own root, as before.
+ *
+ * Otherwise `sentinelRoot` is ALWAYS the root gsd-tools writes the sentinel
+ * under (`resolveProjectRootOrThrow`), so a recorded decision is read where it
+ * was recorded; a failure there, or a git timeout, is unresolved. The CONFIG
+ * comes from that same root when it holds one. When it does not, the resolver
+ * either stopped at a `.planning/` with no config (which a branch can commit)
+ * or ran out of its ancestor bound — in both cases the nearest project above
+ * governs. Any other "no project" from the resolver is its deliberate
+ * boundary (an independent nested repository, #2843; `$HOME`) and stands.
  */
 function resolveGuardProject(cwd) {
-  const anchor = nearestProjectConfigDir(cwd);
-  if (anchor === null) return { project: false };
-  if (anchor === path.resolve(cwd)) return { project: true, root: cwd };
+  let base = path.resolve(cwd);
+  let anchor = nearestProjectConfigDir(base);
+  if (anchor === null) {
+    try {
+      base = fs.realpathSync.native(cwd);
+    } catch {
+      return { project: false };
+    }
+    anchor = nearestProjectConfigDir(base);
+    if (anchor === null) return { project: false };
+  }
+  if (anchor === base) return { project: true, root: cwd, sentinelRoot: cwd };
   let resolved;
   try {
     resolved = resolveProjectRootOrThrow(cwd);
@@ -226,10 +240,23 @@ function resolveGuardProject(cwd) {
       error: new Error(`git timed out resolving which checkout '${cwd}' belongs to.`),
     };
   }
-  if (fs.existsSync(path.join(resolved.root, '.planning', 'config.json'))) {
-    return { project: true, root: resolved.root };
+  const sentinelRoot = resolved.root;
+  if (fs.existsSync(path.join(sentinelRoot, '.planning', 'config.json'))) {
+    return { project: true, root: sentinelRoot, sentinelRoot };
   }
-  return { project: true, root: anchor };
+  const levels = path.relative(anchor, base).split(path.sep).length;
+  const shadowed = isDirectory(path.join(sentinelRoot, '.planning'));
+  if (shadowed || levels > (resolved.maxDepth ?? 10)) return { project: true, root: anchor, sentinelRoot };
+  return { project: false };
+}
+
+/** Whether `p` is a directory (through a symlink, as findProjectRoot's check is). */
+function isDirectory(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /**

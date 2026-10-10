@@ -537,7 +537,8 @@ function evaluateRootIsolation(root, subagentType, { clock = Date, dispatchIds =
   // Hoisted (readSentinel never throws) so the "present, fresh, but did not
   // apply" case (#4594 row 15) can be reported on every deny path below
   // instead of silently discarded.
-  const sentinel = readSentinel(projectRoot, { clock });
+  // #4885: the sentinel is read where gsd-tools writes it (resolveGuardProject).
+  const sentinel = readSentinel(project.sentinelRoot, { clock });
   const applies = sentinelAppliesToDispatch(sentinel, dispatchIds);
   const sentinelDiscarded = buildSentinelDiscard(sentinel, dispatchIds);
 

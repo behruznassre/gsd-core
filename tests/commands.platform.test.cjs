@@ -36,6 +36,7 @@
  * - "a revert in progress still reports nothing_to_commit, not the hook rejection" — runs a real executable pre-commit hook installed with a POSIX mode bit (chmod-mode-bit)
  * - "a --cwd that is a symlink from main into the worktree still commits in the worktree" — creates a real directory symlink/junction from the main checkout into a linked worktree (symlink-keyword)
  * - "the root comes back in the cwd's own spelling when it names the same directory" — creates a real directory symlink/junction to a linked worktree (symlink-keyword)
+ * - "a symlinked alias into a linked worktree is still a project to the isolation guards" — creates a real directory symlink/junction into a linked worktree (symlink-keyword)
  */
 
 const { test, describe, after, beforeEach, afterEach } = require('node:test');
@@ -977,5 +978,24 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     assert.equal(ownWorktreePlanningRoot(viaLink).root, link);
     assert.equal(resolveMainWorktreeCwd(viaLink), link);
     assert.equal(ownWorktreePlanningRoot(sub).root, path.resolve(wt), 'an unlinked cwd keeps its spelling too');
+  });
+
+  // Codex review: an alias whose lexical ancestors hold no project was
+  // "not a project" to the guards' pure-fs probe; the canonical path is probed
+  // when the lexical one finds nothing.
+  test('a symlinked alias into a linked worktree is still a project to the isolation guards', () => {
+    const { resolveGuardProject } = require('../hooks/lib/isolation-sentinel.js');
+    const { resolveMainWorktreeCwd } = require('../gsd-core/bin/gsd-tools.cjs');
+    const { wt, sub } = mainWithWorktree();
+    fs.writeFileSync(path.join(wt, '.planning', 'config.json'), '{}');
+    const aliasParent = createTempDir('gsd-4885-alias-');
+    dirs.push(aliasParent);
+    const alias = path.join(aliasParent, 'alias');
+    fs.symlinkSync(sub, alias, 'junction');
+    const verdict = resolveGuardProject(alias);
+    assert.equal(verdict.project, true, JSON.stringify(verdict));
+    assert.equal(fs.realpathSync(verdict.root), fs.realpathSync(wt));
+    assert.equal(fs.realpathSync(verdict.sentinelRoot), fs.realpathSync(resolveMainWorktreeCwd(alias)),
+      'the sentinel is read where gsd-tools writes it from the same cwd');
   });
 });

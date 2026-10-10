@@ -204,7 +204,7 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
   test('cwd holding .planning/config.json is its own root, with nothing built or run', (t) => {
     const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
     const { root } = projectTree(t, 0);
-    assert.deepEqual(resolveGuardProject(root), { project: true, root });
+    assert.deepEqual(resolveGuardProject(root), { project: true, root, sentinelRoot: root });
     assert.deepEqual(calls, { build: 0, worktree: 0, projectRoot: 0 });
   });
 
@@ -246,24 +246,33 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
   test('a resolved root holding the config is the project root', (t) => {
     const { root, sub } = projectTree(t, 3);
     const { resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: () => root });
-    assert.deepEqual(resolveGuardProject(sub), { project: true, root });
+    assert.deepEqual(resolveGuardProject(sub), { project: true, root, sentinelRoot: root });
   });
 
-  // Majors 3 and 4: when the resolved root holds no config — findProjectRoot
-  // stopped at its ten-ancestor bound or a nested repository, or the resolver
-  // stopped at a `.planning/` with no config (which a branch can commit) — the
-  // nearest project above cwd governs, never an inert "not a project".
-  test('Majors 3/4: a resolved root holding no config falls to the nearest project above cwd', (t) => {
-    const { root, sub } = projectTree(t, 11);
-    const { resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
-    assert.deepEqual(resolveGuardProject(sub), { project: true, root });
-  });
+  // When the resolved root holds no config, the CONFIG falls to the nearest
+  // project above only where the resolver merely ran out (its ten-ancestor
+  // bound: Major 3) or stopped at a `.planning/` with no config (Major 4). The
+  // SENTINEL is still read where gsd-tools writes it (Codex review). Any other
+  // "no project" is the resolver's deliberate boundary and stands (#2843).
+  for (const [depth, governed] of [[10, false], [11, true]]) {
+    test(`resolver finds nothing ${depth} levels below the project -> ${governed ? 'the project above governs; sentinel stays at the writer root' : 'its answer stands (within its bound)'}`, (t) => {
+      const { root, sub } = projectTree(t, depth);
+      const { resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+      assert.deepEqual(resolveGuardProject(sub), governed ? { project: true, root, sentinelRoot: sub } : { project: false });
+    });
+  }
 
-  test('Major 4: a resolved root that is a .planning/ with no config does not shadow the project above', (t) => {
+  test('Major 4: a resolved root that is a .planning/ with no config defers config to the project above, sentinel stays there', (t) => {
     const { root, sub } = projectTree(t, 3);
     const shadow = path.join(root, 'a');
     fs.mkdirSync(path.join(shadow, '.planning'));
     const { resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: () => shadow });
-    assert.deepEqual(resolveGuardProject(sub), { project: true, root });
+    assert.deepEqual(resolveGuardProject(sub), { project: true, root, sentinelRoot: shadow });
+  });
+
+  test('#2843: an independent nested repository the resolver keeps separate is not the parent project\'s', (t) => {
+    const { sub } = projectTree(t, 3);
+    const { resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+    assert.deepEqual(resolveGuardProject(sub), { project: false });
   });
 });

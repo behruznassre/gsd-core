@@ -2085,6 +2085,49 @@ describe('gsd-agent-isolation-guard.js: #4885 review (2026-10-10) — subdirecto
     });
   }
 
+  // Codex review: the SENTINEL is read where gsd-tools writes it, even when the
+  // config falls to the project above. Conflicting decisions at the two
+  // locations: the writer-side one wins, both ways.
+  test('12 levels down: a sentinel at the writer root (the deep cwd) is honored, one at the project above is not', (t) => {
+    const project = mkProject('gsd-aig-4885r-sent-');
+    t.after(() => cleanup(project));
+    writeConfig(project, JSON.stringify({ runtime: 'claude' }));
+    const deep = path.join(project, ...'abcdefghijkl'.split(''));
+    fs.mkdirSync(deep, { recursive: true });
+    writeSentinel(project, { isolation: 'none' });
+    assert.equal(block(runHook(agentPayload({ cwd: deep }), deep)).reason_code, REASON_CODE.HARNESS_FLAG_MISSING,
+      'a decision recorded at the project above is not the one this cwd\'s writer records');
+    writeSentinel(deep, { isolation: 'none' });
+    const r = runHook(agentPayload({ cwd: deep }), deep);
+    assert.equal(r.status, 0, `the writer-side sentinel must be read; stdout: ${r.stdout}`);
+  });
+
+  test('a config-less .planning/ the writer roots at: its sentinel is honored while the config falls to the project above', (t) => {
+    const { wt } = repoWithWorktree(t);
+    const pkg = path.join(wt, 'package');
+    fs.mkdirSync(path.join(pkg, '.planning'), { recursive: true });
+    const sub = path.join(pkg, 'src');
+    fs.mkdirSync(sub);
+    assert.equal(block(runHook(agentPayload({ cwd: sub }), sub)).reason_code, REASON_CODE.HARNESS_FLAG_MISSING);
+    writeSentinel(pkg, { isolation: 'none' });
+    const r = runHook(agentPayload({ cwd: sub }), sub);
+    assert.equal(r.status, 0, `stdout: ${r.stdout}`);
+  });
+
+  // Codex review / #2843: an independent repository nested in a project, with
+  // no .planning of its own, is not that project's — base allowed it, and so
+  // does the guard (findProjectRoot's boundary stands).
+  test('an independent git repository nested inside a harness-worktree project -> ALLOW', (t) => {
+    const project = mkProject('gsd-aig-4885r-nested-');
+    t.after(() => cleanup(project));
+    writeConfig(project, JSON.stringify({ runtime: 'claude' }));
+    const child = path.join(project, 'vendor', 'child');
+    fs.mkdirSync(child, { recursive: true });
+    git(['init', '-q'], child);
+    const r = runHook(agentPayload({ cwd: child }), child);
+    assert.equal(r.status, 0, `stdout: ${r.stdout} stderr: ${r.stderr}`);
+  });
+
   // Minor 4: the guard driven from a subdirectory of a real LINKED worktree.
   test('linked worktree with its own .planning/: a subdirectory dispatch reads THAT worktree\'s sentinel', (t) => {
     const { main, wt } = repoWithWorktree(t);

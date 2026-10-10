@@ -434,7 +434,8 @@ function resolveIsolationState(cwd, { clock = Date, dispatchIds = null } = {}) {
     return { gsdProject: false, isolation: null, harnessFlag: null, error: null, sentinelDiscarded: null, root: null };
   }
 
-  const sentinel = readSentinel(root, { clock });
+  // #4885: the sentinel is read where gsd-tools writes it (resolveGuardProject).
+  const sentinel = readSentinel(project.sentinelRoot, { clock });
   // Hoisted so the "sentinel was present/fresh but did not apply" case below
   // (#4594 row 15 — Postel's-Law finding) can distinguish itself from
   // "absent"/"stale" without re-deriving applicability.
