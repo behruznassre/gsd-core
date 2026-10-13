@@ -103,9 +103,23 @@
 //   edit of `.env` lands in the link target — a write redirection, the
 //   out-of-scope write class, not a read.)
 //
+// A second, unrelated contract is enforced on the Bash leg because this is the
+// one hook that already parses EVERY Bash command (#5214): a Bash command that
+// launches the debugger as a CLI process — `claude … --agent gsd-debugger` — is
+// denied (`debugger-cli-spawn`). The debug session manager is required to spawn
+// gsd-debugger with `Agent(run_in_background=false)` so it can read the
+// debugger's structured return; on a captured 1.15.0 run it routed around that
+// literal and shelled out with the Bash parameter `run_in_background: true`,
+// so no return ever came back and the checkpoint never advanced. Prose in the
+// agent file cannot stop an improvised tool call; a PreToolUse denial can, and
+// Claude Code runs plugin hooks for a subagent's tool calls too. A person
+// running `claude --agent gsd-debugger` in their own terminal never reaches
+// this hook. Only the debugger is named: it is the agent whose blocking return
+// the managed debug loop depends on.
+//
 // Triggers on: Read, Grep, Bash tool calls (Kimi: ReadFile, Grep, Shell)
 // Action: BLOCK (decision: 'block', exit 2) — codes secret-read |
-//         glob-too-complex | command-too-large
+//         glob-too-complex | command-too-large | debugger-cli-spawn
 // No-op: other tools, non-secret targets, hook errors (fail open — a parser
 //        bug in a hook that runs on EVERY Bash call must never brick a
 //        session; the crash policy is declared once below).
@@ -1004,6 +1018,100 @@ function findSecretRead(command, depth) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// gsd-debugger CLI spawn scan (#5214)
+// ---------------------------------------------------------------------------
+
+const DEBUGGER_AGENT_NAME = 'gsd-debugger';
+const CLAUDE_BINARY_RE = /^claude(\.exe)?$/;
+
+// `gsd-debugger`, or a plugin-namespaced `<plugin>:gsd-debugger`.
+function isDebuggerAgent(value) {
+  return value.slice(value.lastIndexOf(':') + 1) === DEBUGGER_AGENT_NAME;
+}
+
+// `timeout [flags] DURATION cmd …` is not in CMD_PREFIXES because its first
+// operand is a duration, not the command. Returns the command that follows it.
+function unwrapTimeout(cmd) {
+  let { base, operands } = cmd;
+  while (base === 'timeout') {
+    let k = 0;
+    while (k < operands.length && operands[k].text.startsWith('-')) k++;
+    k++; // the DURATION operand
+    const rest = resolveCommand(operands.slice(k));
+    if (!rest) return null;
+    ({ base, operands } = rest);
+  }
+  return { base, operands };
+}
+
+// Returns the `--agent` value text of a debugger launch, or null.
+function findDebuggerCliSpawn(command, depth) {
+  const { tokens, nested } = tokenize(command);
+
+  for (const sub of nested) {
+    if (depth < MAX_NESTING_DEPTH) {
+      const hit = findDebuggerCliSpawn(sub, depth + 1);
+      if (hit) return hit;
+    }
+  }
+
+  const bySeg = new Map();
+  for (const t of tokens) {
+    if (t.kind !== 'word' && t.kind !== 'op') continue;
+    if (!bySeg.has(t.seg)) bySeg.set(t.seg, []);
+    bySeg.get(t.seg).push(t);
+  }
+
+  for (const segTokens of bySeg.values()) {
+    const words = [];
+    for (let k = 0; k < segTokens.length; k++) {
+      const t = segTokens[k];
+      if (t.kind === 'op') {
+        // A redirect consumes its target word; it is never the command.
+        if (!t.dup && segTokens[k + 1] && segTokens[k + 1].kind === 'word') k++;
+        continue;
+      }
+      words.push(t);
+    }
+    if (!words.length) continue;
+
+    const first = resolveCommand(words);
+    const cmd = first && unwrapTimeout(first);
+    if (!cmd) continue;
+    const { base, operands } = cmd;
+
+    if (base === 'eval') {
+      if (depth < MAX_NESTING_DEPTH) {
+        const hit = findDebuggerCliSpawn(operands.map((w) => w.text).join(' '), depth + 1);
+        if (hit) return hit;
+      }
+      continue;
+    }
+
+    if (SHELL_INTERPRETERS.has(base)) {
+      const cIdx = operands.findIndex((w) => DASH_C_RE.test(w.text));
+      if (cIdx !== -1 && operands[cIdx + 1] && depth < MAX_NESTING_DEPTH) {
+        const hit = findDebuggerCliSpawn(operands[cIdx + 1].text, depth + 1);
+        if (hit) return hit;
+      }
+      continue;
+    }
+
+    if (!CLAUDE_BINARY_RE.test(base)) continue;
+    for (let k = 0; k < operands.length; k++) {
+      const text = operands[k].text;
+      if (text === '--agent') {
+        const value = operands[k + 1];
+        if (value && isDebuggerAgent(value.text)) return value.text;
+      } else if (text.startsWith('--agent=') && isDebuggerAgent(text.slice('--agent='.length))) {
+        return text.slice('--agent='.length);
+      }
+    }
+  }
+  return null;
+}
+
 // A shell interpreter's script comes from `-c`, a file operand, or stdin.
 function scanShellInterpreter(operands, heredocs, hereStrings, s, bySeg, sepAfter, depth) {
   const cIdx = operands.findIndex((w) => DASH_C_RE.test(w.text));
@@ -1101,6 +1209,12 @@ function reasonFor(code, tool, target) {
   if (code === 'glob-too-complex') {
     return `Secret read guard: the Grep glob '${target}' expands to more than ${MAX_GLOB_ALTERNATIVES} ` +
       'alternatives and cannot be checked for secret-file matches. Use a narrower glob.';
+  }
+  if (code === 'debugger-cli-spawn') {
+    return `Debugger spawn guard: this Bash command launches the debugger as a CLI process ('--agent ${target}'). ` +
+      'A shell-spawned debugger runs detached, returns no structured result, and the debug checkpoint never advances. ' +
+      'Spawn it with the Agent tool instead: Agent(subagent_type="gsd-debugger", run_in_background=false, ...) ' +
+      'and wait for its structured return.';
   }
   return `Secret read guard: ${tool} would read '${target}', which matches a protected secret-file ` +
     `pattern (${PATTERN_TEXT}). Secret values must not be read into the conversation. ` +
@@ -1253,6 +1367,8 @@ process.stdin.on('end', () => {
     if (command.length > MAX_COMMAND_LENGTH) emitBlock('command-too-large', tool, '');
     const hit = findSecretRead(command, 0);
     if (hit !== null) emitBlock('secret-read', tool, hit);
+    const spawn = findDebuggerCliSpawn(command, 0);
+    if (spawn !== null) emitBlock('debugger-cli-spawn', tool, spawn);
     allow(undefined);
   } catch {
     // Fail open — never block valid tool calls due to hook errors.
