@@ -804,3 +804,81 @@ describe('gsd-secret-read-guard: name-only git pathspecs and copy destinations (
     }), PROPERTY_RUNS);
   });
 });
+
+// #5214: the debug session manager is told to spawn gsd-debugger with
+// Agent(run_in_background=false), but on a real 1.15.0 run it routed around that
+// literal and shelled out to `claude --agent gsd-debugger` through Bash with
+// run_in_background:true, so the checkpoint never advanced. The spawn contract
+// cannot be enforced by prose; this Bash hook is the only deterministic seam that
+// sees the call. The three commands below are the ones the reporter captured.
+describe('gsd-secret-read-guard: gsd-debugger CLI spawn (#5214)', () => {
+  const DEBUGGER_BLOCKS = [
+    ['captured spawn 1 (prompt file, exit echo)',
+      'claude -p "$(cat /tmp/gsd-debug-main-app-audio-silent-prompt.md)" --agent gsd-debugger --model opus --permission-mode bypassPermissions --no-session-persistence > /tmp/run1.out 2>/tmp/run1.err; echo "exit=$?"'],
+    ['captured spawn 2 (heredoc prompt)',
+      "claude -p --agent gsd-debugger --model opus --permission-mode bypassPermissions --no-session-persistence --output-format text > /tmp/run1.out 2>&1 <<'PROMPT'\n<resume_directive>\ncontinue the investigation\n</resume_directive>\nPROMPT"],
+    ['captured spawn 3 (flags before the agent)',
+      'claude --agent gsd-debugger --model opus -p "$(cat /tmp/gsd-dbg-iter1.md)" --output-format text --dangerously-skip-permissions > /tmp/i1.out 2> /tmp/i1.err; echo "exit=$?"'],
+    ['--agent=VALUE form', 'claude -p hi --agent=gsd-debugger'],
+    ['quoted agent value', 'claude --agent "gsd-debugger" -p hi'],
+    ['single-quoted agent value', "claude --agent 'gsd-debugger' -p hi"],
+    ['plugin-namespaced agent name', 'claude --agent gsd:gsd-debugger -p hi'],
+    ['absolute path to the binary', '/usr/local/bin/claude --agent gsd-debugger -p hi'],
+    ['claude.exe', 'claude.exe --agent gsd-debugger -p hi'],
+    ['behind timeout', 'timeout 600 claude --agent gsd-debugger -p hi'],
+    ['behind nohup and env assignments', 'nohup env FOO=1 claude --agent gsd-debugger -p hi &'],
+    ['second command of a compound', 'cd /tmp && claude --agent gsd-debugger -p hi'],
+    ['inside $( )', 'out=$(claude --agent gsd-debugger -p hi); echo "$out"'],
+    ['inside bash -c', "bash -c 'claude --agent gsd-debugger -p hi'"],
+    ['inside eval', 'eval "claude --agent gsd-debugger -p hi"'],
+    ['piped', 'echo go | claude --agent gsd-debugger -p'],
+  ];
+
+  for (const [label, command] of DEBUGGER_BLOCKS) {
+    test(`blocks: ${label}`, () => {
+      assertBlocked(runHook(bash(command)), label, { code: 'debugger-cli-spawn', tool: 'Bash' });
+    });
+  }
+
+  const DEBUGGER_ALLOWS = [
+    ['another agent', 'claude --agent gsd-executor -p hi'],
+    ['no agent flag', 'claude -p "summarize this"'],
+    ['a version probe', 'claude --version'],
+    ['an agent that only starts with the name', 'claude --agent gsd-debugger-extra -p hi'],
+    ['the name in a quoted echo argument', 'echo "claude --agent gsd-debugger"'],
+    ['the name in a commit message', 'git commit -m "docs: never run claude --agent gsd-debugger from Bash"'],
+    ['searching for the text', 'grep -rn "agent gsd-debugger" agents/'],
+    ['reading the agent file', 'cat agents/gsd-debugger.md'],
+    ['the name in a heredoc body', "cat <<'EOF'\nclaude --agent gsd-debugger\nEOF"],
+    ['a different binary that ends in claude', 'myclaude --agent gsd-debugger -p hi'],
+    ['the gsd-tools model lookup the manager really runs', 'gsd_run query resolve-model gsd-debugger'],
+  ];
+
+  for (const [label, command] of DEBUGGER_ALLOWS) {
+    test(`allows: ${label}`, () => {
+      assertAllowed(runHook(bash(command)), label);
+    });
+  }
+
+  test('the Kimi Shell vocabulary is covered too', () => {
+    assertBlocked(
+      runHook({ hook_event_name: 'PreToolUse', tool_name: 'Shell', tool_input: { command: 'claude --agent gsd-debugger -p hi' } }),
+      'kimi shell',
+      { code: 'debugger-cli-spawn', tool: 'Bash' },
+    );
+  });
+
+  test('the denial names the Agent tool and the foreground flag so the model can recover', () => {
+    const out = assertBlocked(runHook(bash('claude --agent gsd-debugger -p hi')), 'reason', { code: 'debugger-cli-spawn' });
+    assert.match(out.reason, /Agent/);
+    assert.match(out.reason, /run_in_background/);
+  });
+
+  test('a secret read in the same command still reports the secret code', () => {
+    assertBlocked(runHook(bash('cat .env && claude --agent gsd-debugger -p hi')), 'both', { code: 'secret-read' });
+  });
+
+  test('a non-Bash tool with the same text is never inspected', () => {
+    assertAllowed(runHook({ hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: 'notes-claude-agent-gsd-debugger.md' } }), 'read');
+  });
+});
