@@ -431,7 +431,13 @@ export function editedLineContinuation(before: string, after: string): string | 
   const lineEnd = before.indexOf('\n', lineStart);
   // The edited line only: trimming the rest of the document would let a blank
   // edited line borrow a later table row's pipe.
-  if (before.slice(lineStart, lineEnd === -1 ? before.length : lineEnd).trimStart().startsWith('|')) return null;
+  const line = before.slice(lineStart, lineEnd === -1 ? before.length : lineEnd).replace(/\r$/, '');
+  if (line.trimStart().startsWith('|')) return null;
+  // A line break INSIDE the edited line (a bare CR, U+2028, U+2029) already
+  // wraps the value for the `m`-flag readers, which stop there: the text after
+  // it is a continuation, exactly as a following LF line is (Codex review round 3).
+  const inner = line.search(FIELD_LINE_BREAK_RE);
+  if (inner !== -1) return line.slice(inner + 1).split(FIELD_LINE_BREAK_RE).map((part) => part.trim()).join(' ').trim();
   return lineEnd === -1 ? null : continuationAfter(before, lineEnd);
 }
 
@@ -456,52 +462,68 @@ export function readableEditedBoldLabel(before: string, after: string): string {
 }
 
 /**
- * #4998: `scanFencedBlocks` over the Markdown of `lines` only. A closed
- * frontmatter block is YAML, where a ``` line is data (a block scalar), not a
- * fence; its lines are blanked for the scan, so they are never fenced and
- * never open a fence that shifts every boundary after them (Codex review).
- * Line indices are those of `lines`.
+ * #4998: which text a fence helper is given. `document`: a whole STATE.md,
+ * which may open with a frontmatter block. Otherwise a section or body, where
+ * a leading `---` is a Markdown horizontal rule, never frontmatter (Codex
+ * review round 3: a session body opening with two rules was read as YAML).
  */
-export function markdownFencedBlocks(lines: string[]): ReturnType<typeof scanFencedBlocks> {
-  const last = lastFrontmatterLine(lines);
-  return last === -1 ? scanFencedBlocks(lines) : scanFencedBlocks(lines.map((line, i) => (i <= last ? '' : line)));
+export interface FenceScope {
+  document?: boolean;
 }
 
-/** Index of the closing `---` of a closed frontmatter block at the top of `lines`, or -1. */
-function lastFrontmatterLine(lines: string[]): number {
+/**
+ * Index of the closing `---` of a closed frontmatter block at the top of a
+ * whole document, or -1 (always -1 outside `document` scope).
+ */
+function lastFrontmatterLine(lines: string[], scope: FenceScope): number {
+  if (!scope.document) return -1;
   const text = lines.join('\n');
   const fm = locateFrontmatterFence(text);
   return fm && fm.closed ? text.slice(0, fm.closingStart).split('\n').length - 1 : -1;
 }
 
-/** A line every Markdown fence scanner here reads as a fence delimiter (`scanFencedBlocks`' shape). */
-const FENCE_DELIMITER_LINE_RE = /^ {0,3}(?:`{3,}|~{3,})/;
-
-/** Per line of `lines`: whether it belongs to a fenced block (`markdownFencedBlocks`), delimiters included. */
-function fencedLineFlags(lines: string[]): boolean[] {
-  const fenced = lines.map(() => false);
-  for (const block of markdownFencedBlocks(lines)) {
-    const end = block.closeLineIdx === -1 ? lines.length - 1 : block.closeLineIdx;
-    for (let i = block.openLineIdx; i <= end; i++) fenced[i] = true;
-  }
-  return fenced;
+/**
+ * #4998: `scanFencedBlocks` over the Markdown of `lines` only. In a whole
+ * document the frontmatter block is YAML, where a ``` line is data (a block
+ * scalar), not a fence; its lines are blanked for the scan, so they never open
+ * a fence that shifts every boundary after them (Codex review). Line indices
+ * are those of `lines`.
+ */
+export function markdownFencedBlocks(lines: string[], scope: FenceScope = {}): ReturnType<typeof scanFencedBlocks> {
+  const last = lastFrontmatterLine(lines, scope);
+  return last === -1 ? scanFencedBlocks(lines) : scanFencedBlocks(lines.map((line, i) => (i <= last ? '' : line)));
 }
 
 /**
- * #4998: `content` with every fenced line (`markdownFencedBlocks`) blanked to
- * spaces — same length, same line terminators — for reading a field the way
- * `writeOutsideFences` writes it: an example line in a fence is not a field.
- * A frontmatter line shaped like a fence delimiter (a ``` in a YAML block
- * scalar) is blanked too, so a scanner that does not know frontmatter — the
- * heading tokenizer behind `collectSection`, `parsePlanningDoc` — reading the
- * masked text sees no fence there either (Codex review round 2).
+ * Per line of `lines`: whether a field reader or writer must not see it — a
+ * fenced block's line (delimiters included) or, in a whole document, a line
+ * of frontmatter between its `---` delimiters (YAML data that a Markdown
+ * scanner would otherwise read as a heading, a fence or a field).
  */
-export function maskFencedLines(content: string): string {
+function maskedLineFlags(lines: string[], scope: FenceScope): boolean[] {
+  const masked = lines.map(() => false);
+  for (const block of markdownFencedBlocks(lines, scope)) {
+    const end = block.closeLineIdx === -1 ? lines.length - 1 : block.closeLineIdx;
+    for (let i = block.openLineIdx; i <= end; i++) masked[i] = true;
+  }
+  const last = lastFrontmatterLine(lines, scope);
+  for (let i = 1; i < last; i++) masked[i] = true;
+  return masked;
+}
+
+/**
+ * #4998: `content` with every fenced line blanked to spaces — same length,
+ * same line terminators — for reading a field the way `writeOutsideFences`
+ * writes it: an example line in a fence is not a field. With
+ * `{ document: true }` the frontmatter's content lines are blanked too (its
+ * `---` delimiters kept), so scanners that do not know frontmatter — the
+ * heading tokenizer behind `collectSection`, `parsePlanningDoc` — see only
+ * the Markdown body (Codex review rounds 2 and 3).
+ */
+export function maskFencedLines(content: string, scope: FenceScope = {}): string {
   const lines = content.split('\n');
-  const fenced = fencedLineFlags(lines);
-  const last = lastFrontmatterLine(lines);
-  const masked = (line: string, i: number): boolean => fenced[i] || (i <= last && FENCE_DELIMITER_LINE_RE.test(line));
-  return lines.map((line, i) => (masked(line, i) ? line.replace(/[^\r]/g, ' ') : line)).join('\n');
+  const masked = maskedLineFlags(lines, scope);
+  return lines.map((line, i) => (masked[i] ? line.replace(/[^\r]/g, ' ') : line)).join('\n');
 }
 
 /**
@@ -516,8 +538,12 @@ export function maskFencedLines(content: string): string {
  * the line structure) — the stateReplaceField no-match contract, never a
  * partial write.
  */
-export function writeOutsideFences(content: string, write: (masked: string) => string | null): string | null {
-  const masked = maskFencedLines(content);
+export function writeOutsideFences(
+  content: string,
+  write: (masked: string) => string | null,
+  scope: FenceScope = {},
+): string | null {
+  const masked = maskFencedLines(content, scope);
   if (masked === content) return write(content);
   const result = write(masked);
   if (result === null) return null;
@@ -531,10 +557,10 @@ export function writeOutsideFences(content: string, write: (masked: string) => s
   // touched a fenced line cannot be carried back, even when the masked and
   // real bytes there happen to agree (a whitespace-only fenced line).
   const lineOf = (offset: number): number => content.slice(0, offset).split('\n').length - 1;
-  const fenced = fencedLineFlags(content.split('\n'));
+  const fenced = maskedLineFlags(content.split('\n'), scope);
   for (let line = lineOf(p); line <= lineOf(content.length - s); line++) if (fenced[line]) return null;
   const spliced = content.slice(0, p) + result.slice(p, result.length - s) + content.slice(content.length - s);
-  return maskFencedLines(spliced) === result ? spliced : null;
+  return maskFencedLines(spliced, scope) === result ? spliced : null;
 }
 
 /**
@@ -601,7 +627,7 @@ export interface SessionFieldInsert {
  */
 export function insertMissingSessionFields(body: string, fields: readonly SessionFieldInsert[]): string {
   const lines = body.split('\n');
-  const fenced = fencedLineFlags(lines);
+  const fenced = maskedLineFlags(lines, {});
   const cr = body.includes('\r\n') ? '\r' : '';
   // The spellings stateReplaceField writes: `**Label:**`, `**Label**:`, `Label:`.
   const lineOf = (label: string): number => {

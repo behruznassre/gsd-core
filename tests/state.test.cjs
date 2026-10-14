@@ -22523,6 +22523,69 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.match(live, /\nLast session: /);
   });
 
+  // #4998 Codex review round 3 (user-approved final round), each reproduced first.
+  // (1) Frontmatter is data in a whole document, never Markdown: an indented
+  // `## Session` inside a YAML block scalar took record-session's insert.
+  test('a ## Session line inside a frontmatter block scalar never takes the insert', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', 'stopped_at: previous handoff', 'notes: |',
+      '  ## Session', '  Last session: sample', '  Resume file: sample.md', '---', '', '# Project State', '',
+      '## Session', '', 'Last session: 2026-01-01', 'Resume file: live.md', ''].join('\n'));
+    const { json } = recordSession('--stopped-at', 'new handoff');
+    assert.notStrictEqual(json.recorded, false, JSON.stringify(json));
+    const state = readState();
+    const frontmatter = state.slice(0, state.indexOf('# Project State'));
+    assert.ok(frontmatter.includes('sample.md'), `frontmatter data lost:\n${state}`);
+    assert.ok(!frontmatter.includes('new handoff\n  ') && !/^Stopped at:/m.test(frontmatter), state);
+    assert.match(session(), /\nStopped at: new handoff\n/);
+  });
+
+  // (2) Frontmatter exists only at the top of a DOCUMENT: a section body that
+  // opens with `---` horizontal rules is Markdown, and a fence between them is
+  // still a fence for every session reader and writer.
+  const RULES_SESSION = ['---', 'status: executing', 'stopped_at: live', '---', '', '# State', '', '## Session', '---',
+    '```md', 'Stopped at: example', '```', '---', 'Last session: 2026-01-01', 'Stopped at: live', 'Resume file: live.md', ''];
+  for (const [label, args] of [
+    ['record-session', ['state', 'record-session', '--stopped-at', 'new handoff']],
+    ['update', ['state', 'update', 'Stopped At', 'new handoff']],
+    ['patch', ['state', 'patch', '--Stopped At', 'new handoff']],
+  ]) {
+    test(`a session section opening with --- rules: ${label} writes the live line, not the fenced example`, () => {
+      fs.writeFileSync(statePath(), RULES_SESSION.join('\n'));
+      const rec = runTool(...args);
+      assert.strictEqual(rec.exitCode, 0, rec.stderr);
+      const state = readState();
+      assert.ok(state.includes('```md\nStopped at: example\n```'), state);
+      assert.match(state, /\nStopped at: new handoff\n/);
+      assert.match(state, /^stopped_at: "?new handoff"?$/m, 'frontmatter follows the live line');
+    });
+  }
+
+  // ...and the live fields BETWEEN such rules stay visible: read as YAML they
+  // were masked away, and the write missed the live line.
+  for (const [label, args] of [
+    ['update', ['state', 'update', 'Stopped At', 'new handoff']],
+    ['patch', ['state', 'patch', '--Stopped At', 'new handoff']],
+  ]) {
+    test(`a session section whose live fields sit between --- rules: ${label} writes them`, () => {
+      fs.writeFileSync(statePath(), ['---', 'status: executing', 'stopped_at: live', '---', '', '# State', '', '## Session',
+        '---', 'Last session: 2026-01-01', 'Stopped at: live', '---', 'Resume file: live.md', ''].join('\n'));
+      const rec = runTool(...args);
+      assert.strictEqual(rec.exitCode, 0, rec.stderr);
+      const state = readState();
+      assert.match(state, /\n---\nLast session: 2026-01-01\nStopped at: new handoff\n---\n/, state);
+    });
+  }
+
+  // (3) A value already wrapped by a U+2028 is a wrapped value like an LF one:
+  // left whole and listed, not truncated at the separator.
+  test('a session field already wrapped by U+2028 is left whole and listed under skipped', () => {
+    const ls = String.fromCharCode(0x2028);
+    seed([], [`**Stopped at:** finished Phase 2${ls}waiting for approval`, 'Resume file: plan.md'], '## Session');
+    const { json } = recordSession('--stopped-at', 'new handoff');
+    assert.ok((json.skipped || []).some((x) => x.field === 'Stopped At' && x.reason === 'wrapped_value'), JSON.stringify(json));
+    assert.ok(readState().includes(`finished Phase 2${ls}waiting for approval`), readState());
+  });
+
   // Minor 4: `None` is the template placeholder, not a displaced record.
   for (const [where, fm, lines] of [
     ['frontmatter', ['stopped_at: None'], ['Last session: 2026-01-01']],

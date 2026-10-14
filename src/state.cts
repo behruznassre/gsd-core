@@ -2022,7 +2022,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     // the same unfenced text they write.
     // A `**Label**:` line the writer can replace is read too (readableBoldLabels).
     const capturePrior = (fieldName: string): string | undefined => {
-      const visible = readableBoldLabels(maskFencedLines(content));
+      const visible = readableBoldLabels(maskFencedLines(content, { document: true }));
       const first = stateExtractField(visible, fieldName);
       if (first === null) return undefined;
       const cont = stateFieldContinuation(visible, fieldName);
@@ -2039,14 +2039,14 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     // #4998: every in-place write skips fenced blocks, as the insertion
     // below does — a fenced example line is never the occurrence replaced.
     const replaceField = (fieldName: string, value: string): string | null =>
-      writeOutsideFences(content, (visible) => stateReplaceField(visible, fieldName, value));
+      writeOutsideFences(content, (visible) => stateReplaceField(visible, fieldName, value), { document: true });
     // The template check reads the field the way the writer finds it: an
     // authored `**Resume file**: plan.md` read as absent and was reset to None.
     const replaceFieldIfTemplate = (fieldName: string, defaults: string[], value: string): string => {
-      const current = stateExtractField(readableBoldLabels(maskFencedLines(content)), fieldName);
+      const current = stateExtractField(readableBoldLabels(maskFencedLines(content, { document: true })), fieldName);
       if (current !== null && current.trim() !== ''
           && !defaults.some((d) => d.toLowerCase() === current.trim().toLowerCase())) return content;
-      return writeOutsideFences(content, (visible) => stateReplaceFieldIfTemplate(visible, fieldName, defaults, value)) ?? content;
+      return writeOutsideFences(content, (visible) => stateReplaceFieldIfTemplate(visible, fieldName, defaults, value), { document: true }) ?? content;
     };
 
     // Update Last session / Last Date
@@ -2140,7 +2140,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // `## Session Continuity`. Treat each separately so we never append a
       // duplicate section alongside an existing one.
       // #4998: a heading inside a fenced example is not a section.
-      const headingScan = maskFencedLines(content);
+      const headingScan = maskFencedLines(content, { document: true });
       const existingCanonicalSession = /^## Session[ \t]*$/im.test(headingScan);
       const existingSessionContinuity = /^## Session Continuity[ \t]*$/im.test(headingScan);
 
@@ -2166,10 +2166,10 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // `## Session` example is not the section, and a ``` in a frontmatter
       // block scalar does not hide the real one (Codex review round 2).
       const insertIntoSection = (isTarget: (h: HeadingToken) => boolean): void => {
-        let section = collectSection(maskFencedLines(content), isTarget, { levelBounded: true });
+        let section = collectSection(maskFencedLines(content, { document: true }), isTarget, { levelBounded: true });
         if (section && content[section.bodyStart - 1] !== '\n' && section.bodyStart >= content.length) {
           content += content.includes('\r\n') ? '\r\n' : '\n';
-          section = collectSection(maskFencedLines(content), isTarget, { levelBounded: true });
+          section = collectSection(maskFencedLines(content, { document: true }), isTarget, { levelBounded: true });
         }
         if (!section || content[section.bodyStart - 1] !== '\n') return;
         const body = insertMissingSessionFields(content.slice(section.bodyStart, section.bodyEnd), [
@@ -2244,7 +2244,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // Markdown), and `scanFencedBlocks` reports
         // an unclosed block only as its LAST record (the fence runs to EOF), so
         // `closeLineIdx === -1` here means exactly "the tail is inside a fence".
-        if (markdownFencedBlocks(content.split('\n')).some((b) => b.closeLineIdx === -1)) {
+        if (markdownFencedBlocks(content.split('\n'), { document: true }).some((b) => b.closeLineIdx === -1)) {
           for (const [label] of scaffoldFields) skippedFields.push({ field: label, reason: 'unclosed_fence' });
         } else {
           const scaffold = ['', '## Session', '', ...scaffoldLines, ''].join('\n');
