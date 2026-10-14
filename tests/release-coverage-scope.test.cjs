@@ -45,3 +45,40 @@ describe('release-coverage-scope', () => {
       'of rc-coverage-gate and finalize-coverage-gate); expected 2');
   });
 });
+
+describe('release-audit-baseline-pin', () => {
+  // The #3588/#4196 npm-audit gate runs inside the sharded unit suites. Unset,
+  // resolveBaselineRef() falls back to the live origin/next tip, which can move
+  // mid-run and flag an already-fixed advisory as "newly introduced" (release
+  // run 38549271057). Every raw-coverage shard step must pin it, as test.yml does.
+  test('every sharded unit-test step in release.yml pins AUDIT_BASELINE_REF', () => {
+    const lines = fs.readFileSync(RELEASE_WORKFLOW, 'utf8').split(/\r?\n/);
+    const runLines = lines.map((l, i) => (l.includes('npm run test:coverage:unit:raw -- --shard') ? i : -1))
+      .filter(i => i >= 0);
+    assert.strictEqual(runLines.length, 2, 'expected rc-test and finalize-test shard steps');
+    for (const i of runLines) {
+      // The step's env block sits within a few lines above its `run:` script.
+      const stepHead = lines.slice(Math.max(0, i - 12), i).join('\n');
+      assert.ok(stepHead.includes('AUDIT_BASELINE_REF: ${{ github.sha }}'),
+        `shard step at line ${i + 1} must pin AUDIT_BASELINE_REF to github.sha`);
+    }
+  });
+});
+
+describe('release-test-shard-timeout', () => {
+  // #5421: shard 1/3 of the sharded unit suites measured ~18.5m of tests plus
+  // the coverage upload; a 20m job cap cancelled it mid-upload (run
+  // 38609859394). Both *-test shard jobs must keep at least 30m of headroom.
+  test('rc-test and finalize-test shard jobs keep timeout-minutes >= 30', () => {
+    const lines = fs.readFileSync(RELEASE_WORKFLOW, 'utf8').split(/\r?\n/);
+    for (const job of ['rc-test', 'finalize-test']) {
+      const start = lines.findIndex(l => l === `  ${job}:`);
+      assert.ok(start >= 0, `${job} job not found`);
+      const end = lines.findIndex((l, i) => i > start && /^ {2}\S/.test(l));
+      const body = lines.slice(start, end < 0 ? undefined : end);
+      const m = body.map(l => /^ {4}timeout-minutes:\s*(\d+)\s*$/.exec(l)).find(Boolean);
+      assert.ok(m, `${job} must set timeout-minutes`);
+      assert.ok(Number(m[1]) >= 30, `${job} timeout-minutes must be >= 30 (was ${m[1]})`);
+    }
+  });
+});
