@@ -1142,6 +1142,68 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.strictEqual(fs.readFileSync(path.join(committed, 'file.txt'), 'utf8'), 'uncommitted edit\n');
   });
 
+  /** Run `fn` with `vars` set in process.env (undefined = unset), restoring every one after. */
+  function withEnv(vars, fn) {
+    const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+    for (const [k, v] of Object.entries(vars)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      return fn();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  /** A checkout tracking `<sub>.claude/worktrees/agent-notes/notes`, edited and uncommitted, with a harness branch. */
+  function trackedNotes(repoDir, sub = '') {
+    initRepo(repoDir);
+    const dir = path.join(repoDir, sub, '.claude', 'worktrees', 'agent-notes');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'notes'), 'committed\n');
+    git(['add', '-A'], repoDir);
+    git(['commit', '-m', 'track notes under .claude/worktrees'], repoDir);
+    git(['branch', 'worktree-agent-notes'], repoDir);
+    fs.writeFileSync(path.join(dir, 'notes'), 'uncommitted edit\n');
+    return dir;
+  }
+
+  // Codex review round 2: git told about ANOTHER repository (inherited
+  // GIT_DIR / GIT_WORK_TREE, or core.worktree) while the filesystem sweep
+  // stayed on this checkout, so the other repository's empty index and its
+  // branch removed this checkout's tracked work. The sweep now refuses unless
+  // the top's own `.git` leads to the git dir git is using.
+  test('an inherited GIT_DIR naming another repository sweeps nothing (git_mismatch)', () => {
+    const repoDir = path.join(tmpBase, 'repo-gitdir');
+    const notes = trackedNotes(repoDir);
+    const donor = path.join(tmpBase, 'donor');
+    initRepo(donor);
+    git(['branch', 'worktree-agent-notes'], donor);
+    const { results, scan } = withEnv({ GIT_DIR: path.join(donor, '.git'), GIT_WORK_TREE: undefined },
+      () => reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps()));
+    assert.ok(!results.some((r) => r.status === 'reaped'), JSON.stringify(results));
+    assert.strictEqual(scan.residue_dir, 'git_mismatch');
+    assert.strictEqual(fs.readFileSync(path.join(notes, 'notes'), 'utf8'), 'uncommitted edit\n');
+  });
+
+  for (const [label, how] of [['an inherited GIT_WORK_TREE', 'env'], ['core.worktree', 'config']]) {
+    test(`${label} naming a nested directory sweeps nothing (git_mismatch)`, () => {
+      const repoDir = path.join(tmpBase, `repo-wt-${how}`);
+      const notes = trackedNotes(repoDir, 'nested');
+      const nested = path.join(repoDir, 'nested');
+      if (how === 'config') git(['config', 'core.worktree', nested], repoDir);
+      const { results, scan } = withEnv({ GIT_DIR: undefined, GIT_WORK_TREE: how === 'env' ? nested : undefined },
+        () => reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps()));
+      assert.ok(!results.some((r) => r.status === 'reaped'), JSON.stringify(results));
+      assert.strictEqual(scan.residue_dir, 'git_mismatch');
+      assert.strictEqual(fs.readFileSync(path.join(notes, 'notes'), 'utf8'), 'uncommitted edit\n');
+    });
+  }
+
   test('when git cannot say what it tracks, nothing is removed (fail closed)', () => {
     const { repoDir, residue } = repoWithResidue('lsfail');
     const faultyGit = makeFaultyGit({ faults: [{ kind: 'exit', exitCode: 128, when: ['ls-files'] }], passthrough: realExecGit });

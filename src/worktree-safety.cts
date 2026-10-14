@@ -2536,10 +2536,12 @@ type AdminDirStatus = 'scanned' | 'absent' | 'unreadable' | 'git_dir_unresolved'
  * `residue_dir` (`.claude/worktrees/`): `scanned` | `absent` | `unreadable` |
  * `aliased` (`.claude` or `.claude/worktrees` is a symlink or junction) | `not_main_checkout`
  * (a linked worktree: the sweep runs from the main checkout) | `top_unresolved`
- * (git could not name the checkout top or common dir) | `not_scanned` (the
+ * (git could not name the checkout top or common dir) | `git_mismatch` (the
+ * top's own `.git` does not lead to the git dir git is using: an inherited
+ * GIT_DIR / GIT_WORK_TREE or a core.worktree) | `not_scanned` (the
  * git dir itself could not be resolved).
  */
-type ResidueDirStatus = 'scanned' | 'absent' | 'unreadable' | 'aliased' | 'not_main_checkout' | 'top_unresolved' | 'not_scanned';
+type ResidueDirStatus = 'scanned' | 'absent' | 'unreadable' | 'aliased' | 'not_main_checkout' | 'top_unresolved' | 'git_mismatch' | 'not_scanned';
 interface ReapScan {
   admin_dir: AdminDirStatus;
   residue_dir: ResidueDirStatus;
@@ -2848,6 +2850,15 @@ function findUnregisteredResidue(
   } catch {
     return { results, status: 'top_unresolved' };
   }
+  // Every later git answer (registrations, branches, index) must be about THIS
+  // checkout: an inherited GIT_DIR or GIT_WORK_TREE, or a core.worktree, can
+  // point git at another repository or work tree while the sweep stays here,
+  // and that repository's empty index then hides tracked work (Codex review).
+  // So the top's own `.git` must lead to the git dir git is using; a top git
+  // placed elsewhere (another work tree) has no such `.git`.
+  if (ownGitDir(top) !== comparablePath(gitDirPath)) {
+    return { results, status: 'git_mismatch' };
+  }
   const claudeDir = path.join(top, '.claude');
   const residueDir = path.join(claudeDir, 'worktrees');
   const realDirectory = (p: string): boolean | null => {
@@ -3046,6 +3057,24 @@ function repositoryInside(dir: string, limit: number): 'none' | 'found' | 'unkno
   return 'none';
 }
 
+/**
+ * #4941: the git dir a checkout's own `.git` entry leads to, keyed by
+ * `comparablePath` — the directory itself, or a gitfile's `gitdir:` target
+ * (`--separate-git-dir`, a submodule). `null` when there is no readable one.
+ */
+function ownGitDir(top: string): string | null {
+  const entry = path.join(top, '.git');
+  try {
+    const st = fs.lstatSync(entry);
+    if (st.isDirectory()) return comparablePath(entry);
+    if (!st.isFile()) return null;
+    const m = /^gitdir: (.+?)\r?\n?$/.exec(fs.readFileSync(entry, 'utf8'));
+    return m ? comparablePath(path.resolve(top, m[1])) : null;
+  } catch {
+    return null;
+  }
+}
+
 /** A path as the residue scan compares it: canonical where it resolves, keyed by `pathCompareKey`. */
 function comparablePath(p: string): string {
   let canonical: string;
@@ -3081,6 +3110,7 @@ const RESIDUE_NOT_SWEPT: Readonly<Record<Exclude<ResidueDirStatus, 'scanned' | '
   unreadable: 'it could not be read',
   aliased: 'it (or .claude) is a symlink or junction, not a directory of this checkout',
   top_unresolved: 'git could not name this checkout\'s top directory',
+  git_mismatch: 'git is pointed at another repository or work tree (GIT_DIR, GIT_WORK_TREE or core.worktree)',
   not_scanned: 'git could not resolve this checkout\'s git directory',
 };
 
