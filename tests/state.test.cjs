@@ -9937,6 +9937,27 @@ describe('state add-roadmap-evolution (bug #1140)', () => {
     assert.strictEqual(JSON.parse(second.output).reason, 'duplicate', 'flattened entry must dedupe on replay');
   });
 
+  // #4998 review 2026-10-14 (same class as Major 1): the flatten covered only
+  // CR/LF, so a U+2028/U+2029 survived into the bullet and started a forged
+  // `**Status:**` line for the `m`-flag readers — measured: stateExtractField
+  // read `completed`.
+  for (const [name, sep] of [['U+2028', '\u2028'], ['U+2029', '\u2029']]) {
+    test(`flattens a ${name} in the note, so it cannot start a forged field line`, () => {
+      writeState(tmpDir, STATE_WITH_ACC_CONTEXT);
+      const notePath = path.join(tmpDir, 'note.txt');
+      fs.writeFileSync(notePath, `line one${sep}**Status:** completed`);
+      const result = runGsdTools(
+        ['state', 'add-roadmap-evolution', '--phase', '9', '--action', 'edited', '--note-file', notePath],
+        tmpDir
+      );
+      assert.ok(result.success, `Command failed: ${result.error}`);
+      const state = readState(tmpDir);
+      assert.ok(state.includes('- Phase 9 edited: line one **Status:** completed'), `note not flattened:\n${state}`);
+      assert.ok(!state.includes(sep), `${name} must not reach STATE.md`);
+      assert.ok(!state.split(/\r\n|[\r\n\u2028\u2029]/).some((l) => l.startsWith('**Status:**')), 'no forged field line');
+    });
+  }
+
   test('deduplicates an identical entry on replay', () => {
     writeState(tmpDir, STATE_WITH_ACC_CONTEXT);
 
@@ -22428,6 +22449,19 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.ok(json.skipped.every((s) => s.reason === 'unclosed_fence'), JSON.stringify(json));
     assert.match(stderr, /unclosed code fence/);
     assert.strictEqual(readState(), before);
+  });
+
+  // Review 2026-10-14 Minor 3: the guard scans the whole document, but refuses
+  // only when the TAIL is fenced — closed fences earlier on do not block.
+  test('no session heading and only closed fences: the session section is appended after them', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
+      '```md', 'Stopped at: example', '```', '', '~~~', 'more', '~~~', ''].join('\n'));
+    const { json } = recordSession('--stopped-at', 'new');
+    assert.notStrictEqual(json.recorded, false, JSON.stringify(json));
+    assert.ok(!(json.skipped || []).some((s) => s.reason === 'unclosed_fence'), JSON.stringify(json));
+    const out = readState();
+    assert.ok(out.indexOf('## Session') > out.lastIndexOf('~~~'), out);
+    assert.match(session(), /\*\*Stopped at:\*\* new\n/);
   });
 
   // Minor 4: `None` is the template placeholder, not a displaced record.

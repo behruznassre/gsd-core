@@ -716,6 +716,24 @@ describe('row 29: setFieldValue refuses a value carrying a line break', () => {
     assert.strictEqual(result.ok, false);
   });
 
+  // #4998 review 2026-10-14 Major 1: a multiline-anchor reader (state-document's
+  // `m`-flag regexes) starts a line at U+2028/U+2029 too, so either one would
+  // forge `**Owner:**` exactly as `\n` does.
+  for (const [name, sep] of [['U+2028', '\u2028'], ['U+2029', '\u2029']]) {
+    test(`a value containing ${name} is refused and the document is untouched`, () => {
+      const doc = parseOk(source);
+      const result = setFieldValue(doc, findField(doc, 'Plans'), `1/1${sep}**Owner:** mallory`);
+      assert.strictEqual(result.ok, false);
+      assert.match(result.reason, /line break/);
+      assert.strictEqual(serialize(doc).value, source);
+    });
+  }
+
+  test('the seam and state-document refuse one line-break set: the same constant', () => {
+    const stateDocument = require('../gsd-core/bin/lib/state-document.cjs');
+    assert.strictEqual(stateDocument.FIELD_LINE_BREAK_RE, mod.FIELD_LINE_BREAK_RE);
+  });
+
   test('the negative proof: a refused write leaves the original document untouched', () => {
     const doc = parseOk(source);
     const id = findField(doc, 'Plans');
@@ -1074,6 +1092,11 @@ describe('replaceProse: verbatim cross-reference rewrite through the seam', () =
     assert.strictEqual(replaceProse(doc, '', 'x').ok, false);
     assert.strictEqual(replaceProse(doc, 'a\nb', 'x').ok, false);
     assert.strictEqual(replaceProse(doc, 'text', 'x\ny').ok, false);
+    // #4998 review 2026-10-14 Major 1: U+2028/U+2029 are line breaks to the readers.
+    for (const sep of ['\u2028', '\u2029']) {
+      assert.strictEqual(replaceProse(doc, `a${sep}b`, 'x').ok, false);
+      assert.strictEqual(replaceProse(doc, 'text', `x${sep}**Status:** completed`).ok, false);
+    }
     const staged = setFieldValue(doc, findField(doc, 'Plans'), 'b');
     assert.strictEqual(staged.ok, true);
     assert.strictEqual(replaceProse(staged.value, 'text', 'x').ok, false);

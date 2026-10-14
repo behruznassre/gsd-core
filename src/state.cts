@@ -1765,8 +1765,10 @@ function cmdStateAddRoadmapEvolution(cwd: string, options: StateAddRoadmapEvolut
   // Flatten line breaks so the entry is always a single Markdown bullet. The
   // dedupe + rendering contract is line-oriented; a multiline --note-file would
   // otherwise spill continuation lines outside the bullet and defeat dedupe.
-  // Internal spacing (e.g. dollar columns) is preserved.
-  const flatNote = noteText.replace(/\s*[\r\n]+\s*/g, ' ').trim();
+  // Internal spacing (e.g. dollar columns) is preserved. #4998: every
+  // FIELD_LINE_BREAK_RE character, so a U+2028/U+2029 cannot survive into the
+  // bullet and start a forged `**Field:**` line for the `m`-flag readers.
+  const flatNote = noteText.replace(new RegExp(`\\s*${FIELD_LINE_BREAK_RE.source}+\\s*`, 'g'), ' ').trim();
 
   const actionText = (action && action.trim()) || 'changed';
   const afterText = after && after.trim() ? ` after Phase ${after.trim()}` : '';
@@ -2233,6 +2235,10 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         }
         // A document that ends inside an unclosed fence would swallow the
         // appended section — nothing reads it there. Write nothing, and say so.
+        // The whole document is scanned on purpose: whether its tail is fenced
+        // depends on every delimiter before it, and `scanFencedBlocks` reports
+        // an unclosed block only as its LAST record (the fence runs to EOF), so
+        // `closeLineIdx === -1` here means exactly "the tail is inside a fence".
         if (scanFencedBlocks(content.split('\n')).some((b) => b.closeLineIdx === -1)) {
           for (const [label] of scaffoldFields) skippedFields.push({ field: label, reason: 'unclosed_fence' });
         } else {

@@ -12,7 +12,7 @@ import { clampPercentFromFraction } from './phase-lifecycle.cjs';
 import { collectSection, withSection, scanFencedBlocks } from './markdown-sectionizer.cjs';
 import type { HeadingToken } from './markdown-sectionizer.cjs';
 import { escapeRegex } from './pattern.cjs';
-import { parsePlanningDoc } from './planning-document.cjs';
+import { parsePlanningDoc, FIELD_LINE_BREAK_RE } from './planning-document.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- planning-scope.cjs is an export= CommonJS module
 import planningScopeMod = require('./planning-scope.cjs');
 const { SCOPE } = planningScopeMod;
@@ -356,14 +356,9 @@ const SETEXT_UNDERLINE_RE = /^(?:=+|-+)\s*$/;
 // refuse a field that does not wrap.
 const STATE_SIBLING_FIELD_LINE_RE = /^ {0,3}\*{0,2}[A-Za-z][A-Za-z0-9 _.()/-]*\*{0,2}:{1,2}\*{0,2}(?:\s|$)/;
 
-/**
- * #4998: every character that ends a line for this module's readers. Their
- * `^`/`$` run with the `m` flag, and a JavaScript multiline anchor matches at
- * U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR as well as at CR and
- * LF — so a single-line value carrying either one forges a sibling line just
- * as `\n` does. The single-line writers refuse a value matching this.
- */
-export const FIELD_LINE_BREAK_RE = /[\r\n\u2028\u2029]/;
+// #4998: defined at the ADR-4910 seam (`planning-document.cts`) so its writers
+// and this module's refuse one line-break set; re-exported for existing callers.
+export { FIELD_LINE_BREAK_RE };
 
 /**
  * Return the prose that FOLLOWS a single-line field but plainly belongs to it —
