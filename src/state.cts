@@ -132,6 +132,7 @@ import {
   insertMissingSessionFields,
   readableEditedBoldLabel,
   FIELD_LINE_BREAK_RE,
+  markdownFencedBlocks,
   maskFencedLines,
   writeOutsideFences,
   readableBoldLabels,
@@ -140,7 +141,7 @@ import {
   stateReplaceFieldIfTemplate,
   stateCurrentPositionSlice,
 } from './state-document.cjs';
-import { tokenizeHeadings, collectSection, collectSections, replaceSection, stripFencedCode, scanFencedBlocks } from './markdown-sectionizer.cjs';
+import { tokenizeHeadings, collectSection, collectSections, replaceSection, stripFencedCode } from './markdown-sectionizer.cjs';
 import type { HeadingToken } from './markdown-sectionizer.cjs';
 import { parseMarkdownTable, updateTableCell, deleteTableRow, insertTableRow, splitTableRow, isDelimiterRow } from './markdown-table.cjs';
 import { textEncodingError } from './validate.cjs';
@@ -2236,10 +2237,11 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // A document that ends inside an unclosed fence would swallow the
         // appended section — nothing reads it there. Write nothing, and say so.
         // The whole document is scanned on purpose: whether its tail is fenced
-        // depends on every delimiter before it, and `scanFencedBlocks` reports
+        // depends on every delimiter before it (frontmatter excluded: YAML, not
+        // Markdown), and `scanFencedBlocks` reports
         // an unclosed block only as its LAST record (the fence runs to EOF), so
         // `closeLineIdx === -1` here means exactly "the tail is inside a fence".
-        if (scanFencedBlocks(content.split('\n')).some((b) => b.closeLineIdx === -1)) {
+        if (markdownFencedBlocks(content.split('\n')).some((b) => b.closeLineIdx === -1)) {
           for (const [label] of scaffoldFields) skippedFields.push({ field: label, reason: 'unclosed_fence' });
         } else {
           const scaffold = ['', '## Session', '', ...scaffoldLines, ''].join('\n');

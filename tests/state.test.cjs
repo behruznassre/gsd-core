@@ -22464,6 +22464,28 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.match(session(), /\*\*Stopped at:\*\* new\n/);
   });
 
+  // #4998 Codex review: a ``` line inside a frontmatter block scalar is YAML
+  // data, not a fence. Scanned as Markdown it opened a fence that shifted every
+  // boundary after it: the write hit the fenced example and missed the live
+  // line, and with no session heading the scaffold was refused as unclosed.
+  const YAML_BACKTICKS = ['notes: |', '  ```', '  YAML data'];
+  test('a ``` inside a frontmatter block scalar does not shift the session fences: the live line is written', () => {
+    // Codex's layout: a bare ``` example, so the YAML ``` pairs with its opener.
+    seed(YAML_BACKTICKS, ['```', 'Stopped at: example', '```', '', 'Last session: 2026-01-01', 'Stopped at: live', 'Resume file: None'], '## Session');
+    const { json } = recordSession('--stopped-at', 'new handoff');
+    assert.notStrictEqual(json.recorded, false, JSON.stringify(json));
+    assert.ok(session().includes('```\nStopped at: example\n```'), session());
+    assert.match(session(), /\nStopped at: new handoff\n/);
+    assert.strictEqual(session().match(/^## Session/gm).length, 1, 'no second session section');
+  });
+
+  test('a ``` inside a frontmatter block scalar does not make a headingless document end inside a fence', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', ...YAML_BACKTICKS, '---', '', '# Project State', ''].join('\n'));
+    const { json } = recordSession('--stopped-at', 'new');
+    assert.ok(!(json.skipped || []).some((s) => s.reason === 'unclosed_fence'), JSON.stringify(json));
+    assert.match(session(), /\*\*Stopped at:\*\* new\n/);
+  });
+
   // Minor 4: `None` is the template placeholder, not a displaced record.
   for (const [where, fm, lines] of [
     ['frontmatter', ['stopped_at: None'], ['Last session: 2026-01-01']],

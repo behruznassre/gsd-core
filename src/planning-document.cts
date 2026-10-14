@@ -728,8 +728,19 @@ export function setFieldValue(doc: PlanningDoc, id: NodeId, value: string): Resu
   // once spliced back into the source. Decision 4 licenses refusal for any
   // value the grammar cannot represent; Phase 3 may widen this to escaping,
   // but Phase 1 refuses outright. Do not remove this as an over-restriction.
-  if (FIELD_LINE_BREAK_RE.test(value)) {
-    return { ok: false, reason: 'field value must not contain a line break (\\r, \\n, U+2028 or U+2029)' };
+  // One carve-out (#4998, Codex review): a U+2028/U+2029 the field ALREADY
+  // carries may stay when everything from it on is byte-identical — a rewrite
+  // of the text before it (phase renumbering a `Depends on`) adds no line, and
+  // refusing it left the field silently unrenumbered.
+  const breakAt = value.search(FIELD_LINE_BREAK_RE);
+  if (breakAt !== -1) {
+    const current = doc.source.slice(node.valueSpan.start, node.valueSpan.end);
+    const currentBreak = current.search(FIELD_LINE_BREAK_RE);
+    const keepsExistingTail = !/[\r\n]/.test(value) && currentBreak !== -1
+      && value.slice(breakAt) === current.slice(currentBreak);
+    if (!keepsExistingTail) {
+      return { ok: false, reason: 'field value must not contain a line break (\\r, \\n, U+2028 or U+2029)' };
+    }
   }
 
   // #4917 / ADR-4910 Decision 4: "a value that cannot be represented in the

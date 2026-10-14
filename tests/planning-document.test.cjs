@@ -729,6 +729,29 @@ describe('row 29: setFieldValue refuses a value carrying a line break', () => {
     });
   }
 
+  // #4998 Codex review: a separator the field ALREADY carries may stay when
+  // everything from it on is unchanged (phase renumbering rewrites only the
+  // text before it); any other placement is still refused.
+  test('an existing U+2028 tail is kept through a rewrite of the text before it; any other change to it is refused', () => {
+    const ls = String.fromCharCode(0x2028);
+    const ps = String.fromCharCode(0x2029);
+    const withTail = ['---', 'title: Fixture', '---', '', `**Depends on:** Phase 3${ls}(after approval)`, ''].join('\n');
+    const doc = parseOk(withTail);
+    const id = findField(doc, 'Depends on');
+    const kept = setFieldValue(doc, id, `Phase 2${ls}(after approval)`);
+    assert.strictEqual(kept.ok, true, JSON.stringify(kept));
+    assert.strictEqual(serialize(kept.value).value, withTail.replace('Phase 3', 'Phase 2'));
+    for (const value of [
+      `Phase 2${ls}(changed)`,
+      `Phase 2${ls}(after approval)${ls}**Owner:** mallory`,
+      `Phase 2${ps}(after approval)`,
+      `Phase 2${ls}(after approval)\n**Owner:** mallory`,
+      `Phase${ls}2${ls}(after approval)`,
+    ]) {
+      assert.strictEqual(setFieldValue(doc, id, value).ok, false, JSON.stringify(value));
+    }
+  });
+
   test('the seam and state-document refuse one line-break set: the same constant', () => {
     const stateDocument = require('../gsd-core/bin/lib/state-document.cjs');
     assert.strictEqual(stateDocument.FIELD_LINE_BREAK_RE, mod.FIELD_LINE_BREAK_RE);

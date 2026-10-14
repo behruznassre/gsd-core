@@ -13,6 +13,7 @@ import { collectSection, withSection, scanFencedBlocks } from './markdown-sectio
 import type { HeadingToken } from './markdown-sectionizer.cjs';
 import { escapeRegex } from './pattern.cjs';
 import { parsePlanningDoc, FIELD_LINE_BREAK_RE } from './planning-document.cjs';
+import { locateFrontmatterFence } from './frontmatter-fence.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- planning-scope.cjs is an export= CommonJS module
 import planningScopeMod = require('./planning-scope.cjs');
 const { SCOPE } = planningScopeMod;
@@ -454,10 +455,24 @@ export function readableEditedBoldLabel(before: string, after: string): string {
   return after.slice(0, lineStart) + line + after.slice(end);
 }
 
-/** Per line of `lines`: whether it belongs to a fenced block (`scanFencedBlocks`), delimiters included. */
+/**
+ * #4998: `scanFencedBlocks` over the Markdown of `lines` only. A closed
+ * frontmatter block is YAML, where a ``` line is data (a block scalar), not a
+ * fence; its lines are blanked for the scan, so they are never fenced and
+ * never open a fence that shifts every boundary after them (Codex review).
+ * Line indices are those of `lines`.
+ */
+export function markdownFencedBlocks(lines: string[]): ReturnType<typeof scanFencedBlocks> {
+  const fm = locateFrontmatterFence(lines.join('\n'));
+  if (!fm || !fm.closed) return scanFencedBlocks(lines);
+  const lastFrontmatterLine = lines.join('\n').slice(0, fm.closingStart).split('\n').length - 1;
+  return scanFencedBlocks(lines.map((line, i) => (i <= lastFrontmatterLine ? '' : line)));
+}
+
+/** Per line of `lines`: whether it belongs to a fenced block (`markdownFencedBlocks`), delimiters included. */
 function fencedLineFlags(lines: string[]): boolean[] {
   const fenced = lines.map(() => false);
-  for (const block of scanFencedBlocks(lines)) {
+  for (const block of markdownFencedBlocks(lines)) {
     const end = block.closeLineIdx === -1 ? lines.length - 1 : block.closeLineIdx;
     for (let i = block.openLineIdx; i <= end; i++) fenced[i] = true;
   }
