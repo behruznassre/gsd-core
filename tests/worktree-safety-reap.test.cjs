@@ -1237,6 +1237,85 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(fs.existsSync(path.join(pkg, 'work.txt')));
   });
 
+  /**
+   * Replace the residue's contents with a known layout the walk reads in
+   * exactly FOUR entries: the residue's own three (`a`, `b`, `deep/`), then
+   * `deep`'s one — a repository pointer, or a plain file when `withRepo` is false.
+   */
+  function layoutResidue(residue, withRepo) {
+    for (const entry of fs.readdirSync(residue)) cleanup(path.join(residue, entry));
+    fs.writeFileSync(path.join(residue, 'a'), 'a\n');
+    fs.writeFileSync(path.join(residue, 'b'), 'b\n');
+    fs.mkdirSync(path.join(residue, 'deep'));
+    fs.writeFileSync(path.join(residue, 'deep', withRepo ? '.git' : 'c'), withRepo ? 'gitdir: /elsewhere/.git\n' : 'c\n');
+  }
+  const WALK_ENTRIES = 4;
+
+  // Review 2026-10-14 Minor 1: the walk bound is fail-closed at every side of
+  // it. A repository the walk reaches only on its last read keeps the residue
+  // at limit-1 (bound passed first: unverified), limit and limit+1 (found).
+  for (const [label, limit, reason] of [
+    ['limit-1', WALK_ENTRIES - 1, 'residue_unverified'],
+    ['limit', WALK_ENTRIES, 'residue_contains_repository'],
+    ['limit+1', WALK_ENTRIES + 1, 'residue_contains_repository'],
+  ]) {
+    test(`a repository on the walk's last read keeps the residue at walk bound ${label} (${reason})`, () => {
+      const { repoDir, residue } = repoWithResidue(`walk-repo-${limit}`);
+      layoutResidue(residue, true);
+      const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ residueWalkLimit: limit })));
+      assert.deepStrictEqual([row.status, row.reason], ['skipped', reason]);
+      assert.ok(fs.existsSync(path.join(residue, 'deep', '.git')), 'the residue survives');
+    });
+  }
+
+  test('the walk bound counts every entry read: a clean residue one entry past it is kept, one at it is removed', () => {
+    const over = repoWithResidue('walk-clean-over');
+    layoutResidue(over.residue, false);
+    const row = onlyRow(reapOrphanWorktrees(over.repoDir, deadOwnerDeps({ residueWalkLimit: WALK_ENTRIES - 1 })));
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_unverified']);
+    assert.ok(fs.existsSync(path.join(over.residue, 'deep', 'c')), 'the residue survives');
+
+    const at = repoWithResidue('walk-clean-at');
+    layoutResidue(at.residue, false);
+    const removed = onlyRow(reapOrphanWorktrees(at.repoDir, deadOwnerDeps({ residueWalkLimit: WALK_ENTRIES })));
+    assert.deepStrictEqual([removed.status, removed.reason], ['reaped', 'unregistered_residue']);
+    assert.ok(!fs.existsSync(at.residue));
+  });
+
+  test('an unreadable subdirectory keeps the residue as residue_unverified — what the walk cannot read may hold a repository', (t) => {
+    if (process.platform === 'win32') {
+      t.skip('chmod 000 does not make a directory unreadable on Windows');
+      return;
+    }
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      t.skip('root reads a mode-000 directory');
+      return;
+    }
+    const { repoDir, residue } = repoWithResidue('walk-unreadable');
+    const locked = path.join(residue, 'locked');
+    fs.mkdirSync(locked);
+    fs.writeFileSync(path.join(locked, 'work.txt'), 'uncommitted\n');
+    const mode = fs.statSync(locked).mode;
+    fs.chmodSync(locked, 0o000);
+    try {
+      const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+      assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_unverified']);
+    } finally {
+      fs.chmodSync(locked, mode);
+    }
+    assert.ok(fs.existsSync(path.join(locked, 'work.txt')), 'the residue survives');
+  });
+
+  test('a bare agent- child has no id and is not harness-named', () => {
+    const repoDir = path.join(tmpBase, 'repo-bare-agent');
+    initRepo(repoDir);
+    const bare = plainChild(repoDir, 'agent-');
+    git(['branch', 'worktree-agent-'], repoDir);
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_not_harness_named']);
+    assert.ok(fs.existsSync(path.join(bare, 'file.txt')));
+  });
+
   test('a checkout whose path ends in a space sweeps itself, never a same-named sibling', (t) => {
     if (process.platform === 'win32') {
       t.skip('a trailing space is not a valid Windows path component');
@@ -1835,6 +1914,8 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(blocked, JSON.stringify(result));
     assert.strictEqual(blocked.reason, 'worktree_unregistered');
     assert.match(blocked.stderr, /no \.git entry/);
+    // Review 2026-10-14 Nit 2: removal is conditional, and the message says so.
+    assert.match(blocked.stderr, /only when it passes the residue guards/);
     assert.ok(fs.existsSync(residue), 'wave cleanup never removes it');
   });
 

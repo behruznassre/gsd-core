@@ -150,6 +150,8 @@ interface WorktreeDeps {
   mergeTimeoutMs?: number;
   /** #4941: removes one residue directory; defaults to `fs.rmSync(p, { recursive: true })`. */
   removeDir?: (p: string) => void;
+  /** #4941: entries the residue repository walk reads before `residue_unverified`; defaults to RESIDUE_WALK_LIMIT. */
+  residueWalkLimit?: number;
 }
 
 function readWorktreeList(repoRoot: string, deps: WorktreeDeps = {}): WorktreeListResult {
@@ -1393,7 +1395,8 @@ function executeWorktreeWaveCleanupPlan(plan: WaveCleanupPlan | null, deps: Work
         result,
         'worktree_unregistered',
         `${entry.worktree_path} exists but has no .git entry: it is not a worktree (git no longer tracks it — ` +
-        'an incomplete teardown); `worktree.reap-orphans` removes such harness directories.',
+        'an incomplete teardown); `worktree.reap-orphans` removes such a harness directory only when it passes ' +
+        'the residue guards, and otherwise reports it as skipped with the reason.',
       );
       continue; // #2852: isolate
     }
@@ -2542,8 +2545,8 @@ interface ReapScan {
   residue_dir: ResidueDirStatus;
 }
 
-/** Claude Code names its harness worktrees `agent-*`; only those are ever removed as residue (#4941). */
-const HARNESS_WORKTREE_NAME_RE = /^agent-/;
+/** Claude Code names its harness worktrees `agent-<id>`; only those are ever removed as residue (#4941). A bare `agent-` has no id. */
+const HARNESS_WORKTREE_NAME_RE = /^agent-./su;
 
 /** The reap results alone — the pre-#4941 signature; `reapOrphanWorktreesWithScan` adds what was read. */
 function reapOrphanWorktrees(repoRoot: string, deps: WorktreeDeps = {}): ReapResult[] {
@@ -2822,6 +2825,7 @@ function findUnregisteredResidue(
   const mtimeSafe = deps.mtimeSafe || defaultMtimeSafe;
   const readDirSafe = deps.readDirSafe || defaultReadDirSafe;
   const removeDir = deps.removeDir || ((p: string) => fs.rmSync(p, { recursive: true, maxRetries: 2 }));
+  const walkLimit = deps.residueWalkLimit ?? RESIDUE_WALK_LIMIT;
   const results: ReapResult[] = [];
 
   // Only a main checkout scans: its git dir IS the common dir, while a linked
@@ -2943,7 +2947,7 @@ function findUnregisteredResidue(
       results.push({ path: p, status: 'skipped', reason: 'residue_tracked' });
       continue;
     }
-    const inner = repositoryInside(p);
+    const inner = repositoryInside(p, walkLimit);
     if (inner !== 'none') {
       results.push({ path: p, status: 'skipped', reason: inner === 'found' ? 'residue_contains_repository' : 'residue_unverified' });
       continue;
@@ -3008,9 +3012,9 @@ const RESIDUE_WALK_LIMIT = 1_000_000;
  * #4941: whether a repository lies inside `dir` — a `.git` entry at any depth,
  * or a bare repository layout (`HEAD` file beside `objects/` and `refs/`), the
  * directory itself included. Links are never followed. `unknown` when a
- * directory cannot be read or the walk passes RESIDUE_WALK_LIMIT entries.
+ * directory cannot be read or the walk passes `limit` entries.
  */
-function repositoryInside(dir: string): 'none' | 'found' | 'unknown' {
+function repositoryInside(dir: string, limit: number): 'none' | 'found' | 'unknown' {
   const pending = [dir];
   let seen = 0;
   while (pending.length > 0) {
@@ -3022,7 +3026,7 @@ function repositoryInside(dir: string): 'none' | 'found' | 'unknown' {
       return 'unknown';
     }
     seen += entries.length;
-    if (seen > RESIDUE_WALK_LIMIT) return 'unknown';
+    if (seen > limit) return 'unknown';
     // Case-folded: on a case-insensitive filesystem `.GIT` is still the
     // repository's pointer to git (Codex review).
     const names = new Set(entries.map((e) => e.name.toLowerCase()));
@@ -3557,6 +3561,10 @@ export = {
   cmdWorktreeCreate,
   reapOrphanWorktrees,
   reapOrphanWorktreesWithScan,
+  // #4941 review: exported for tests. The cap, cut and escaping of the stderr
+  // name list are asserted directly — through the CLI each row would need its
+  // own git-backed residue — and pathCompareKey's win32 fold is unreachable
+  // from the public surface on a POSIX host.
   residueNameList,
   pathCompareKey,
   cmdWorktreeReapOrphans,
