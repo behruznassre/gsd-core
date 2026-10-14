@@ -22486,6 +22486,43 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.match(session(), /\*\*Stopped at:\*\* new\n/);
   });
 
+  // #4998 Codex review round 2: the section lookup (collectSection) and the
+  // field writers' parser (parsePlanningDoc) also read the YAML ``` as a
+  // fence, so the live section was not found: a missing field was never
+  // inserted, a bold field read as absent, or a fenced `## Session` example
+  // took the insert.
+  test('a ``` inside a frontmatter block scalar: a missing Stopped at is inserted into the live section', () => {
+    seed(YAML_BACKTICKS, ['Last session: 2026-01-01', 'Resume file: old.md'], '## Session');
+    const { json } = recordSession('--stopped-at', 'new handoff');
+    assert.notStrictEqual(json.recorded, false, JSON.stringify(json));
+    assert.match(session(), /\nStopped at: new handoff\n/);
+    assert.match(session(), /\nResume file: old\.md\n/);
+  });
+
+  test('a ``` inside a frontmatter block scalar: bold session fields are found and written', () => {
+    seed(YAML_BACKTICKS, ['**Last session:** 2026-01-01', '**Stopped at:** old', '**Resume file:** old.md'], '## Session');
+    const { json } = recordSession('--stopped-at', 'new handoff');
+    assert.notStrictEqual(json.recorded, false, JSON.stringify(json));
+    assert.match(session(), /\*\*Stopped at:\*\* new handoff\n/);
+    assert.ok(!session().includes('**Stopped at:** old'), session());
+  });
+
+  test('a ``` inside a frontmatter block scalar: a fenced ## Session example never takes the insert', () => {
+    seed(YAML_BACKTICKS, ['```', '## Session', 'Stopped at: example', '```', '', '## Session', '', 'Stopped at: live'], '## Notes');
+    const { json } = recordSession('--stopped-at', 'new handoff');
+    assert.notStrictEqual(json.recorded, false, JSON.stringify(json));
+    const state = readState();
+    // The example region (`## Notes` up to the live heading) gains nothing.
+    // (The platform write normalizer may add a blank line before its fenced
+    // heading; that is unrelated and pre-existing.)
+    const example = state.slice(state.indexOf('## Notes'), state.lastIndexOf('## Session'));
+    assert.ok(example.includes('Stopped at: example'), state);
+    assert.ok(!/Last session|new handoff/.test(example), state);
+    const live = state.slice(state.lastIndexOf('## Session'));
+    assert.match(live, /\nStopped at: new handoff\n/);
+    assert.match(live, /\nLast session: /);
+  });
+
   // Minor 4: `None` is the template placeholder, not a displaced record.
   for (const [where, fm, lines] of [
     ['frontmatter', ['stopped_at: None'], ['Last session: 2026-01-01']],

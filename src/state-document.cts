@@ -463,11 +463,19 @@ export function readableEditedBoldLabel(before: string, after: string): string {
  * Line indices are those of `lines`.
  */
 export function markdownFencedBlocks(lines: string[]): ReturnType<typeof scanFencedBlocks> {
-  const fm = locateFrontmatterFence(lines.join('\n'));
-  if (!fm || !fm.closed) return scanFencedBlocks(lines);
-  const lastFrontmatterLine = lines.join('\n').slice(0, fm.closingStart).split('\n').length - 1;
-  return scanFencedBlocks(lines.map((line, i) => (i <= lastFrontmatterLine ? '' : line)));
+  const last = lastFrontmatterLine(lines);
+  return last === -1 ? scanFencedBlocks(lines) : scanFencedBlocks(lines.map((line, i) => (i <= last ? '' : line)));
 }
+
+/** Index of the closing `---` of a closed frontmatter block at the top of `lines`, or -1. */
+function lastFrontmatterLine(lines: string[]): number {
+  const text = lines.join('\n');
+  const fm = locateFrontmatterFence(text);
+  return fm && fm.closed ? text.slice(0, fm.closingStart).split('\n').length - 1 : -1;
+}
+
+/** A line every Markdown fence scanner here reads as a fence delimiter (`scanFencedBlocks`' shape). */
+const FENCE_DELIMITER_LINE_RE = /^ {0,3}(?:`{3,}|~{3,})/;
 
 /** Per line of `lines`: whether it belongs to a fenced block (`markdownFencedBlocks`), delimiters included. */
 function fencedLineFlags(lines: string[]): boolean[] {
@@ -480,14 +488,20 @@ function fencedLineFlags(lines: string[]): boolean[] {
 }
 
 /**
- * #4998: `content` with every fenced line (`scanFencedBlocks`) blanked to
+ * #4998: `content` with every fenced line (`markdownFencedBlocks`) blanked to
  * spaces — same length, same line terminators — for reading a field the way
  * `writeOutsideFences` writes it: an example line in a fence is not a field.
+ * A frontmatter line shaped like a fence delimiter (a ``` in a YAML block
+ * scalar) is blanked too, so a scanner that does not know frontmatter — the
+ * heading tokenizer behind `collectSection`, `parsePlanningDoc` — reading the
+ * masked text sees no fence there either (Codex review round 2).
  */
 export function maskFencedLines(content: string): string {
   const lines = content.split('\n');
   const fenced = fencedLineFlags(lines);
-  return lines.map((line, i) => (fenced[i] ? line.replace(/[^\r]/g, ' ') : line)).join('\n');
+  const last = lastFrontmatterLine(lines);
+  const masked = (line: string, i: number): boolean => fenced[i] || (i <= last && FENCE_DELIMITER_LINE_RE.test(line));
+  return lines.map((line, i) => (masked(line, i) ? line.replace(/[^\r]/g, ' ') : line)).join('\n');
 }
 
 /**

@@ -2162,14 +2162,17 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // the heading in bold, the pre-#4998 shape. Every existing line is kept.
       // A heading at EOF with no line terminator gets one first, so its body
       // exists to insert into rather than a field being glued onto it.
+      // The section is located on the masked text (same offsets): a fenced
+      // `## Session` example is not the section, and a ``` in a frontmatter
+      // block scalar does not hide the real one (Codex review round 2).
       const insertIntoSection = (isTarget: (h: HeadingToken) => boolean): void => {
-        let section = collectSection(content, isTarget, { levelBounded: true });
+        let section = collectSection(maskFencedLines(content), isTarget, { levelBounded: true });
         if (section && content[section.bodyStart - 1] !== '\n' && section.bodyStart >= content.length) {
           content += content.includes('\r\n') ? '\r\n' : '\n';
-          section = collectSection(content, isTarget, { levelBounded: true });
+          section = collectSection(maskFencedLines(content), isTarget, { levelBounded: true });
         }
         if (!section || content[section.bodyStart - 1] !== '\n') return;
-        const body = insertMissingSessionFields(section.body, [
+        const body = insertMissingSessionFields(content.slice(section.bodyStart, section.bodyEnd), [
           { label: 'Last session', needed: needsLastSession, value: now },
           { label: 'Stopped at', needed: !!needsStoppedAt, value: stoppedAtValue },
           { label: 'Resume file', needed: needsResumeFile, value: resumeValue },
