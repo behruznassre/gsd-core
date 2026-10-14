@@ -3645,6 +3645,150 @@ describe('fingerprint input set is closed and idempotent (#5095, ADR-5057 Phase 
     assert.equal(statusCli(projectDir, phaseDir), 'stale');
   });
 
+  // ── #4817 Part 1 residual: a LEGACY (v1/v2) report whose digest still matches but that never
+  // declared a current plan/summary reads `stale`. The remedy is the same single route, but the
+  // diagnostic must say what is wrong: an artifact the report never covered, named — not "covered
+  // source files changed", which is false here. v3 reports cannot reach this state (the emitter
+  // completes the covered set and the digest includes the live artifacts). ──────────────────────
+  describe('stale diagnostic for a legacy report with an undeclared plan/summary (#4817)', () => {
+    function legacyProject(t, { declared, version = 1 }) {
+      const projectDir = createTempGitProject();
+      t.after(() => cleanup(projectDir));
+      const phaseDir = path.join(projectDir, '.planning', 'phases', '01-foo');
+      fs.mkdirSync(phaseDir, { recursive: true });
+      fs.writeFileSync(path.join(phaseDir, '01-01-PLAN.md'), '# Plan\n');
+      fs.writeFileSync(path.join(phaseDir, '01-01-SUMMARY.md'), '# Summary\n');
+      fs.mkdirSync(path.join(projectDir, 'src'));
+      fs.writeFileSync(path.join(projectDir, 'src', 'impl.ts'), 'export const x = 1;\n');
+      const { computeCoveredDigest } = require('../gsd-core/bin/lib/verification.cjs');
+      const digest = computeCoveredDigest(projectDir, declared, version, {});
+      assert.ok(digest, 'the legacy digest must compute');
+      fs.writeFileSync(
+        path.join(phaseDir, '01-VERIFICATION.md'),
+        `---\nstatus: passed\ncovered_files:\n${declared.map((f) => `  - ${f}`).join('\n')}\ncovered_digest: "${digest}"\n---\n`,
+      );
+      return { projectDir, phaseDir };
+    }
+
+    function fullStatus(projectDir, phaseDir) {
+      const res = runGsdTools(['verification', 'status', phaseDir], projectDir);
+      assert.ok(res.success, `verification status should run: ${res.error}`);
+      return JSON.parse(res.output);
+    }
+
+    test('zero drift, plan and summary never declared: stale, naming both artifacts, not blaming a changed file', (t) => {
+      const { projectDir, phaseDir } = legacyProject(t, { declared: ['src/impl.ts'] });
+      const r = fullStatus(projectDir, phaseDir);
+      assert.equal(r.status, 'stale');
+      assert.equal(r.route, 'execute-phase', 'the one stale route is unchanged');
+      assert.deepEqual([...r.uncovered_artifacts].sort(), ['01-01-PLAN.md', '01-01-SUMMARY.md']);
+      assert.ok(r.next_action.includes('01-01-PLAN.md') && r.next_action.includes('01-01-SUMMARY.md'), r.next_action);
+      assert.ok(!/covered source files changed/.test(r.next_action), `must not claim a file changed: ${r.next_action}`);
+    });
+
+    test('a covered file changed AND an artifact never declared: both problems are exposed', (t) => {
+      const { projectDir, phaseDir } = legacyProject(t, { declared: ['src/impl.ts'] });
+      fs.writeFileSync(path.join(projectDir, 'src', 'impl.ts'), 'export const x = 2;\n');
+      const r = fullStatus(projectDir, phaseDir);
+      assert.equal(r.status, 'stale');
+      assert.ok(/covered source files changed/.test(r.next_action), r.next_action);
+      assert.deepEqual([...r.uncovered_artifacts].sort(), ['01-01-PLAN.md', '01-01-SUMMARY.md']);
+      assert.ok(r.next_action.includes('01-01-PLAN.md'), r.next_action);
+    });
+
+    test('genuine drift with every artifact declared keeps the original diagnostic and no uncovered field', (t) => {
+      const declared = ['src/impl.ts', '.planning/phases/01-foo/01-01-PLAN.md', '.planning/phases/01-foo/01-01-SUMMARY.md'];
+      const { projectDir, phaseDir } = legacyProject(t, { declared });
+      fs.writeFileSync(path.join(projectDir, 'src', 'impl.ts'), 'export const x = 2;\n');
+      const r = fullStatus(projectDir, phaseDir);
+      assert.equal(r.status, 'stale');
+      assert.ok(/covered source files changed/.test(r.next_action), r.next_action);
+      assert.equal(r.uncovered_artifacts, undefined);
+    });
+
+    test('a fully covered, unchanged legacy report still reads passed', (t) => {
+      const declared = ['src/impl.ts', '.planning/phases/01-foo/01-01-PLAN.md', '.planning/phases/01-foo/01-01-SUMMARY.md'];
+      const { projectDir, phaseDir } = legacyProject(t, { declared });
+      assert.equal(statusCli(projectDir, phaseDir), 'passed');
+    });
+
+    test('a v3 report written by the emitter never shows an uncovered artifact', (t) => {
+      const projectDir = createTempGitProject();
+      t.after(() => cleanup(projectDir));
+      const phaseDir = path.join(projectDir, '.planning', 'phases', '01-foo');
+      fs.mkdirSync(phaseDir, { recursive: true });
+      fs.writeFileSync(path.join(phaseDir, '01-01-PLAN.md'), '# Plan\n');
+      fs.writeFileSync(path.join(phaseDir, '01-01-SUMMARY.md'), '# Summary\n');
+      fs.mkdirSync(path.join(projectDir, 'src'));
+      fs.writeFileSync(path.join(projectDir, 'src', 'impl.ts'), 'export const x = 1;\n');
+      writeReportFrom(phaseDir, '01-VERIFICATION.md', fpCli(projectDir, phaseDir, ['src/impl.ts']));
+      const r = fullStatus(projectDir, phaseDir);
+      assert.equal(r.status, 'passed');
+      assert.equal(r.uncovered_artifacts, undefined);
+    });
+  });
+
+  describe('stale diagnostic names the covered files that moved (#4857)', () => {
+    function stampedProject(t) {
+      const projectDir = createTempGitProject();
+      t.after(() => cleanup(projectDir));
+      const phaseDir = path.join(projectDir, '.planning', 'phases', '01-foo');
+      fs.mkdirSync(phaseDir, { recursive: true });
+      fs.writeFileSync(path.join(phaseDir, '01-01-PLAN.md'), '# Plan\n');
+      fs.writeFileSync(path.join(phaseDir, '01-01-SUMMARY.md'), '# Summary\n');
+      fs.mkdirSync(path.join(projectDir, 'src'));
+      fs.writeFileSync(path.join(projectDir, 'src', 'a.ts'), 'export const a = 1;\n');
+      fs.writeFileSync(path.join(projectDir, 'src', 'b.ts'), 'export const b = 1;\n');
+      writeReportFrom(phaseDir, '01-VERIFICATION.md', fpCli(projectDir, phaseDir, ['src/a.ts', 'src/b.ts']));
+      // The report predates every later edit by a minute, so the edit times below are unambiguous.
+      const past = new Date(Date.now() - 120000);
+      for (const f of ['src/a.ts', 'src/b.ts', '.planning/phases/01-foo/01-01-PLAN.md', '.planning/phases/01-foo/01-01-SUMMARY.md']) {
+        fs.utimesSync(path.join(projectDir, f), past, past);
+      }
+      const reportTime = new Date(Date.now() - 60000);
+      fs.utimesSync(path.join(phaseDir, '01-VERIFICATION.md'), reportTime, reportTime);
+      return { projectDir, phaseDir };
+    }
+
+    function fullStatus(projectDir, phaseDir) {
+      const res = runGsdTools(['verification', 'status', phaseDir], projectDir);
+      assert.ok(res.success, `verification status should run: ${res.error}`);
+      return JSON.parse(res.output);
+    }
+
+    test('one covered file edited after the report: stale, naming exactly that file', (t) => {
+      const { projectDir, phaseDir } = stampedProject(t);
+      fs.writeFileSync(path.join(projectDir, 'src', 'b.ts'), 'export const b = 2;\n');
+      const r = fullStatus(projectDir, phaseDir);
+      assert.equal(r.status, 'stale');
+      assert.deepEqual(r.moved_files, ['src/b.ts']);
+      assert.ok(r.next_action.includes('src/b.ts') && !r.next_action.includes('src/a.ts'), r.next_action);
+    });
+
+    test('a plan edited after the report is a moved covered file too', (t) => {
+      const { projectDir, phaseDir } = stampedProject(t);
+      fs.writeFileSync(path.join(phaseDir, '01-01-PLAN.md'), '# Plan v2\n');
+      const r = fullStatus(projectDir, phaseDir);
+      assert.equal(r.status, 'stale');
+      assert.deepEqual(r.moved_files, ['.planning/phases/01-foo/01-01-PLAN.md']);
+    });
+
+    test('an unchanged covered set reads passed with no moved_files', (t) => {
+      const { projectDir, phaseDir } = stampedProject(t);
+      const r = fullStatus(projectDir, phaseDir);
+      assert.equal(r.status, 'passed');
+      assert.equal(r.moved_files, undefined);
+    });
+
+    test('a file the report does not cover never appears in moved_files', (t) => {
+      const { projectDir, phaseDir } = stampedProject(t);
+      fs.writeFileSync(path.join(projectDir, 'src', 'unrelated.ts'), 'export const u = 1;\n');
+      const r = fullStatus(projectDir, phaseDir);
+      assert.equal(r.status, 'passed');
+      assert.equal(r.moved_files, undefined);
+    });
+  });
+
   // ── R1(a) (CLI, fail-first): --raw returns only the digest, and a caller
   // that writes its OWN declared list (no plans/summaries) plus that raw
   // digest still reads passed — the checker adds the same union on both
