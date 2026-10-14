@@ -1149,7 +1149,16 @@ function buildCodexHookWindowsShimIR(scriptAbsPath: string, absoluteRunnerToken:
   const scriptQuoted = JSON.stringify(targetAbs);
   const cmdPath = scriptAbsPath.replace(/\.js$/, '.cmd');
   const hookCommand = JSON.stringify(shellCmdProjection.posixNormalize(cmdPath));
-  const runnerQuoted = JSON.stringify(interpreter);
+  // #4838: node is resolved when the hook fires. The install-time path dies when a
+  // version manager (WinGet) removes the versioned directory on upgrade, and a
+  // shim that only knew that path failed silently until the installer re-ran.
+  // Order: explicit GSD_NODE_PATH; the install-time path while it still exists
+  // (keeps the #3662 minimal-PATH guarantee); node.exe on PATH. `where $PATH:`
+  // searches PATH only, never the current directory, so repo content cannot
+  // become the runner. `%` is doubled so cmd.exe cannot expand a variable out
+  // of an install path.
+  const bakedBat = JSON.stringify(interpreter).slice(1, -1).replace(/%/g, '%%');
+  const scriptBat = scriptQuoted.replace(/%/g, '%%');
   return {
     invocation: { interpreter, target: scriptAbsPath },
     cmdPath,
@@ -1157,7 +1166,16 @@ function buildCodexHookWindowsShimIR(scriptAbsPath: string, absoluteRunnerToken:
     eol: { cmd: '\r\n' },
     passthroughArgs: true,
     render: {
-      cmd: () => `@ECHO OFF\r\n@SETLOCAL\r\n@${runnerQuoted} ${scriptQuoted} %*\r\n`,
+      cmd: () => [
+        '@ECHO OFF',
+        '@SETLOCAL',
+        '@SET "GSD_NODE="',
+        '@IF DEFINED GSD_NODE_PATH IF EXIST "%GSD_NODE_PATH%" SET "GSD_NODE=%GSD_NODE_PATH%"',
+        `@IF NOT DEFINED GSD_NODE IF EXIST "${bakedBat}" SET "GSD_NODE=${bakedBat}"`,
+        '@IF NOT DEFINED GSD_NODE FOR /F "delims=" %%N IN (\'where $PATH:node.exe 2^>NUL\') DO @IF NOT DEFINED GSD_NODE SET "GSD_NODE=%%N"',
+        `@"%GSD_NODE%" ${scriptBat} %*`,
+        '',
+      ].join('\r\n'),
     },
   };
 }
@@ -2466,6 +2484,14 @@ interface ApplySettingsJsonHooksOpts {
   hookOpts: BuildHookCommandOpts;
   localCmd: (hookFile: string) => string | null;
   localShellCmd: (hookFile: string) => string | null;
+  /**
+   * #4840: false when the runtime declares `context-warnings` unsupported
+   * (`hostBehaviors.unsupportedFeatures`) — it has no statusline writer for the
+   * metrics bridge file `gsd-context-monitor.js` reads, so the hook could never
+   * warn. The monitor is then not registered, and a registration left by an
+   * earlier install is stripped. Absent means supported.
+   */
+  contextWarnings?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -2681,6 +2707,32 @@ function pushHookGroup(entries: any[], matcher: string | undefined, command: str
   entries.push(matcher === undefined ? { hooks: [hook] } : { matcher, hooks: [hook] });
 }
 
+/** #4840: the hook that reads the statusline's metrics bridge file. */
+const CONTEXT_MONITOR_HOOK = 'gsd-context-monitor.js';
+
+/**
+ * #4840: remove GSD-managed registrations of `stem` from one event's groups,
+ * leaving user-authored hooks (even in the same group) untouched. Returns
+ * whether anything was removed. A group left with no hooks is dropped.
+ */
+function stripManagedHookRegistrations(entries: any[], stem: string): boolean {
+  let removed = false;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (!entry || !Array.isArray(entry.hooks)) continue;
+    const kept = entry.hooks.filter((h: HookEntry) => {
+      const managed = referencesHook(h as Record<string, unknown>, stem)
+        && isManagedHookCommand((h as { command?: string }).command, { surface: 'settings-json', includeLegacyAliases: true });
+      if (managed) removed = true;
+      return !managed;
+    });
+    if (kept.length === entry.hooks.length) continue;
+    if (kept.length === 0) entries.splice(i, 1);
+    else entry.hooks = kept;
+  }
+  return removed;
+}
+
 function applySettingsJsonHookTables(settings: any, opts: ApplySettingsJsonHooksOpts, tables: SettingsJsonHookTables): void {
   const { runtime, postToolEvent, hookEvents, extendedHookEvents, hooksSurface, targetDir, hookOpts } = opts;
 
@@ -2735,6 +2787,12 @@ function applySettingsJsonHookTables(settings: any, opts: ApplySettingsJsonHooks
       settings.hooks[key] = [];
     }
     const entries: any[] = settings.hooks[key];
+    if (row.file === CONTEXT_MONITOR_HOOK && opts.contextWarnings === false) {
+      if (stripManagedHookRegistrations(entries, hookStem(row.file))) {
+        console.log(`  ${green}✓${reset} Removed stale context monitor hook (${_capabilityTitle(runtime)} has no context metrics writer, #4840)`);
+      }
+      continue;
+    }
     const command = resolveRowCommand(row, opts);
     if ('build' in row.command && row.command.build === 'sh') shellCommands[row.file] = command;
 
@@ -2865,7 +2923,7 @@ function buildKimiHookEntryToml(spec: KimiHookEntrySpec): string | null {
  * unmatched (all tools) instead, which only widens when it fires, it never
  * narrows incorrectly.
  */
-function buildKimiHooksTomlBlock(targetDir: string, opts: { hookOpts: BuildHookCommandOpts }): string | null {
+function buildKimiHooksTomlBlock(targetDir: string, opts: { hookOpts: BuildHookCommandOpts; contextWarnings?: boolean }): string | null {
   const { hookOpts } = opts;
   const cmd = (hookName: string): string | null => {
     if (!fs.existsSync(path.join(targetDir, 'hooks', hookName))) return null;
@@ -2887,7 +2945,8 @@ function buildKimiHooksTomlBlock(targetDir: string, opts: { hookOpts: BuildHookC
     { event: 'PreToolUse', command: cmd('gsd-validate-commit.sh'), matcher: 'Shell', timeout: kimiBlockingGuardTimeout('gsd-validate-commit.sh') },
 
     // PostToolUse
-    { event: 'PostToolUse', command: cmd('gsd-context-monitor.js'), timeout: 10 },
+    // #4840: no metrics writer on kimi, so the warning registration is skipped (a block from an earlier install is replaced wholesale).
+    { event: 'PostToolUse', command: opts.contextWarnings === false ? null : cmd('gsd-context-monitor.js'), timeout: 10 },
     { event: 'PostToolUse', command: cmd('gsd-phase-boundary.sh'), matcher: 'WriteFile|StrReplaceFile', timeout: 5 },
     { event: 'PostToolUse', command: cmd('gsd-read-injection-scanner.js'), matcher: 'ReadFile', timeout: 5 },
     { event: 'PostToolUse', command: cmd('gsd-graphify-update.sh'), matcher: 'Shell', timeout: 5 },
@@ -2963,10 +3022,11 @@ function stripKimiHooksTomlBlock(content: string): string | null {
 function writeKimiHooksToml(
   configPath: string,
   targetDir: string,
-  opts: { hookOpts: BuildHookCommandOpts },
+  opts: { hookOpts: BuildHookCommandOpts; contextWarnings?: boolean },
 ): { changed: boolean; path: string; entryCount: number; configuredEntrypoints: ConfiguredEntrypoint[] } {
   const configuredEntrypoints: ConfiguredEntrypoint[] = [];
   const trackedOpts = {
+    contextWarnings: opts.contextWarnings,
     hookOpts: {
       ...opts.hookOpts,
       configPath,
