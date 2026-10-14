@@ -2909,7 +2909,12 @@ function findUnregisteredResidue(
   // normalized and case-folded: a directory renamed to another normalization
   // form (NFC/NFD) or case is the same directory to the filesystem (Codex
   // review). Index paths use `/` only. A failed listing keeps everything.
-  const trackedList = execGit(['ls-files', '-z', '--', '.claude/worktrees'], { cwd: top });
+  // The checkout's OWN index decides what is tracked: an inherited
+  // GIT_INDEX_FILE (set inside a git hook or a partial commit) would point
+  // `ls-files` at another index and hide tracked work (Codex review). Node
+  // drops an `undefined` env value, so the variable is unset for these calls.
+  const ownIndex = { cwd: top, env: { GIT_INDEX_FILE: undefined } as unknown as Record<string, string> };
+  const trackedList = execGit(['ls-files', '-z', '--', '.claude/worktrees'], ownIndex);
   const trackedNames = new Set<string>();
   for (const file of gitResultOk(trackedList) ? String(trackedList.stdout).split('\0') : []) {
     const name = file.split('/')[2];
@@ -2941,7 +2946,7 @@ function findUnregisteredResidue(
       results.push({ path: p, status: 'skipped', reason: 'residue_no_harness_branch' });
       continue;
     }
-    const tracked = execGit(['ls-files', '-z', '--', `:(icase,literal).claude/worktrees/${name}`], { cwd: top });
+    const tracked = execGit(['ls-files', '-z', '--', `:(icase,literal).claude/worktrees/${name}`], ownIndex);
     if (!gitResultOk(trackedList) || !gitResultOk(tracked) || tracked.stdout.length > 0
         || trackedNames.has(name.normalize('NFC').toLowerCase())) {
       results.push({ path: p, status: 'skipped', reason: 'residue_tracked' });

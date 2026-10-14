@@ -1117,6 +1117,31 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(fs.existsSync(path.join(committed, 'file.txt')));
   });
 
+  // Codex review 2026-10-14: an inherited GIT_INDEX_FILE (a hook, a partial
+  // commit) made both tracked checks read an alternate index, so tracked work
+  // with uncommitted edits was removed. The checkout's own index decides.
+  test('an inherited GIT_INDEX_FILE naming an empty index cannot hide tracked content', () => {
+    const repoDir = path.join(tmpBase, 'repo-altindex');
+    initRepo(repoDir);
+    const committed = plainChild(repoDir, 'agent-notes');
+    git(['add', '-A'], repoDir);
+    git(['commit', '-m', 'commit a directory under .claude/worktrees'], repoDir);
+    git(['branch', 'worktree-agent-notes'], repoDir);
+    fs.writeFileSync(path.join(committed, 'file.txt'), 'uncommitted edit\n');
+    const altIndex = path.join(tmpBase, 'alt-index');
+    const saved = process.env.GIT_INDEX_FILE;
+    process.env.GIT_INDEX_FILE = altIndex; // does not exist: git reads it as an empty index
+    let row;
+    try {
+      row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    } finally {
+      if (saved === undefined) delete process.env.GIT_INDEX_FILE;
+      else process.env.GIT_INDEX_FILE = saved;
+    }
+    assert.deepStrictEqual({ status: row.status, reason: row.reason }, { status: 'skipped', reason: 'residue_tracked' });
+    assert.strictEqual(fs.readFileSync(path.join(committed, 'file.txt'), 'utf8'), 'uncommitted edit\n');
+  });
+
   test('when git cannot say what it tracks, nothing is removed (fail closed)', () => {
     const { repoDir, residue } = repoWithResidue('lsfail');
     const faultyGit = makeFaultyGit({ faults: [{ kind: 'exit', exitCode: 128, when: ['ls-files'] }], passthrough: realExecGit });
