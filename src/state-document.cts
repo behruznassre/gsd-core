@@ -583,19 +583,19 @@ function continuationAfter(content: string, afterValue: number): string | null {
   const rest = content.slice(afterValue).replace(/^\r/, '');
   if (!rest.startsWith('\n')) return null; // end of file: nothing follows
 
-  const lines = rest.slice(1).split('\n');
-  const continuation = lines.slice(0, continuationLineCount(lines)).map((line) => line.replace(/\r$/, '').trim());
+  const lines = rest.slice(1).split('\n').map((line) => line.replace(/\r$/, ''));
+  const continuation = lines.slice(0, continuationLineCount(lines)).map((line) => line.trim());
   return continuation.length ? continuation.join(' ') : null;
 }
 
 /**
- * How many of `following` — the lines directly below a single-line field —
- * continue its value rather than starting the next construct.
+ * How many of the lines directly below a single-line field belong to its value: the scan
+ * `stateFieldContinuation` reports on, shared so a writer that replaces the value removes exactly
+ * the lines a validator would call its continuation (#4945). `lines` are CR-free.
  */
-export function continuationLineCount(following: string[]): number {
-  const lines = following.map((line) => line.replace(/\r$/, ''));
-  let i = 0;
-  for (; i < lines.length; i++) {
+function continuationLineCount(lines: readonly string[]): number {
+  let count = 0;
+  for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!line.trim()) break;
     if (MD_STRUCTURE_LINE_RE.test(line)) break;
@@ -603,8 +603,30 @@ export function continuationLineCount(following: string[]): number {
     // Look ahead one line: a setext underline below makes THIS line a heading
     // title, so stop before consuming it rather than after.
     if (i + 1 < lines.length && SETEXT_UNDERLINE_RE.test(lines[i + 1])) break;
+    count++;
   }
-  return i;
+  return count;
+}
+
+/**
+ * The index just past a single-line field's value AND the continuation lines that wrap it
+ * (#4945). `valueEnd` is where the field's own line ends (before its line terminator). Replacing
+ * `content.slice(valueEnd, result)` with nothing removes every continuation line and the
+ * terminator in front of each, so the terminator after the last one stays. Returns `valueEnd`
+ * when nothing continues the value.
+ */
+export function fieldContinuationEnd(content: string, valueEnd: number): number {
+  const tail = content.slice(valueEnd);
+  const first = /^\r?\n/.exec(tail);
+  if (!first) return valueEnd;
+  const rawLines = tail.slice(first[0].length).split('\n');
+  const count = continuationLineCount(rawLines.map((line) => line.replace(/\r$/, '')));
+  if (count === 0) return valueEnd;
+  let removed = first[0].length + (count - 1);
+  for (let i = 0; i < count; i++) removed += rawLines[i].length;
+  // The terminator after the last continuation line stays; on a CRLF document that includes its CR.
+  if (rawLines[count - 1].endsWith('\r')) removed -= 1;
+  return valueEnd + removed;
 }
 
 /** A session field `insertMissingSessionFields` may add. */
@@ -641,7 +663,7 @@ export function insertMissingSessionFields(body: string, fields: readonly Sessio
     for (let j = k - 1; j >= 0; j--) {
       const anchor = lineOf(fields[j].label);
       if (anchor === -1) continue;
-      const tailEnd = anchor + 1 + continuationLineCount(lines.slice(anchor + 1));
+      const tailEnd = anchor + 1 + continuationLineCount(lines.slice(anchor + 1).map((l) => l.replace(/\r$/, '')));
       let at = anchor + 1;
       while (at < tailEnd && !fenced[at]) at++;
       return { at, anchor };
