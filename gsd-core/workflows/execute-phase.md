@@ -104,6 +104,15 @@ Parse JSON for: `executor_model`, `verifier_model`, `commit_docs`, `parallelizat
 
 @~/.claude/gsd-core/references/execute-phase-response-language.md
 
+Reset the wave-failure tally (#4915). Fenced `bash` blocks are separate shells, so the post-merge gate's cumulative count reaches step 5.8 through a handoff file; a previous run's tally must not leak in:
+
+```bash
+# gsd-handoff:begin wave-failure-reset
+_GSD_HANDOFF="$( { git rev-parse --absolute-git-dir 2>/dev/null || echo "${TMPDIR:-/tmp}/gsd-$(pwd | cksum | cut -d' ' -f1)"; } )/gsd-handoff"; mkdir -p "$_GSD_HANDOFF"
+: > "$_GSD_HANDOFF/wave-failures"
+# gsd-handoff:end wave-failure-reset
+```
+
 Read runtime/worktree config and fail closed before any executor dispatch:
 
 ```bash
@@ -970,6 +979,16 @@ increases monotonically across waves. `{status}` is `complete` (success),
    **For each active entry where `kind == "gate"`** (process in array order): read and execute `gsd-core/workflows/execute-phase/steps/wave-post-gate-hooks.md` for the full evaluation contract (check validation, `onError`, blocking semantics, mapper spawn). A gate declared `blocking: false` — the `drift` capability's codebase-drift gate is one — is non-blocking by contract: it reports and the wave continues. When all active gates are processed without a blocking halt, continue to step 5.8.
 
 5.8. **Handle test gate failures (when `WAVE_FAILURE_COUNT > 0`):**
+
+   Read the count the post-merge gate recorded (#4915); a shell variable set in step 5.6 is gone by now:
+
+   ```bash
+   # gsd-handoff:begin wave-failure-read
+   _GSD_HANDOFF="$( { git rev-parse --absolute-git-dir 2>/dev/null || echo "${TMPDIR:-/tmp}/gsd-$(pwd | cksum | cut -d' ' -f1)"; } )/gsd-handoff"; mkdir -p "$_GSD_HANDOFF"
+   WAVE_FAILURE_COUNT=$(wc -l < "$_GSD_HANDOFF/wave-failures" 2>/dev/null | tr -d ' ' || true); WAVE_FAILURE_COUNT=${WAVE_FAILURE_COUNT:-0}
+   echo "WAVE_FAILURE_COUNT=${WAVE_FAILURE_COUNT}"
+   # gsd-handoff:end wave-failure-read
+   ```
 
    ```
    ## ⚠ Post-Merge Test Failure (cumulative failures: ${WAVE_FAILURE_COUNT})
