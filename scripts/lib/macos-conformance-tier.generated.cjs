@@ -191,6 +191,7 @@ module.exports = {
   "tests/response-language-coverage.test.cjs",
   "tests/retired-artifact-cleanup.test.cjs",
   "tests/review-build-prompt-optional-sections.test.cjs",
+  "tests/review-lane-invocation.test.cjs",
   "tests/review-lane-runner.test.cjs",
   "tests/review-lane-windows-spawn-resolution.test.cjs",
   "tests/review-parallel-lanes.test.cjs",
