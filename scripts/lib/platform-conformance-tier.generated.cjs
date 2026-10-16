@@ -248,6 +248,7 @@ module.exports = {
   "tests/quick-batch-command-router.stdin.test.cjs",
   "tests/quick-batch.test.cjs",
   "tests/quick-branching.test.cjs",
+  "tests/quick-commit-boundary.test.cjs",
   "tests/quick-research.test.cjs",
   "tests/quick-review-scope-tip-bound.test.cjs",
   "tests/read-guard.test.cjs",

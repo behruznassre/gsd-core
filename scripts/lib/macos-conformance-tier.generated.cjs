@@ -183,6 +183,7 @@ module.exports = {
   "tests/quick-batch-command-router.stdin.test.cjs",
   "tests/quick-batch.test.cjs",
   "tests/quick-branching.test.cjs",
+  "tests/quick-commit-boundary.test.cjs",
   "tests/quick-research.test.cjs",
   "tests/reapply-verify-hunks.test.cjs",
   "tests/refactor-1390-t3-characterization.test.cjs",
