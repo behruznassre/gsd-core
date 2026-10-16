@@ -299,10 +299,10 @@ gsd_run query commit "docs: initialize project" --files .planning/PROJECT.md
 
 **If auto mode:** Skip — config was collected in Step 2a. Proceed to Step 5.5.
 
-**Check for global defaults** at `~/.gsd/defaults.json`. If the file exists, read and display its contents before asking:
+**Check for global defaults** at `${GSD_HOME:-$HOME}/.gsd/defaults.json` (`~/.gsd/defaults.json` unless `GSD_HOME` is set). If the file exists, read and display its contents before asking:
 
 ```bash
-DEFAULTS_RAW=$(cat ~/.gsd/defaults.json 2>/dev/null)
+DEFAULTS_RAW=$(cat "${GSD_HOME:-$HOME}/.gsd/defaults.json" 2>/dev/null)
 ```
 
 Format the JSON into human-readable bullets using these label mappings:
