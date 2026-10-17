@@ -243,7 +243,7 @@ function resolveGuardProject(cwd) {
   // own `.planning` is never such a boundary, even when it is a symlink to an
   // external store with a repository of its own (#4815, as findProjectRoot).
   const inPlanning = path.relative(path.join(anchor, '.planning'), base);
-  if (inPlanning === '..' || inPlanning.startsWith(`..${path.sep}`) || path.isAbsolute(inPlanning)) {
+  if (inPlanning === '..' || inPlanning.startsWith(`..${path.sep}`) || path.isAbsolute(inPlanning)) { // allow-handrolled-containment: runs before any runtime build (unbuildable runtime must not decide the #2843 boundary), so src/security.cts's compiled predicate is not reachable here
     const ownRepo = gitCommonDirOf(base);
     const projectRepo = gitCommonDirOf(anchor);
     if (ownRepo.undetermined || projectRepo.undetermined) {
