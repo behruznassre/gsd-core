@@ -295,3 +295,74 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
     });
   }
 });
+
+// #4885 review (M4): the hook decides "which project, if any" BEFORE any build,
+// with its own pure-fs walk (nearestProjectConfigDir) and a git repo-boundary
+// check (gitCommonDirOf), beside src/project-root.cts's findProjectRoot. The
+// rows above run with both collaborators faked, so nothing ties the two
+// notions together. This table runs the REAL hook and the REAL findProjectRoot
+// over the same directories: when the hook names a project, it is the root
+// findProjectRoot resolves; when the hook says "not a project", findProjectRoot
+// does not land on a configured project either.
+describe('#4885 parity: resolveGuardProject agrees with findProjectRoot (review M4)', () => {
+  const { execFileSync } = require('node:child_process');
+  const { GIT_FIXTURE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+  const gitInit = (dir) => execFileSync('git', ['init', '-q'], { cwd: dir, timeout: GIT_FIXTURE_TIMEOUT_MS });
+  const real = (p) => fs.realpathSync.native(p);
+  const deep = (base, n) => path.join(base, ...'abcdefghij'.slice(0, n).split(''));
+
+  function world(t) {
+    const top = real(fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-guard-parity-')));
+    t.after(() => cleanup(top));
+    const project = path.join(top, 'project');
+    fs.mkdirSync(path.join(project, '.planning'), { recursive: true });
+    fs.writeFileSync(path.join(project, '.planning', 'config.json'), '{}');
+    gitInit(project);
+    const nested = path.join(project, 'vendor', 'child');
+    fs.mkdirSync(path.join(nested, 'src'), { recursive: true });
+    gitInit(nested);
+    const plain = path.join(top, 'plain');
+    fs.mkdirSync(plain);
+    gitInit(plain);
+    for (const n of [3, 10]) fs.mkdirSync(deep(project, n), { recursive: true });
+    return { project, nested, plain };
+  }
+
+  function assertAgree(cwd) {
+    const { resolveGuardProject } = require(SENTINEL_MODULE_PATH);
+    const { findProjectRoot } = require(PROJECT_ROOT_PATH);
+    const verdict = resolveGuardProject(cwd);
+    const found = findProjectRoot(cwd);
+    const configured = fs.existsSync(path.join(found, '.planning', 'config.json'));
+    if (verdict.project && verdict.root) {
+      assert.equal(real(verdict.root), real(found), `${cwd}: the hook's root is the one findProjectRoot resolves`);
+    } else {
+      assert.deepEqual(verdict, { project: false }, `${cwd}: ${JSON.stringify(verdict)}`);
+      assert.ok(!configured, `${cwd}: the hook says "not a project" but findProjectRoot resolved the configured project ${found}`);
+    }
+    return verdict;
+  }
+
+  test('project root, 3 and 10 levels below it: the same root', (t) => {
+    const { project } = world(t);
+    for (const cwd of [project, deep(project, 3), deep(project, 10)]) {
+      assert.equal(assertAgree(cwd).project, true, cwd);
+    }
+  });
+
+  test('an independent nested repository inside the project, and a repository with no GSD project: neither is the project', (t) => {
+    const { nested, plain } = world(t);
+    for (const cwd of [nested, path.join(nested, 'src'), plain]) {
+      assert.equal(assertAgree(cwd).project, false, cwd);
+    }
+  });
+
+  test('a nested repository with a config-less .planning/ of its own is still not the project', (t) => {
+    // The one shape where only the hook's pre-build boundary decides: past it,
+    // findProjectRoot stops at the child's own .planning/ and the hook would
+    // call the dispatch unresolved instead of "not this project".
+    const { nested } = world(t);
+    fs.mkdirSync(path.join(nested, '.planning'));
+    assert.equal(assertAgree(path.join(nested, 'src')).project, false);
+  });
+});
