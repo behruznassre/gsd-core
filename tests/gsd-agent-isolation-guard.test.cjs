@@ -2150,6 +2150,29 @@ describe('gsd-agent-isolation-guard.js: #4885 review (2026-10-10) — subdirecto
     assert.equal(r.status, 0, `stdout: ${r.stdout} stderr: ${r.stderr}`);
   });
 
+  // #4885 review (Minor 2): a repository nested INSIDE the `.planning` store
+  // skipped the boundary check (the store is never a boundary), so a cold
+  // runtime denied it as runtime_build_failed while a built one allowed it.
+  // The check now compares against the store's own repository: same verdict.
+  test('a repository nested inside the .planning store gets one verdict, cold runtime or built -> ALLOW', (t) => {
+    const cold = buildColdInstallTree();
+    t.after(cold.cleanup);
+    const project = mkProject('gsd-aig-4885r-planest-');
+    t.after(() => cleanup(project));
+    writeConfig(project, JSON.stringify({ runtime: 'claude' }));
+    const child = path.join(project, '.planning', 'vendor', 'child');
+    fs.mkdirSync(child, { recursive: true });
+    git(['init', '-q'], child);
+    const built = runHook(agentPayload({ cwd: child }), child);
+    assert.equal(built.status, 0, `built: stdout: ${built.stdout} stderr: ${built.stderr}`);
+    const env = { ...process.env };
+    delete env.GSD_RUNTIME;
+    const r = toLegacyResult(runHookSeam(path.join(cold.hooksDir, 'gsd-agent-isolation-guard.js'), [], {
+      input: JSON.stringify(agentPayload({ cwd: child })), cwd: child, env, timeoutMs: PROBE_TIMEOUT_MS,
+    }));
+    assert.equal(r.status, 0, `cold: stdout: ${r.stdout} stderr: ${r.stderr}`);
+  });
+
   // Codex review / #2843: an independent repository nested in a project, with
   // no .planning of its own, is not that project's — base allowed it, and so
   // does the guard (findProjectRoot's boundary stands).

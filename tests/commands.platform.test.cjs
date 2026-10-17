@@ -39,6 +39,7 @@
  * - "a symlinked alias into a linked worktree is still a project to the isolation guards" — creates a real directory symlink/junction into a linked worktree (symlink-keyword)
  * - "an alias to a config-less .planning/ inside a project is blocked like the real path" — creates a real directory symlink/junction inside a project (symlink-keyword)
  * - "an alias into a non-git project is evaluated like the real path" — creates a real directory symlink/junction into a project (symlink-keyword)
+ * - "a decision recorded through an alias is the one the guards read for a dispatch from that alias" — creates a real directory symlink/junction into a project (symlink-keyword)
  * - "a worktree whose path ends in a space still owns its subdirectory" — a trailing space is not a valid Windows path component (process-platform)
  */
 
@@ -1053,6 +1054,44 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
     const viaAlias = evaluateDispatch(payload(alias));
     assert.equal(direct.action, 'block', JSON.stringify(direct));
     assert.deepEqual([viaAlias.action, viaAlias.reasonCode], [direct.action, direct.reasonCode]);
+  });
+
+  // #4885 review (Major): through an alias into a non-git project, gsd-tools
+  // writes the decision under the alias while the guards evaluate the canonical
+  // project. Reading the sentinel from the canonical root missed it, so a
+  // recorded harness-worktree decision did not block an unflagged dispatch.
+  test('a decision recorded through an alias is the one the guards read for a dispatch from that alias', () => {
+    const { TOOLS_PATH } = require('./helpers.cjs');
+    const { evaluateDispatch } = require('../hooks/gsd-agent-isolation-guard.js');
+    const { resolveGuardProject, readSentinel } = require('../hooks/lib/isolation-sentinel.js');
+    const project = createTempDir('gsd-4885-alias-record-');
+    dirs.push(project);
+    fs.mkdirSync(path.join(project, '.planning'), { recursive: true });
+    fs.writeFileSync(path.join(project, '.planning', 'config.json'), '{}');
+    const deep = path.join(project, 'src', 'deep');
+    fs.mkdirSync(deep, { recursive: true });
+    const aliasParent = createTempDir('gsd-4885-alias-record-link-');
+    dirs.push(aliasParent);
+    const alias = path.join(aliasParent, 'alias');
+    fs.symlinkSync(deep, alias, 'junction');
+    const payload = { tool_name: 'Agent', cwd: alias, tool_input: { subagent_type: 'gsd-executor' } };
+    // Without a recorded decision this project allows the dispatch, so a block below is the decision's.
+    assert.equal(evaluateDispatch(payload).action, 'allow');
+
+    const rec = runNode([TOOLS_PATH, 'query', 'record-dispatch-isolation', '--isolation', 'harness-worktree',
+      '--harness-flag', 'isolation="worktree"', '--json', '--cwd', alias],
+    { cwd: alias, env: { ...process.env, ...TEST_ENV_BASE } });
+    assert.equal(rec.exitCode, 0, rec.stderr);
+    assert.equal(JSON.parse(rec.stdout).recorded, true);
+
+    // The configuration stays the canonical project's: an alias cannot route around it.
+    assert.equal(fs.realpathSync.native(resolveGuardProject(alias).root), fs.realpathSync.native(project));
+    const r = evaluateDispatch(payload);
+    assert.deepEqual([r.action, r.reasonCode], ['block', 'harness_flag_missing'], JSON.stringify(r));
+    // The Cursor guard reads through the same sentinelRoot; its own verdict here is
+    // the non-git "isolation not applicable" allow (#3045), so the read itself is pinned.
+    const sentinel = readSentinel(resolveGuardProject(alias).sentinelRoot);
+    assert.deepEqual([sentinel.present, sentinel.isolation], [true, 'harness-worktree']);
   });
 
   // Codex review: an alias whose lexical ancestors hold no project was

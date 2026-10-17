@@ -193,14 +193,17 @@ function nearestProjectConfigDir(cwd) {
  * not answer "safe"):
  *
  *   { project: false }                          no project applies to `cwd`
- *   { project: true, root, sentinelRoot: root } evaluate the project at `root`
+ *   { project: true, root, sentinelRoot }       evaluate the project at `root`,
+ *                                               reading the sentinel for `sentinelRoot`
  *   { project: true, root: null, error }        `cwd` is inside a GSD project,
  *                                               but which root governs it
  *                                               could not be verified — deny
  *
- * The root is always the one gsd-tools writes the sentinel under
- * (`resolveProjectRootOrThrow`): the sentinel and the config are read from the
- * same place, and no other root's configuration is ever substituted.
+ * The root is the one gsd-tools resolves (`resolveProjectRootOrThrow`), and no
+ * other root's configuration is ever substituted. Through a symlinked alias the
+ * configuration comes from the canonical project (an alias cannot route around
+ * it) while `sentinelRoot` stays where gsd-tools, given that same `cwd`, wrote
+ * the decision — so neither half reads another location's answer.
  *
  * A pure-fs probe runs first — the lexical path, then (only when that finds
  * nothing, so a `.planning` symlink to an external store keeps its #4815
@@ -235,22 +238,27 @@ function resolveGuardProject(cwd) {
     if (anchor === null) return { project: false };
     from = base;
   }
-  if (anchor === base) return { project: true, root: from, sentinelRoot: from };
+  // #4885 review: through an alias the configuration is the canonical project's,
+  // but the sentinel is read where gsd-tools, given this same `cwd`, writes it.
+  const sentinelRootFor = (root) => (from === cwd ? root : resolveSentinelRoot(cwd));
+  if (anchor === base) return { project: true, root: from, sentinelRoot: sentinelRootFor(from) };
   const unresolved = (message) => ({ project: true, root: null, error: new Error(message) });
   // #2843: an independent repository nested in the project is not the
   // project's. Decided by git directly — before any runtime build, so an
   // unbuildable runtime never turns that boundary into a denial. The project's
   // own `.planning` is never such a boundary, even when it is a symlink to an
-  // external store with a repository of its own (#4815, as findProjectRoot).
-  const inPlanning = path.relative(path.join(anchor, '.planning'), base);
-  if (inPlanning === '..' || inPlanning.startsWith(`..${path.sep}`) || path.isAbsolute(inPlanning)) { // allow-handrolled-containment: runs before any runtime build (unbuildable runtime must not decide the #2843 boundary), so src/security.cts's compiled predicate is not reachable here
-    const ownRepo = gitCommonDirOf(base);
-    const projectRepo = gitCommonDirOf(anchor);
-    if (ownRepo.undetermined || projectRepo.undetermined) {
-      return unresolved(`git could not say which repository '${cwd}' belongs to (${ownRepo.undetermined || projectRepo.undetermined}).`);
-    }
-    if (ownRepo.dir !== projectRepo.dir) return { project: false };
+  // external store with a repository of its own (#4815, as findProjectRoot):
+  // inside it, the comparison is against the store's repository, so only a
+  // repository nested in the store is independent (#4885 review).
+  const planningDir = path.join(anchor, '.planning');
+  const inPlanning = path.relative(planningDir, base);
+  const outsidePlanning = inPlanning === '..' || inPlanning.startsWith(`..${path.sep}`) || path.isAbsolute(inPlanning); // allow-handrolled-containment: runs before any runtime build (unbuildable runtime must not decide the #2843 boundary), so src/security.cts's compiled predicate is not reachable here
+  const ownRepo = gitCommonDirOf(base);
+  const projectRepo = gitCommonDirOf(outsidePlanning ? anchor : planningDir);
+  if (ownRepo.undetermined || projectRepo.undetermined) {
+    return unresolved(`git could not say which repository '${cwd}' belongs to (${ownRepo.undetermined || projectRepo.undetermined}).`);
   }
+  if (ownRepo.dir !== projectRepo.dir) return { project: false };
   let resolved;
   try {
     resolved = resolveProjectRootOrThrow(from);
@@ -259,7 +267,7 @@ function resolveGuardProject(cwd) {
   }
   if (resolved.reason === 'git_timed_out') return unresolved(`git timed out resolving which checkout '${cwd}' belongs to.`);
   const root = resolved.root;
-  if (fs.existsSync(path.join(root, '.planning', 'config.json'))) return { project: true, root, sentinelRoot: root };
+  if (fs.existsSync(path.join(root, '.planning', 'config.json'))) return { project: true, root, sentinelRoot: sentinelRootFor(root) };
   if (isDirectory(path.join(root, '.planning'))) {
     return unresolved(`'${root}' holds a .planning/ with no config.json, inside the GSD project at '${anchor}'.`);
   }
