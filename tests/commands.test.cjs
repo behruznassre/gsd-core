@@ -6354,6 +6354,21 @@ describe('#4885 regression: linked-worktree subdirectory resolves to its own wor
       'main\'s uncommitted edit must be left alone');
   });
 
+  // #4885 review (M1): the in-process answer for a worktree that DOES carry its
+  // own `.planning/`. Every other in-process row expects null, which a probe run
+  // in the wrong directory (git answering for the test runner's own checkout)
+  // also returns — so only this row pins that the probe runs at `cwd`.
+  test('from a subdirectory of a worktree with its own .planning/, the worktree is the root', () => {
+    const { wt, sub } = mainWithWorktree({ trackPlanning: true });
+    // Three levels below the worktree top, so the `../` count git reports for
+    // cwd cannot coincide with the one for whatever directory the runner is in.
+    const deep = path.join(sub, 'third');
+    fs.mkdirSync(deep);
+    const own = ownWorktreePlanningRoot(deep);
+    assert.equal(fs.realpathSync(own.root), fs.realpathSync(wt));
+    assert.equal(own.timedOut, false);
+  });
+
   test('a worktree with no .planning/ of its own still resolves to the main checkout', () => {
     const { main, sub } = mainWithWorktree({ trackPlanning: false });
     assert.equal(ownWorktreePlanningRoot(sub).root, null);
