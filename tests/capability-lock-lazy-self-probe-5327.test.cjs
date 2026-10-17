@@ -15,9 +15,9 @@ const { runNode, OUTCOME } = require('./helpers/process-seam.cjs');
 //
 // The start-time is only ever read by lockFileBody, so the contract pinned here:
 //   - loading the module, and a whole config-reading CLI call, probe ZERO times;
-//   - the first lock write probes ONCE, before the exclusive create, and later
-//     writes reuse that value;
-//   - a FAILED probe is not cached: the next write retries, at most two probes
+//   - the first lock acquire probes ONCE, before the exclusive create, and later
+//     acquires reuse that value;
+//   - a FAILED probe is not cached: the next acquire retries, at most two probes
 //     in all, so a host whose probe never succeeds stays bounded;
 //   - the lock body still carries this process's start-time (the pid-reuse
 //     discriminator the steal path compares against is unchanged).
@@ -90,7 +90,7 @@ describe('#5327 regression: capability-lock probes its own start-time lazily', (
     return JSON.parse(res.stdout);
   }
 
-  test('module load probes zero times; the first lock write probes once and later writes reuse it', (t) => {
+  test('module load probes zero times; the first lock acquire probes once and later acquires reuse it', (t) => {
     const r = runThreeLockWrites(sandbox(t));
 
     assert.equal(r.afterLoad, 0, 'requiring capability-lock must not probe this process\'s start-time');
@@ -104,7 +104,7 @@ describe('#5327 regression: capability-lock probes its own start-time lazily', (
       t.skip('the real self probe failed on this host; the forced-failure cases pin that path');
       return;
     }
-    assert.deepEqual(r.writes.map((w) => w.probes), [1, 1, 1], 'the first lock write probes once; later writes reuse the cached start-time');
+    assert.deepEqual(r.writes.map((w) => w.probes), [1, 1, 1], 'the first lock acquire probes once; later acquires reuse the cached start-time');
     assert.deepEqual(r.events, ['probe', 'open-wx', 'open-wx', 'open-wx']);
 
     // The steal path compares a holder's recorded startTime against a fresh probe of
@@ -114,7 +114,7 @@ describe('#5327 regression: capability-lock probes its own start-time lazily', (
     assert.equal(body.startTime, r.direct, 'the lock body records this process\'s own start-time');
   });
 
-  test('a failed first probe is not cached: the next write probes again and records the start-time', (t) => {
+  test('a failed first probe is not cached: the next acquire probes again and records the start-time', (t) => {
     const r = runThreeLockWrites(sandbox(t), { GSD_TEST_FAIL_SELF_PROBES: '1' });
 
     assert.equal(r.writes[0].body.startTime, null, 'the write after a failed probe records no start-time');
@@ -127,7 +127,7 @@ describe('#5327 regression: capability-lock probes its own start-time lazily', (
     assert.equal(r.writes[2].body.startTime, r.direct);
   });
 
-  test('a probe that never succeeds stops after two attempts instead of costing one per write', (t) => {
+  test('a probe that never succeeds stops after two attempts instead of costing one per acquire', (t) => {
     const r = runThreeLockWrites(sandbox(t), { GSD_TEST_FAIL_SELF_PROBES: '2' });
 
     assert.deepEqual(r.writes.map((w) => w.probes), [1, 2, 2], 'no third probe after two failures');

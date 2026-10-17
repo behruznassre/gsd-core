@@ -73,9 +73,16 @@ childProcess.spawnSync = function countingSpawnSync(cmd, args, ...rest) {
   return res;
 };
 
+// Any exclusive create, in either spelling: the string flag, or numeric O_CREAT|O_EXCL
+// (the form src/state.cts uses), so a flag-spelling change cannot hide the create.
+const { O_CREAT, O_EXCL } = fs.constants;
+const isExclusiveCreate = (flags) => (typeof flags === 'string'
+  ? flags.includes('x')
+  : typeof flags === 'number' && (flags & (O_CREAT | O_EXCL)) === (O_CREAT | O_EXCL));
+
 const realOpenSync = fs.openSync;
 fs.openSync = function recordingOpenSync(file, flags, ...rest) {
-  if (flags === 'wx') events.push('open-wx');
+  if (isExclusiveCreate(flags)) events.push('open-wx');
   return realOpenSync.call(this, file, flags, ...rest);
 };
 

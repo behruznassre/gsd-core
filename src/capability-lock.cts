@@ -215,7 +215,7 @@ function isSameHost(parsed: ParsedLock): boolean {
  * process instance: even if a crashed holder's pid is REUSED, the new process's start-time differs.
  * Returns null on ANY error / unobtainable value (liveness cannot be VERIFIED → steal-eligible past
  * the deadman). Probing ANOTHER pid only happens on the rare STEAL-decision path; this process's own
- * start-time is probed once, on its first lock write (see selfStartTime) — never at module load (#5327).
+ * start-time is probed on its first lock acquire (see selfStartTime) — never at module load (#5327).
  */
 function getProcessStartTime(pid: number): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
@@ -248,11 +248,14 @@ function getProcessStartTime(pid: number): string | null {
 }
 
 /**
- * THIS process's start-time, probed on the first lock write and cached so later writes never re-shell.
+ * THIS process's start-time, probed on the first lock acquire and cached so later acquires never re-shell.
  * Not probed at module load: every config read loads this module, and most never take a lock (#5327).
  * Only a successful probe is cached. A failed one (a PowerShell launch past its 5 s timeout on a loaded
- * Windows host) is retried on the next write, up to SELF_PROBE_ATTEMPTS probes in all, so a host whose
- * probe never succeeds pays a bounded cost instead of one launch per write.
+ * Windows host) is retried on the next acquire, up to SELF_PROBE_ATTEMPTS probes in all, so a host whose
+ * probe never succeeds pays a bounded cost instead of one launch per acquire.
+ * Probed per acquire ATTEMPT, before the O_EXCL create, so a process whose first acquire meets a live
+ * holder still pays it: probing after a successful create instead would widen the empty-body window
+ * that the steal path's `LOCK_STALE_MS` floor relies on.
  */
 const SELF_PROBE_ATTEMPTS = 2;
 let _selfStartTime: string | null = null;
