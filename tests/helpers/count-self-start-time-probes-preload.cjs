@@ -15,6 +15,8 @@
  * ordered probe / exclusive-open events as `globalThis.__gsdSelfStartTimeEvents()`, for
  * `node -e` scripts, and printed on exit as a `GSD_SELF_START_TIME_PROBES=<n>`
  * stderr line for whole-CLI runs, next to `GSD_CAPABILITY_LOCK_LOADED=<bool>`.
+ * `globalThis.__gsdSelfStartTimeResults()` reports whether each self probe succeeded, and
+ * GSD_TEST_FAIL_SELF_PROBES=<n> forces the first n to fail.
  *
  * Loaded via `node --require <this file> ...`. One-shot subprocess: no restore.
  */
@@ -27,10 +29,28 @@ let count = 0;
 // Ordered record of self probes and exclusive ('wx') opens, so a test can assert the probe
 // runs BEFORE the lockfile is created rather than inside the held window.
 const events = [];
+// Per self probe: did the platform seam yield a usable value? A real probe can fail under load.
+const results = [];
+// GSD_TEST_FAIL_SELF_PROBES=<n> fails the first n self probes the way a real failure does
+// (the /proc read throws; the shell-out comes back as a spawn timeout), so the retry path
+// is pinned on every platform rather than only when a CI runner happens to be slow.
+let forcedFailures = Number(process.env.GSD_TEST_FAIL_SELF_PROBES) || 0;
+function forceFailure() {
+  if (forcedFailures <= 0) return false;
+  forcedFailures--;
+  return true;
+}
 
 const realReadFileSync = fs.readFileSync;
 fs.readFileSync = function countingReadFileSync(file, ...rest) {
-  if (file === `/proc/${selfPid}/stat`) { count++; events.push('probe'); }
+  if (file === `/proc/${selfPid}/stat`) {
+    count++; events.push('probe');
+    if (forceFailure()) {
+      results.push(false);
+      throw Object.assign(new Error(`ENOENT: no such file or directory, open '${file}'`), { code: 'ENOENT' });
+    }
+    results.push(true);
+  }
   return realReadFileSync.call(this, file, ...rest);
 };
 
@@ -41,8 +61,16 @@ childProcess.spawnSync = function countingSpawnSync(cmd, args, ...rest) {
   // includes(), not ===: a powershell .cmd/.bat shim is mediated through cmd.exe, which folds the
   // expression into one `/c` command string.
   const isPowershellSelf = argv.some((a) => typeof a === 'string' && a.includes(`(Get-Process -Id ${selfPid}).StartTime.Ticks`));
-  if (isPsSelf || isPowershellSelf) { count++; events.push('probe'); }
-  return realSpawnSync.call(this, cmd, args, ...rest);
+  if (!isPsSelf && !isPowershellSelf) return realSpawnSync.call(this, cmd, args, ...rest);
+  count++; events.push('probe');
+  if (forceFailure()) {
+    results.push(false);
+    const error = Object.assign(new Error(`spawnSync ${cmd} ETIMEDOUT`), { code: 'ETIMEDOUT' });
+    return { pid: 0, output: [null, '', ''], stdout: '', stderr: '', status: null, signal: 'SIGTERM', error };
+  }
+  const res = realSpawnSync.call(this, cmd, args, ...rest);
+  results.push(res.status === 0 && !res.error && String(res.stdout || '').trim() !== '');
+  return res;
 };
 
 const realOpenSync = fs.openSync;
@@ -53,6 +81,7 @@ fs.openSync = function recordingOpenSync(file, flags, ...rest) {
 
 globalThis.__gsdSelfStartTimeProbes = () => count;
 globalThis.__gsdSelfStartTimeEvents = () => events.slice();
+globalThis.__gsdSelfStartTimeResults = () => results.slice();
 
 process.on('exit', () => {
   // Whether capability-lock was loaded at all, so a zero count can never pass vacuously.

@@ -250,11 +250,18 @@ function getProcessStartTime(pid: number): string | null {
 /**
  * THIS process's start-time, probed on the first lock write and cached so later writes never re-shell.
  * Not probed at module load: every config read loads this module, and most never take a lock (#5327).
- * `undefined` = not probed yet; `null` = probed, unobtainable.
+ * Only a successful probe is cached. A failed one (a PowerShell launch past its 5 s timeout on a loaded
+ * Windows host) is retried on the next write, up to SELF_PROBE_ATTEMPTS probes in all, so a host whose
+ * probe never succeeds pays a bounded cost instead of one launch per write.
  */
-let _selfStartTime: string | null | undefined;
+const SELF_PROBE_ATTEMPTS = 2;
+let _selfStartTime: string | null = null;
+let _selfProbeAttempts = 0;
 function selfStartTime(): string | null {
-  if (_selfStartTime === undefined) _selfStartTime = getProcessStartTime(process.pid);
+  if (_selfStartTime === null && _selfProbeAttempts < SELF_PROBE_ATTEMPTS) {
+    _selfProbeAttempts++;
+    _selfStartTime = getProcessStartTime(process.pid);
+  }
   return _selfStartTime;
 }
 
