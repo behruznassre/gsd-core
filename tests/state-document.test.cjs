@@ -28,6 +28,8 @@ const {
   FIELD_LINE_BREAK_RE,
   maskFencedLines,
   writeOutsideFences,
+  markdownFencedBlocks,
+  fieldContinuationEnd,
 } = require('../gsd-core/bin/lib/state-document.cjs');
 const { scanFencedBlocks } = require('../gsd-core/bin/lib/markdown-sectionizer.cjs');
 
@@ -3007,5 +3009,116 @@ describe('insertMissingSessionFields (#4998)', () => {
         }
       },
     ));
+  });
+});
+
+// #4998 review (Minor 1): in-process rows for the paths the CLI rows in
+// tests/state.test.cjs reach only out of process — the in-line line break of
+// editedLineContinuation and the whole-document frontmatter branch of the fence
+// helpers — so their behavior is pinned where a mutation run can see it.
+describe('#4998 in-process: in-line breaks and the whole-document fence scope', () => {
+  const edit = (before, from, to) => before.replace(from, to);
+
+  test('editedLineContinuation: text after an in-line CR / U+2028 / U+2029 is the continuation, joined with spaces', () => {
+    const before = 'Last session: one\u2028two\u2029 three \rfour\nStopped at: x\n';
+    assert.equal(editedLineContinuation(before, edit(before, 'one', 'ONE')), 'two three four');
+  });
+
+  test('editedLineContinuation: an in-line break on the LAST line (no terminator) still yields its tail', () => {
+    const before = 'Stopped at: x\nLast session: one\u2028tail';
+    assert.equal(editedLineContinuation(before, edit(before, 'one', 'ONE')), 'tail');
+  });
+
+  test('editedLineContinuation: an unchanged write has no continuation even when the last line wraps in-line', () => {
+    // Nothing changed, so nothing the write touched can be wrapped.
+    const doc = 'Last session: one\u2028tail';
+    assert.equal(editedLineContinuation(doc, doc), null);
+  });
+
+  test('editedLineContinuation: an edited last line with no break has no continuation', () => {
+    assert.equal(editedLineContinuation('Stopped at: x', 'Stopped at: y'), null);
+  });
+
+  test('editedLineContinuation: an indented table row without a closing pipe is still a table row', () => {
+    // A table cell cannot wrap, so the line below is never its continuation.
+    const before = '  | Resume file | None\nnot a continuation\n';
+    assert.equal(editedLineContinuation(before, edit(before, 'None', 'x.md')), null);
+  });
+
+  // Frontmatter whose block scalar holds a ``` line, then a real fence in the body.
+  const doc = [
+    '---',            // 0
+    'a: 1',           // 1
+    'b: |',           // 2
+    '  ```',          // 3  YAML data, not a fence
+    '  x',            // 4
+    '---',            // 5
+    '# Title',        // 6
+    'Status: live',   // 7
+    '```',            // 8
+    'Status: fenced', // 9
+    '```',            // 10
+    'tail',           // 11
+  ];
+  const blank = (line) => line.replace(/[^\r]/g, ' ');
+
+  test('document scope: frontmatter content is blanked (delimiters kept) and its ``` never opens a fence', () => {
+    const expected = doc.map((line, i) => ((i >= 1 && i <= 4) || (i >= 8 && i <= 10) ? blank(line) : line));
+    assert.equal(maskFencedLines(doc.join('\n'), { document: true }), expected.join('\n'));
+    assert.deepEqual(
+      markdownFencedBlocks(doc, { document: true }).map((b) => [b.openLineIdx, b.closeLineIdx]),
+      [[8, 10]],
+      'only the body fence is a fence; line indices are those of the whole document',
+    );
+  });
+
+  test('section scope: a leading --- is a rule, so the same ``` line DOES open a fence', () => {
+    // The scope switch is what keeps a session body that opens with rules from being read as YAML.
+    const masked = maskFencedLines(doc.join('\n')).split('\n');
+    assert.equal(masked[1], 'a: 1', 'outside document scope nothing is frontmatter');
+    assert.equal(masked[7], blank('Status: live'), 'the fence opened at line 3 runs to line 8');
+    assert.equal(masked[9], 'Status: fenced', 'and line 9 is outside every fence');
+    assert.deepEqual(markdownFencedBlocks(doc).map((b) => b.openLineIdx), [3, 10]);
+  });
+
+  test('document scope: an UNCLOSED frontmatter block is Markdown, so its ``` lines are a real fence', () => {
+    const open = ['---', '```', 'Status: example', '```', 'Status: live'];
+    const masked = maskFencedLines(open.join('\n'), { document: true }).split('\n');
+    assert.deepEqual(masked, ['---', blank('```'), blank('Status: example'), blank('```'), 'Status: live']);
+  });
+
+  test('document scope on CRLF: the same lines are masked and every CR is kept', () => {
+    const crlf = doc.join('\r\n');
+    const expected = doc.map((line, i) => ((i >= 1 && i <= 4) || (i >= 8 && i <= 10) ? blank(line) : line));
+    assert.equal(maskFencedLines(crlf, { document: true }), expected.join('\r\n'));
+  });
+});
+
+// #4945's fieldContinuationEnd (shared with this PR's record-session path) is
+// otherwise reached only through out-of-process begin-phase rows. Its contract:
+// removing content.slice(valueEnd, end) drops every wrapped line and the
+// terminator in front of each, and keeps the terminator after the last one.
+describe('#4998 in-process: fieldContinuationEnd removes exactly the wrapped lines', () => {
+  const dropTail = (content) => {
+    const valueEnd = content.indexOf('A: x') + 'A: x'.length;
+    return content.slice(0, valueEnd) + content.slice(fieldContinuationEnd(content, valueEnd));
+  };
+
+  test('two wrapped lines go, the blank line and what follows stay', () => {
+    assert.equal(dropTail('A: x\nwrap one\nwrap two\n\nnext'), 'A: x\n\nnext');
+  });
+
+  test('a value at end of file, or followed by a sibling field, heading or setext title, has no tail', () => {
+    for (const content of ['A: x', 'A: x\nB: y', 'A: x\n# Heading', 'A: x\nTitle\n=====']) {
+      assert.equal(fieldContinuationEnd(content, 4), 4, JSON.stringify(content));
+    }
+  });
+
+  test('CRLF: the wrapped line and its CR go, the CRLF after it stays', () => {
+    assert.equal(dropTail('A: x\r\nwrap one\r\n\r\nB'), 'A: x\r\n\r\nB');
+  });
+
+  test('a wrapped tail running to end of file is removed whole', () => {
+    assert.equal(dropTail('A: x\nwrap one\nwrap two'), 'A: x');
   });
 });
