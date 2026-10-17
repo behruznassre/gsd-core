@@ -243,7 +243,7 @@ function resolveGuardProject(cwd) {
   // own `.planning` is never such a boundary, even when it is a symlink to an
   // external store with a repository of its own (#4815, as findProjectRoot).
   const inPlanning = path.relative(path.join(anchor, '.planning'), base);
-  if (inPlanning.startsWith('..') || path.isAbsolute(inPlanning)) {
+  if (inPlanning === '..' || inPlanning.startsWith(`..${path.sep}`) || path.isAbsolute(inPlanning)) {
     const ownRepo = gitCommonDirOf(base);
     const projectRepo = gitCommonDirOf(anchor);
     if (ownRepo.undetermined || projectRepo.undetermined) {

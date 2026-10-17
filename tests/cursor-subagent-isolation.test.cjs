@@ -1242,4 +1242,26 @@ describe('#4885: the guards read the sentinel where gsd-tools wrote it, through 
     const cursorVerdict = require('../hooks/gsd-cursor-subagent-start.js').evaluateRootIsolation(phaseDir, 'gsd-executor');
     assert.equal(cursorVerdict.action, 'deny', JSON.stringify(cursorVerdict));
   });
+
+  // #4885 review (N1): a child of `.planning` whose name merely STARTS with `..`
+  // is still inside it. Read as outside, the store's own repository looked like an
+  // independent nested one and the guards answered "not this project".
+  test('a .planning child named ..foo is inside .planning, not a nested repository', (t) => {
+    if (symlinkError) {
+      t.skip('directory symlinks require elevated privileges on this platform');
+      return;
+    }
+    const dotDir = path.join(project, '.planning', '..foo');
+    fs.mkdirSync(dotDir, { recursive: true });
+    const { TOOLS_PATH: toolsPath, TEST_ENV_BASE } = require('./helpers.cjs');
+    const rec = runNode([toolsPath, 'query', 'record-dispatch-isolation', '--isolation', 'harness-worktree',
+      '--harness-flag', 'isolation="worktree"', '--json', '--cwd', dotDir],
+    { cwd: dotDir, env: { ...process.env, ...TEST_ENV_BASE }, timeoutMs: PROBE_TIMEOUT_MS });
+    assert.equal(rec.exitCode, 0, rec.stderr);
+    const { evaluateDispatch } = require('../hooks/gsd-agent-isolation-guard.js');
+    const r = evaluateDispatch({ tool_name: 'Agent', cwd: dotDir, tool_input: { subagent_type: 'gsd-executor' } });
+    assert.equal(r.action, 'block', JSON.stringify(r));
+    const cursorVerdict = require('../hooks/gsd-cursor-subagent-start.js').evaluateRootIsolation(dotDir, 'gsd-executor');
+    assert.equal(cursorVerdict.action, 'deny', JSON.stringify(cursorVerdict));
+  });
 });

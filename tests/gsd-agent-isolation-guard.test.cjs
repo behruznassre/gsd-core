@@ -2099,18 +2099,17 @@ describe('gsd-agent-isolation-guard.js: #4885 review (2026-10-10) — subdirecto
 
   // Major 3: the guard answered "not a project" 11+ levels down (findProjectRoot's
   // bound). Within the bound the project is resolved and evaluated; past it the
-  // dispatch is blocked too — evaluated where git resolves the root, otherwise
-  // refused as unresolved (which one depends on how the OS spells the temp root).
+  // dispatch is refused as unresolved. The root is realpathed so the verdict does
+  // not depend on how the OS spells its temp directory (macOS /var vs /private/var).
   for (const depth of [9, 10, 11, 12]) {
     test(`Major 3: a dispatch ${depth} levels below a harness-worktree project root is blocked`, (t) => {
       const project = mkProject(`gsd-aig-4885r-d${depth}-`);
       t.after(() => cleanup(project));
       writeConfig(project, JSON.stringify({ runtime: 'claude' }));
-      const deep = path.join(project, ...'abcdefghijkl'.slice(0, depth).split(''));
+      const deep = path.join(fs.realpathSync.native(project), ...'abcdefghijkl'.slice(0, depth).split(''));
       fs.mkdirSync(deep, { recursive: true });
       const out = block(runHook(agentPayload({ cwd: deep }), deep));
-      if (depth <= 10) assert.equal(out.reason_code, REASON_CODE.HARNESS_FLAG_MISSING);
-      else assert.ok([REASON_CODE.HARNESS_FLAG_MISSING, REASON_CODE.CONFIG_UNREADABLE].includes(out.reason_code), out.reason_code);
+      assert.equal(out.reason_code, depth <= 10 ? REASON_CODE.HARNESS_FLAG_MISSING : REASON_CODE.CONFIG_UNREADABLE);
     });
   }
 
