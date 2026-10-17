@@ -49,7 +49,14 @@ fs.readFileSync = function countingReadFileSync(file, ...rest) {
       results.push(false);
       throw Object.assign(new Error(`ENOENT: no such file or directory, open '${file}'`), { code: 'ENOENT' });
     }
-    results.push(true);
+    try {
+      const out = realReadFileSync.call(this, file, ...rest);
+      results.push(true);
+      return out;
+    } catch (err) {
+      results.push(false);
+      throw err;
+    }
   }
   return realReadFileSync.call(this, file, ...rest);
 };

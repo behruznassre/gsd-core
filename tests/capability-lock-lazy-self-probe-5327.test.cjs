@@ -111,6 +111,13 @@ describe('#5327 regression: capability-lock probes its own start-time lazily', (
     // that pid, so the body must still carry the value a direct probe returns.
     const body = r.writes[0].body;
     assert.equal(body.pid, Number(body.token.split('-')[0]));
+    assert.equal(typeof body.startTime, 'string', 'a successful probe\'s start-time reaches the lock body');
+    assert.ok(r.writes.every((w) => w.body.startTime === body.startTime), 'later acquires record the cached value');
+    // The reference probe is a fresh real probe too, and can fail on its own.
+    if (r.direct === null) {
+      t.skip('the reference probe failed on this host; the recorded value is checked above');
+      return;
+    }
     assert.equal(body.startTime, r.direct, 'the lock body records this process\'s own start-time');
   });
 
@@ -123,8 +130,13 @@ describe('#5327 regression: capability-lock probes its own start-time lazily', (
       t.skip('the real retry probe failed on this host as well');
       return;
     }
-    assert.equal(r.writes[1].body.startTime, r.direct, 'the retried probe\'s start-time reaches the lock body');
-    assert.equal(r.writes[2].body.startTime, r.direct);
+    assert.equal(typeof r.writes[1].body.startTime, 'string', 'the retried probe\'s start-time reaches the lock body');
+    assert.equal(r.writes[2].body.startTime, r.writes[1].body.startTime, 'the retried success is reused');
+    if (r.direct === null) {
+      t.skip('the reference probe failed on this host; the recorded value is checked above');
+      return;
+    }
+    assert.equal(r.writes[1].body.startTime, r.direct);
   });
 
   test('a probe that never succeeds stops after two attempts instead of costing one per acquire', (t) => {
