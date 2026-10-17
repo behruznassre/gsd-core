@@ -104,7 +104,7 @@ function isReapStderrSweepLine(sign, body, addedBodies, removedBodies) {
  * gate. Any OTHER line — ordinary quick prose, steps, contracts — still trips
  * this row exactly as before.
  *
- * #4941 adds the fifth, `isReapStderrSweepLine`: the orphan sweep's call line
+ * #4941 adds the sixth, `isReapStderrSweepLine`: the orphan sweep's call line
  * swapped `2>/dev/null` for `>/dev/null` in all three callers so its stderr
  * reaches the operator. Only that paired swap is exempt.
  */
@@ -130,7 +130,13 @@ function editsBeyondSharedDirective(base, file) {
     // sweep -- not quick-batch phase work. Any OTHER line still trips this row.
     if (body.includes('$ARGUMENTS') || body.includes('`<arguments>` block')) return false;
     if (body === '<arguments>$ARGUMENTS</arguments>' || body.startsWith('The text inside `<arguments>` is exactly what the user typed')) return false;
-    // #4941 fifth mechanical-sweep carve-out (isReapStderrSweepLine above).
+    // #5143 fifth mechanical-sweep carve-out: the argument-capture sweep gives every
+    // shell fence that reads the typed text the same four-line quoted-heredoc capture
+    // and renames each use to the captured variable. Those lines are that sweep -- not
+    // quick-batch phase work. The exact capture lines and the renamed uses only.
+    if (body === "IFS= read -rd '' GSD_ARGS <<'GSD_ARGS_END' || true" || body === 'GSD_ARGS_END' || body === "GSD_ARGS=${GSD_ARGS%$'\\n'}") return false;
+    if (/\$\{?GSD_ARGS\b/.test(body)) return false;
+    // #4941 sixth mechanical-sweep carve-out (isReapStderrSweepLine above).
     if (isReapStderrSweepLine(line[0], body, addedBodies, removedBodies)) return false;
     return !importsDirectiveReference(body);
   });
