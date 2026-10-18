@@ -2192,6 +2192,24 @@ describe('gsd-agent-isolation-guard.js: #4885 review (2026-10-10) — subdirecto
     assert.equal(d.status, 0, `stdout: ${d.stdout} stderr: ${d.stderr}`);
   });
 
+  // Codex review (#4885): a nested repository the project's config CLAIMS
+  // (`sub_repos`, `planning.sub_repos`, legacy `multiRepo`) is the workspace's
+  // — findProjectRoot resolves it there and gsd-tools records its decisions
+  // there — so the guard evaluates it as the workspace instead of allowing it
+  // as independent. The unclaimed row above still allows.
+  for (const [label, claim] of [['sub_repos', { sub_repos: ['vendor'] }], ['planning.sub_repos', { planning: { sub_repos: ['vendor'] } }], ['multiRepo', { multiRepo: true }]]) {
+    test(`a nested repository the project claims via ${label} is the project's -> blocked unflagged`, (t) => {
+      const project = mkProject('gsd-aig-4885r-claimed-');
+      t.after(() => cleanup(project));
+      writeConfig(project, JSON.stringify({ runtime: 'claude', ...claim }));
+      const child = path.join(fs.realpathSync.native(project), 'vendor', 'child');
+      fs.mkdirSync(child, { recursive: true });
+      git(['init', '-q'], child);
+      const out = block(runHook(agentPayload({ cwd: child }), child));
+      assert.equal(out.reason_code, REASON_CODE.HARNESS_FLAG_MISSING);
+    });
+  }
+
   // Minor 4: the guard driven from a subdirectory of a real LINKED worktree.
   test('linked worktree with its own .planning/: a subdirectory dispatch reads THAT worktree\'s sentinel', (t) => {
     const { main, wt } = repoWithWorktree(t);

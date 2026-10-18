@@ -343,8 +343,12 @@ describe('hookOutputFor: what the hook writes', () => {
 
   test('a failure outside the verdict paths is allowed, never a crash', (t) => {
     const { dir } = project(t);
-    const throwing = () => { throw new Error('unexpected'); };
+    // A present sentinel, so the staleness check reaches the throwing clock.
+    writeSentinel(dir, { isolation: 'harness-worktree' });
+    let calls = 0;
+    const throwing = () => { calls += 1; throw new Error('unexpected'); };
     const out = hookOutputFor(JSON.stringify({ subagent_type: 'gsd-executor', workspace_roots: [dir] }), { clock: { now: throwing } });
+    assert.ok(calls > 0, 'the injected failure must actually be raised');
     assert.equal(out.permission, undefined);
   });
 });

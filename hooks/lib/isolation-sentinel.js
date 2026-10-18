@@ -214,7 +214,8 @@ function nearestProjectConfigDir(cwd) {
  *   - a resolution failure or git timeout is unresolved (deny);
  *   - the writer's root holding `.planning/config.json` is the project;
  *   - `cwd` in a different repository from the project above (an independent
- *     nested repository, #2843) is not that project's;
+ *     nested repository, #2843) is not that project's, unless the project's
+ *     config claims it (`sub_repos`, `multiRepo`) as findProjectRoot honors;
  *   - the writer's root holding a `.planning/` with no config, or `cwd` past
  *     the ancestor bound `findProjectRoot` walks (so it found nothing), is a
  *     directory inside a GSD project whose governing configuration cannot be
@@ -258,7 +259,7 @@ function resolveGuardProject(cwd) {
   if (ownRepo.undetermined || projectRepo.undetermined) {
     return unresolved(`git could not say which repository '${cwd}' belongs to (${ownRepo.undetermined || projectRepo.undetermined}).`);
   }
-  if (ownRepo.dir !== projectRepo.dir) return { project: false };
+  if (ownRepo.dir !== projectRepo.dir && !claimsNestedRepository(anchor, base)) return { project: false };
   let resolved;
   try {
     resolved = resolveProjectRootOrThrow(from);
@@ -276,6 +277,28 @@ function resolveGuardProject(cwd) {
     return unresolved(`'${cwd}' is ${levels} directories below the GSD project at '${anchor}', past the ${resolved.maxDepth ?? 10} that project-root resolution walks.`);
   }
   return { project: false };
+}
+
+/**
+ * #4885 review: whether the project at `anchor` explicitly claims the nested
+ * repository `base` sits in, as findProjectRoot honors it before its own #2843
+ * boundary: `sub_repos` (top-level or under `planning`) naming `base`'s first
+ * path segment below `anchor`, or legacy `multiRepo: true`. gsd-tools writes a
+ * claimed repository's decisions at the workspace, so the guard must not call
+ * it "not a project"; findProjectRoot still decides the root. Pure fs, so the
+ * boundary stays decided before any build.
+ */
+function claimsNestedRepository(anchor, base) {
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(path.join(anchor, '.planning', 'config.json'), 'utf8'));
+  } catch {
+    return false;
+  }
+  if (!config || typeof config !== 'object') return false;
+  if (config.multiRepo === true) return true;
+  const subRepos = config.sub_repos ?? (config.planning && typeof config.planning === 'object' ? config.planning.sub_repos : undefined);
+  return Array.isArray(subRepos) && subRepos.includes(path.relative(anchor, base).split(path.sep)[0]);
 }
 
 /**

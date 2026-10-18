@@ -384,4 +384,24 @@ describe('#4885 parity: resolveGuardProject agrees with findProjectRoot (review 
     fs.mkdirSync(path.join(nested, '.planning'));
     assert.equal(assertAgree(path.join(nested, 'src')).project, false);
   });
+
+  // Codex review: findProjectRoot honors an explicit claim on a nested
+  // repository before its #2843 boundary, so the hook must too — and a claim
+  // naming another directory leaves the boundary standing.
+  for (const [label, claim, claimed] of [
+    ['sub_repos', { sub_repos: ['vendor'] }, true],
+    ['planning.sub_repos', { planning: { sub_repos: ['vendor'] } }, true],
+    ['multiRepo: true', { multiRepo: true }, true],
+    ['sub_repos naming another directory', { sub_repos: ['other'] }, false],
+  ]) {
+    test(`a nested repository with the project's config claiming it by ${label}: ${claimed ? 'the project' : 'not the project'}`, (t) => {
+      const { project, nested } = world(t);
+      fs.writeFileSync(path.join(project, '.planning', 'config.json'), JSON.stringify(claim));
+      for (const cwd of [nested, path.join(nested, 'src')]) {
+        const verdict = assertAgree(cwd);
+        assert.equal(verdict.project, claimed, cwd);
+        if (claimed) assert.equal(real(verdict.sentinelRoot), real(project), `${cwd}: the sentinel is read at the workspace gsd-tools writes it to`);
+      }
+    });
+  }
 });
