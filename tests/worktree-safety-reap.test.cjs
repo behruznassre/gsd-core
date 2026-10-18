@@ -1587,6 +1587,26 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(fs.existsSync(residue));
   });
 
+  // Codex review: when the removal fails and the rename back fails too (here,
+  // the original path was recreated meanwhile), the files stay under the
+  // reserved name, and the row must name that path, not the vacated original.
+  test('a failed removal that cannot be renamed back reports the .gsd-reap-* path holding the files', (t) => {
+    if (process.platform === 'win32') {
+      t.skip('a rename onto a non-empty directory fails differently on Windows');
+      return;
+    }
+    const { repoDir, residue } = repoWithResidue('rmfail-stuck');
+    const removeDir = () => {
+      fs.mkdirSync(residue);
+      fs.writeFileSync(path.join(residue, 'new.txt'), 'recreated\n');
+      throw new Error('EBUSY: injected');
+    };
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ removeDir })));
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_remove_failed']);
+    assert.match(path.basename(row.path), /^\.gsd-reap-[0-9a-f]{16}$/u);
+    assert.ok(fs.existsSync(path.join(row.path, 'node_modules')), 'the reported path holds the residue');
+  });
+
   test('a residue newer than the mtime guard is not reported and not removed (it may be mid-creation)', () => {
     const { repoDir, residue } = repoWithResidue('fresh');
     assert.deepStrictEqual(reapOrphanWorktrees(repoDir, { mtimeSafe: () => new Date(1000), nowMs: 1000 }), []);

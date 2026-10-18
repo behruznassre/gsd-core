@@ -2552,10 +2552,12 @@ const HARNESS_WORKTREE_NAME_RE = /^agent-./su;
 
 /**
  * The name the residue sweep renames a child to just before removing it
- * (`findUnregisteredResidue`). One left behind — the process died between the
- * rename and the removal, or a failed removal could not be renamed back — is
- * this sweep's own, so it needs no harness name or branch; every other guard
- * still applies (#4941 review).
+ * (`findUnregisteredResidue`). One can be left behind: the process died
+ * between the rename and the removal, or a failed removal could not be renamed
+ * back. This name under `.claude/worktrees` is RESERVED for the sweep. A match
+ * is not proof that the sweep created the directory, so it is treated as the
+ * sweep's by that contract: it needs no harness name or branch, and every
+ * other guard still applies (#4941 review).
  */
 const STRANDED_REAP_NAME_RE = /^\.gsd-reap-[0-9a-f]{16}$/u;
 
@@ -2812,8 +2814,9 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
  *   - it is older than the lock path's mtime guard (it may be mid-creation);
  *   - it is named `agent-<id>` (`residue_not_harness_named`) and a harness
  *     branch for it exists — `agent-<id>` or `worktree-agent-<id>`
- *     (`residue_no_harness_branch`); or it is a `.gsd-reap-<16 hex>` this
- *     sweep stranded mid-removal, which has neither and needs neither;
+ *     (`residue_no_harness_branch`); or it carries the `.gsd-reap-<16 hex>`
+ *     name reserved for a child this sweep stranded mid-removal, which has
+ *     neither and needs neither;
  *   - git tracks no file under it, asked per child with a literal,
  *     case-insensitive pathspec, so a case-only rename or a backslash in a
  *     POSIX name cannot hide one (`residue_tracked`; fails closed);
@@ -3012,17 +3015,20 @@ function findUnregisteredResidue(
     } catch {
       landed = false;
     }
+    // A rename back that fails leaves the files under the reserved name, so the
+    // row names THAT path: it is the one to inspect (Codex review).
+    const restore = (): string => {
+      try { retryRenameSync(doomed, target); return p; } catch { return doomed; }
+    };
     if (!landed) {
-      try { retryRenameSync(doomed, target); } catch { /* left under its .gsd-reap name, reported */ }
-      results.push({ path: p, status: 'skipped', reason: 'residue_unreadable' });
+      results.push({ path: restore(), status: 'skipped', reason: 'residue_unreadable' });
       continue;
     }
     try {
       removeDir(doomed);
       results.push({ path: p, status: 'reaped', reason: 'unregistered_residue' });
     } catch {
-      try { retryRenameSync(doomed, target); } catch { /* left under its .gsd-reap name */ }
-      results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
+      results.push({ path: restore(), status: 'skipped', reason: 'residue_remove_failed' });
     }
   }
   return { results, status: 'scanned' };
