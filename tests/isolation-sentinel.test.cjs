@@ -313,6 +313,50 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
       assert.deepEqual(resolveGuardProject(sub), { project: false });
     });
   }
+
+  // Codex review: a nested repository can be the workspace's only when a
+  // config at or above it declares nested repositories (`sub_repos`,
+  // `planning.sub_repos`, `multiRepo: true`). Without one, the #2843 answer
+  // needs no build; with one, the resolver decides (here: independent).
+  function nestedRepo(t, rawConfig) {
+    const { root } = projectTree(t, 0);
+    fs.writeFileSync(path.join(root, '.planning', 'config.json'), rawConfig);
+    const child = path.join(root, 'vendor', 'child');
+    fs.mkdirSync(child, { recursive: true });
+    require('node:child_process').execFileSync('git', ['init', '-q'], { cwd: child, timeout: require('./helpers/timeouts.cjs').GIT_FIXTURE_TIMEOUT_MS });
+    return { root, child };
+  }
+  for (const raw of ['{}', 'null', '{"sub_repos":[]}', '{"sub_repos":"vendor"}', '{"planning":{"sub_repos":[]}}', '{"planning":"vendor"}', '{"multiRepo":"true"}']) {
+    test(`no nested repositories declared (${raw}) -> an independent nested repository, nothing built`, (t) => {
+      const { child } = nestedRepo(t, raw);
+      const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+      assert.deepEqual(resolveGuardProject(child), { project: false });
+      assert.equal(calls.build, 0);
+    });
+  }
+  for (const raw of ['{"sub_repos":["other"]}', '{"planning":{"sub_repos":["other"]}}', '{"multiRepo":true}']) {
+    test(`nested repositories declared (${raw}) -> the resolver decides; kept independent, not a project`, (t) => {
+      const { child } = nestedRepo(t, raw);
+      const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+      assert.deepEqual(resolveGuardProject(child), { project: false });
+      assert.equal(calls.build, 1);
+    });
+  }
+  test('a declaration ABOVE the nearest configured project also hands the decision to the resolver', (t) => {
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-guard-outer-'));
+    t.after(() => cleanup(ws));
+    fs.mkdirSync(path.join(ws, '.planning'));
+    fs.writeFileSync(path.join(ws, '.planning', 'config.json'), '{"sub_repos":["inner"]}');
+    const inner = path.join(ws, 'inner');
+    fs.mkdirSync(path.join(inner, '.planning'), { recursive: true });
+    fs.writeFileSync(path.join(inner, '.planning', 'config.json'), '{}');
+    const child = path.join(inner, 'vendor', 'child');
+    fs.mkdirSync(child, { recursive: true });
+    require('node:child_process').execFileSync('git', ['init', '-q'], { cwd: child, timeout: require('./helpers/timeouts.cjs').GIT_FIXTURE_TIMEOUT_MS });
+    const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+    assert.deepEqual(resolveGuardProject(child), { project: false });
+    assert.equal(calls.build, 1);
+  });
 });
 
 // #4885 review (M4): the hook decides "which project, if any" BEFORE any build,
@@ -425,6 +469,31 @@ describe('#4885 parity: resolveGuardProject agrees with findProjectRoot (review 
     const verdict = assertAgree(alias);
     assert.equal(real(verdict.root), real(project));
     assert.equal(real(verdict.sentinelRoot), real(project));
+  });
+
+  test('a claimed nested repository reached through an alias from OUTSIDE the workspace is governed by the workspace\'s config', (t) => {
+    const { project, nested } = world(t);
+    fs.writeFileSync(path.join(project, '.planning', 'config.json'), JSON.stringify({ sub_repos: ['vendor'] }));
+    const outside = real(fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-guard-parity-out-')));
+    t.after(() => cleanup(outside));
+    const alias = path.join(outside, 'alias');
+    fs.symlinkSync(path.join(nested, 'src'), alias, 'junction');
+    // Only the canonical path leads to the workspace, so (as for any alias)
+    // the configuration is the canonical workspace's and the sentinel is read
+    // where gsd-tools, given this same cwd, writes it.
+    const { resolveGuardProject, resolveSentinelRoot } = require(SENTINEL_MODULE_PATH);
+    const verdict = resolveGuardProject(alias);
+    assert.equal(verdict.project, true, JSON.stringify(verdict));
+    assert.equal(real(verdict.root), real(project));
+    assert.equal(verdict.sentinelRoot, resolveSentinelRoot(alias));
+  });
+
+  test('a sub_repos entry that is a symlink to a repository elsewhere is the workspace\'s, as findProjectRoot\'s lexical walk says', (t) => {
+    const { project, plain } = world(t);
+    fs.writeFileSync(path.join(project, '.planning', 'config.json'), JSON.stringify({ sub_repos: ['linked'] }));
+    const linked = path.join(project, 'linked');
+    fs.symlinkSync(plain, linked, 'junction');
+    assert.equal(real(assertAgree(linked).root), real(project));
   });
 
   test('a nested repository the resolver keeps as its own (config-less .planning/) under multiRepo is not the workspace\'s', (t) => {
