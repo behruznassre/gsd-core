@@ -229,8 +229,8 @@ const RATCHET_BASELINE = {
                                    // Below TARGET_MUTATION_SCORE (80) — ratchet candidate like
                                    // planning-inspect / model-catalog above; raise as tests improve.
   'isolation-hooks':         85,  // #4885: net-new shard (the isolation guard hooks + sentinel library);
-                                   // measured locally on #5232: 88.15% (86.12% killed only);
-                                   // floor(86.12)-1, to be re-set from its first CI measurement.
+                                   // measured locally on #5232: 88.31% (86.18% killed only);
+                                   // floor(86.18)-1, to be re-set from its first CI measurement.
   'worktree-safety':         93,  // #4885: net-new shard; measured locally on #5232: 94.67%
                                    // (94.48% killed only); floor(94.48)-1, to be re-set from its
                                    // first CI measurement.

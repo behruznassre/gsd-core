@@ -670,9 +670,9 @@ const COVERED = {
   // (gsd-agent-isolation-guard.test.cjs, cursor-subagent-isolation.test.cjs) drive
   // the hooks as subprocesses, which Stryker cannot attribute to a mutant, and
   // would only add their full runtime to every mutant they happen to cover.
-  // Measured locally on #5232 (concurrency 4, timeoutFactor 3): 88.15% (86.12%
-  // killed only; 850 killed, 20 timeout, 91 survived, 26 no coverage of 987
-  // counted). Floor = floor(86.12) - 1 = 85, to be re-set from this shard's
+  // Measured locally on #5232 (concurrency 4, timeoutFactor 3): 88.31% (86.18%
+  // killed only; 892 killed, 22 timeout, 98 survived, 23 no coverage of 1035
+  // counted). Floor = floor(86.18) - 1 = 85, to be re-set from this shard's
   // first CI measurement per the HOW TO UPDATE procedure above.
   'isolation-hooks': {
     mutate: [
@@ -692,8 +692,8 @@ const COVERED = {
       'isolation-sentinel.unit.test.cjs',
     ],
     minScore: 85,
-    // Measured need: the local run above took 22m14s (1005 mutants, 4 runners, sharing the
-    // machine with another Stryker run), past the 15-minute default.
+    // Measured need: the local run above took 18m48s (1053 mutants, 4 runners; 22m14s when it
+    // shared the machine with another Stryker run), past the 15-minute default.
     timeoutMinutes: 40,
   },
   // #4885 review (maintainer ruling): worktree-safety owns the resolver gsd-tools and the
