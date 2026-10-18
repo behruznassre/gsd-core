@@ -57,9 +57,12 @@
 // for unchanged modules. Only as the entry (a test require() is unaffected),
 // skipped under V8 coverage, optional (Bun stubs it), and never fatal.
 // NODE_DISABLE_COMPILE_CACHE (any value) turns it off.
+// Stryker disable all: runs only when this file is the process entry, and its one effect is
+// V8 compile-cache speed, which no test can observe (equivalent mutants, #4885 review).
 if (require.main === module && !process.env.NODE_V8_COVERAGE) {
   try { require('node:module').enableCompileCache?.(); } catch { /* optimization only */ }
 }
+// Stryker restore all
 
 const fs = require('fs');
 const path = require('path');
@@ -670,18 +673,21 @@ function hookOutputFor(raw, { clock = Date, realpath = fs.realpathSync } = {}) {
   return additionalContext !== null ? { additional_context: additionalContext } : {};
 }
 
-/* istanbul ignore next -- stdin adapter, exercised via spawnSync in tests */
-function main() {
+/**
+ * The stdin adapter. `io` defaults to the real streams; tests pass a stream and
+ * a recording writer to drive it in-process (#4885 review).
+ */
+function main(io = { stdin: process.stdin, write: (s) => process.stdout.write(s), allow }) {
   let raw = '';
   const stdinTimeout = setTimeout(() => {
-    allow(undefined);
+    io.allow(undefined);
   }, 10000);
 
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', (chunk) => { raw += chunk; });
-  process.stdin.on('end', () => {
+  io.stdin.setEncoding('utf8');
+  io.stdin.on('data', (chunk) => { raw += chunk; });
+  io.stdin.on('end', () => {
     clearTimeout(stdinTimeout);
-    process.stdout.write(JSON.stringify(hookOutputFor(raw)));
+    io.write(JSON.stringify(hookOutputFor(raw)));
   });
 }
 
@@ -694,6 +700,7 @@ if (require.main === module) {
 // per the repo's clock-seam convention, instead of racing real `Date.now()`
 // across a spawned subprocess boundary.
 module.exports = {
+  main,
   hookOutputFor,
   resolveIsolationDecision,
   evaluateRootIsolation,

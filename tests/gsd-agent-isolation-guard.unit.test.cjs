@@ -24,7 +24,10 @@ const { createFixture } = require('./fixtures/index.cjs');
 const { SENTINEL_RELATIVE_PATH } = require('../hooks/lib/isolation-sentinel.js');
 const { REASON_CODE, describeSentinelDiscard } = require('../hooks/lib/isolation-deny-reason.js');
 const { resolveRuntimeNameFromCandidates } = require('../gsd-core/bin/lib/runtime-name-policy.cjs');
+const { PassThrough } = require('node:stream');
+const { HOOK_ON_CRASH } = require('../hooks/lib/hook-exit.js');
 const {
+  main,
   evaluateDispatch,
   blockOutputFor,
   resolveIsolationState,
@@ -375,3 +378,148 @@ describe('blockOutputFor: what the hook writes on a block', () => {
     assert.throws(() => blockOutputFor('{ nope', { clock }), SyntaxError);
   });
 });
+
+/** Feed `input` to main() through a stream; resolves with the exit calls it made. */
+function runMain(input) {
+  return new Promise((resolve) => {
+    const calls = [];
+    const stdin = new PassThrough();
+    const done = () => setImmediate(() => resolve(calls));
+    main({
+      stdin,
+      allow: (payload) => { calls.push(['allow', payload]); done(); },
+      deny: (payload, stderr) => { calls.push(['deny', payload, stderr]); },
+      crash: (policy, payload) => { calls.push(['crash', policy, payload]); done(); },
+    });
+    stdin.end(input);
+  });
+}
+
+describe('main: the stdin adapter', () => {
+  test('a blocked dispatch is denied with the block payload on both streams', async (t) => {
+    const { dir } = project(t);
+    writeSentinel(dir, { isolation: 'harness-worktree', harness_flag: CLAUDE_FLAG, written_at: Date.now() });
+    const calls = await runMain(JSON.stringify(dispatch(dir)));
+    assert.equal(calls[0][0], 'deny');
+    assert.equal(calls[0][1].decision, 'block');
+    assert.equal(calls[0][1].reason_code, REASON_CODE.HARNESS_FLAG_MISSING);
+    assert.equal(calls[0][2], calls[0][1].reason);
+  });
+
+  test('an allowed dispatch only allows', async (t) => {
+    const { dir } = project(t);
+    writeSentinel(dir, { isolation: 'none', written_at: Date.now() });
+    assert.deepEqual(await runMain(JSON.stringify(dispatch(dir))), [['allow', undefined]]);
+  });
+
+  test('a payload split across chunks is read whole', async (t) => {
+    const { dir } = project(t);
+    writeSentinel(dir, { isolation: 'harness-worktree', harness_flag: CLAUDE_FLAG, written_at: Date.now() });
+    const calls = await new Promise((resolve) => {
+      const got = [];
+      const stdin = new PassThrough();
+      main({ stdin, allow: (p) => { got.push(['allow', p]); setImmediate(() => resolve(got)); }, deny: (p) => got.push(['deny', p.reason_code]), crash: () => {} });
+      const text = JSON.stringify(dispatch(dir));
+      stdin.write(text.slice(0, 10));
+      stdin.end(text.slice(10));
+    });
+    assert.deepEqual(calls[0], ['deny', REASON_CODE.HARNESS_FLAG_MISSING]);
+  });
+
+  test('an unparseable payload takes the fail-open crash path', async () => {
+    assert.deepEqual(await runMain('{ nope'), [['crash', HOOK_ON_CRASH.ALLOW, undefined]]);
+  });
+});
+
+/**
+ * Load a fresh copy of the hook with `fakes` (absolute module path -> exports)
+ * substituted in require.cache, restoring every entry afterwards.
+ */
+function loadHookWith(t, fakes) {
+  const hookPath = require.resolve('../hooks/gsd-agent-isolation-guard.js');
+  const keys = [hookPath, ...Object.keys(fakes)];
+  const saved = keys.map((k) => [k, require.cache[k]]);
+  t.after(() => {
+    for (const [k, v] of saved) { if (v) require.cache[k] = v; else delete require.cache[k]; }
+  });
+  for (const [k, exportsObj] of Object.entries(fakes)) {
+    require.cache[k] = { id: k, filename: k, loaded: true, exports: exportsObj, children: [], paths: [] };
+  }
+  delete require.cache[hookPath];
+  return require(hookPath);
+}
+const SEAM_PATH = require.resolve('../gsd-core/bin/ensure-runtime-build.cjs');
+const WORKSPACE_PATH = require.resolve('../gsd-core/bin/lib/planning-workspace.cjs');
+
+describe('evaluateDispatch: a runtime library that will not build', () => {
+  test('blocks as runtime_build_failed with the seam\'s own message', (t) => {
+    const { dir } = project(t, { runtime: 'claude' });
+    class FakeRuntimeBuildError extends Error {}
+    const hook = loadHookWith(t, {
+      [SEAM_PATH]: { RuntimeBuildError: FakeRuntimeBuildError, ensureRuntimeBuild: () => { throw new FakeRuntimeBuildError('lib not built: run npm run build:lib'); } },
+    });
+    const r = hook.evaluateDispatch(dispatch(dir), { clock });
+    assert.deepEqual([r.action, r.reasonCode, r.sentinelDiscarded], ['block', REASON_CODE.RUNTIME_BUILD_FAILED, null]);
+    assert.equal(r.reason,
+      'Agent isolation guard: cannot resolve this project\'s dispatch-isolation configuration because the GSD ' +
+      'runtime library failed to self-build. lib not built: run npm run build:lib Refusing to dispatch ' +
+      'subagent_type="gsd-executor" until the runtime library is built — a guard that cannot verify must not ' +
+      'answer "safe" (#3050).');
+  });
+});
+
+describe('resolveRegistryIsolation: the flat-config fallback when the opt-out ladder is unreachable', () => {
+  const ladderDown = (t) => loadHookWith(t, {
+    [WORKSPACE_PATH]: { worktreesOptedOut: () => { throw new Error('ladder unavailable'); } },
+  });
+
+  for (const [label, config, isolation] of [
+    ['use_worktrees: false opts out', { runtime: 'claude', workflow: { use_worktrees: false } }, 'none'],
+    ['use_worktrees: true keeps enforcing', { runtime: 'claude', workflow: { use_worktrees: true } }, 'harness-worktree'],
+    ['no workflow block keeps enforcing', { runtime: 'claude' }, 'harness-worktree'],
+    ['a non-object workflow keeps enforcing', { runtime: 'claude', workflow: 'off' }, 'harness-worktree'],
+    ['a string use_worktrees keeps enforcing', { runtime: 'claude', workflow: { use_worktrees: 'false' } }, 'harness-worktree'],
+  ]) {
+    test(label, (t) => {
+      const { dir } = project(t, config);
+      const hook = ladderDown(t);
+      assert.equal(hook.resolveRegistryIsolation(dir, path.join(dir, '.planning', 'config.json')).isolation, isolation);
+    });
+  }
+});
+
+describe('the remaining decision edges', () => {
+  test('not a GSD project: the state says so in full', (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-aig-unit-none2-'));
+    t.after(() => cleanup(dir));
+    assert.deepEqual(resolveIsolationState(dir, { clock }), {
+      gsdProject: false, isolation: null, harnessFlag: null, error: null, sentinelDiscarded: null, root: null,
+    });
+  });
+
+  test('a recorded harness-worktree with no flag names exactly what is missing', (t) => {
+    const { dir } = project(t);
+    writeSentinel(dir, { isolation: 'harness-worktree' });
+    assert.equal(resolveIsolationState(dir, { clock }).error.message,
+      'dispatch-isolation sentinel resolved "harness-worktree" but recorded no harness_flag — ' +
+      'cannot verify what parameter the dispatch must carry.');
+  });
+
+  test('a runtime name the registry does not know is inert, not a crash', (t) => {
+    const { dir } = project(t, { runtime: 'not-a-runtime' });
+    assert.deepEqual(resolveRegistryIsolation(dir, path.join(dir, '.planning', 'config.json')), { isolation: 'none', harnessFlag: null });
+  });
+
+  test('outside a repository only a harness-worktree decision degrades; orchestrator-worktree stands', (t) => {
+    const dir = createFixture({ prefix: 'gsd-aig-unit-nogit2-', planning: true, git: false });
+    t.after(() => cleanup(dir));
+    fs.writeFileSync(path.join(dir, '.planning', 'config.json'), JSON.stringify({ runtime: 'codex' }));
+    withEnv(t, { GSD_RUNTIME: undefined });
+    assert.equal(resolveRegistryIsolation(dir, path.join(dir, '.planning', 'config.json')).isolation, 'orchestrator-worktree');
+  });
+
+  test('a flag value that only stringifies like key="value" is not a flag', () => {
+    assert.equal(parseHarnessFlag({ toString: () => 'isolation="worktree"' }), null);
+  });
+});
+

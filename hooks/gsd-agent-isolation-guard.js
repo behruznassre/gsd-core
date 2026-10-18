@@ -64,9 +64,12 @@
 // for unchanged modules. Only as the entry (a test require() is unaffected),
 // skipped under V8 coverage, optional (Bun stubs it), and never fatal.
 // NODE_DISABLE_COMPILE_CACHE (any value) turns it off.
+// Stryker disable all: runs only when this file is the process entry, and its one effect is
+// V8 compile-cache speed, which no test can observe (equivalent mutants, #4885 review).
 if (require.main === module && !process.env.NODE_V8_COVERAGE) {
   try { require('node:module').enableCompileCache?.(); } catch { /* optimization only */ }
 }
+// Stryker restore all
 
 const fs = require('fs');
 const path = require('path');
@@ -606,19 +609,22 @@ function blockOutputFor(input, { clock = Date } = {}) {
   };
 }
 
-/* istanbul ignore next -- stdin adapter, exercised via spawnSync in tests */
-function main() {
+/**
+ * The stdin adapter. `io` defaults to the real stream and exits; tests pass a
+ * stream and recording exits to drive it in-process (#4885 review).
+ */
+function main(io = { stdin: process.stdin, allow, deny, crash }) {
   let input = '';
-  const stdinTimeout = setTimeout(() => allow(undefined), 3000);
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', (chunk) => { input += chunk; });
-  process.stdin.on('end', () => {
+  const stdinTimeout = setTimeout(() => io.allow(undefined), 3000);
+  io.stdin.setEncoding('utf8');
+  io.stdin.on('data', (chunk) => { input += chunk; });
+  io.stdin.on('end', () => {
     clearTimeout(stdinTimeout);
     try {
       const out = blockOutputFor(input);
       // Kimi feeds stderr (not stdout) back to the model on exit 2.
-      if (out) deny(out, out.reason);
-      allow(undefined);
+      if (out) io.deny(out, out.reason);
+      io.allow(undefined);
     } catch {
       // Silent fail — never block valid tool calls due to hook errors
       // (malformed payload, etc.). This is distinct from resolveIsolationState's
@@ -626,7 +632,7 @@ function main() {
       // covers payload parsing before applicability could even be determined.
       // ON_CRASH is declared ALLOW at module top: this preserves today's
       // exit(0) fail-open behavior exactly (#3911).
-      crash(ON_CRASH, undefined);
+      io.crash(ON_CRASH, undefined);
     }
   });
 }
@@ -636,6 +642,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  main,
   evaluateDispatch,
   blockOutputFor,
   resolveIsolationState,

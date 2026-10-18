@@ -24,7 +24,9 @@ const { cleanup } = require('./helpers.cjs');
 const { createFixture } = require('./fixtures/index.cjs');
 const { SENTINEL_RELATIVE_PATH } = require('../hooks/lib/isolation-sentinel.js');
 const { REASON_CODE, describeSentinelDiscard } = require('../hooks/lib/isolation-deny-reason.js');
+const { PassThrough } = require('node:stream');
 const {
+  main,
   hookOutputFor,
   resolveIsolationDecision,
   evaluateRootIsolation,
@@ -346,3 +348,156 @@ describe('hookOutputFor: what the hook writes', () => {
     assert.equal(out.permission, undefined);
   });
 });
+
+function loadHookWith(t, fakes) {
+  const hookPath = require.resolve('../hooks/gsd-cursor-subagent-start.js');
+  const keys = [hookPath, ...Object.keys(fakes)];
+  const saved = keys.map((k) => [k, require.cache[k]]);
+  t.after(() => {
+    for (const [k, v] of saved) { if (v) require.cache[k] = v; else delete require.cache[k]; }
+  });
+  for (const [k, exportsObj] of Object.entries(fakes)) {
+    require.cache[k] = { id: k, filename: k, loaded: true, exports: exportsObj, children: [], paths: [] };
+  }
+  delete require.cache[hookPath];
+  return require(hookPath);
+}
+const SEAM_PATH = require.resolve('../gsd-core/bin/ensure-runtime-build.cjs');
+const WORKTREE_SAFETY_PATH = require.resolve('../gsd-core/bin/lib/worktree-safety.cjs');
+
+describe('main: the stdin adapter writes hookOutputFor\'s answer', () => {
+  test('a payload split across chunks is read whole and answered once', async (t) => {
+    const { dir } = project(t);
+    writeSentinel(dir, { isolation: 'harness-worktree', written_at: Date.now() });
+    const text = JSON.stringify({ subagent_type: 'gsd-executor', workspace_roots: [dir] });
+    const written = await new Promise((resolve) => {
+      const out = [];
+      const stdin = new PassThrough();
+      main({ stdin, write: (str) => { out.push(str); setImmediate(() => resolve(out)); }, allow: () => {} });
+      stdin.write(text.slice(0, 7));
+      stdin.end(text.slice(7));
+    });
+    assert.equal(written.length, 1);
+    assert.deepEqual(JSON.parse(written[0]), hookOutputFor(text));
+    assert.equal(JSON.parse(written[0]).permission, 'deny');
+  });
+});
+
+describe('a runtime library that will not build', () => {
+  class FakeRuntimeBuildError extends Error {}
+  for (const [label, thrown, detail] of [
+    ['the seam\'s own error', new FakeRuntimeBuildError('lib not built'), 'lib not built'],
+    ['any other failure', new Error('EACCES'), 'EACCES'],
+  ]) {
+    test(`a project root is denied as runtime_build_failed, naming ${label}`, (t) => {
+      const { dir } = project(t);
+      const hook = loadHookWith(t, { [SEAM_PATH]: { RuntimeBuildError: FakeRuntimeBuildError, ensureRuntimeBuild: () => { throw thrown; } } });
+      const r = hook.evaluateRootIsolation(dir, 'gsd-executor', { clock });
+      assert.deepEqual([r.action, r.reasonCode, r.sentinelDiscarded], ['deny', REASON_CODE.RUNTIME_BUILD_FAILED, null]);
+      assert.equal(r.reason,
+        'GSD subagent isolation guard: cannot resolve this project\'s dispatch-isolation configuration because ' +
+        `the GSD runtime library failed to self-build. ${detail} Refusing to allow this subagent to spawn until ` +
+        'the runtime library is built — a guard that cannot verify must not answer "safe" (#3050).');
+    });
+  }
+
+  test('a project subdirectory whose root cannot be resolved for a build failure names the build', (t) => {
+    const { dir } = project(t);
+    const sub = path.join(dir, 'src');
+    fs.mkdirSync(sub);
+    const hook = loadHookWith(t, { [SEAM_PATH]: { RuntimeBuildError: FakeRuntimeBuildError, ensureRuntimeBuild: () => { throw new FakeRuntimeBuildError('cold tree'); } } });
+    const r = hook.evaluateRootIsolation(sub, 'gsd-executor', { clock });
+    assert.equal(r.reasonCode, REASON_CODE.RUNTIME_BUILD_FAILED);
+    assert.equal(r.reason,
+      'GSD subagent isolation guard: cannot resolve this project\'s dispatch-isolation configuration because ' +
+      'the GSD runtime library failed to self-build. cold tree Refusing to allow this subagent to spawn until ' +
+      'the runtime library is built — a guard that cannot verify must not answer "safe" (#3050).');
+  });
+});
+
+describe('exact deny reasons and remaining edges', () => {
+  test('an unresolved root names the workspace root, the cause and the rule', (t) => {
+    const { dir } = project(t, { runtime: 'cursor' });
+    const sub = path.join(dir, 'src');
+    fs.mkdirSync(sub);
+    const savedPath = process.env.PATH;
+    process.env.PATH = path.join(dir, 'no-binaries-here');
+    let r;
+    try {
+      r = evaluateRootIsolation(sub, 'gsd-executor', { clock });
+    } finally {
+      process.env.PATH = savedPath;
+    }
+    assert.ok(r.reason.endsWith('). Refusing to allow this subagent to spawn without being able to verify whether isolation is required — a guard that cannot verify must not answer "safe" (#3050).'), r.reason);
+  });
+
+  test('no usable subagent_type: the full reason, with a discarded decision appended', (t) => {
+    const { dir } = project(t, { runtime: 'cursor' });
+    writeSentinel(dir, { isolation: 'none', phase: '3' });
+    const ids = { phase: '4', plan: null };
+    const r = evaluateRootIsolation(dir, undefined, { clock, dispatchIds: ids });
+    const base = 'GSD subagent isolation guard: this project\'s dispatch isolation resolves to "harness-worktree", but ' +
+      'the subagentStart payload for this dispatch carries no usable subagent_type. Refusing to allow it to spawn ' +
+      'without being able to confirm whether it is a GSD executor — a guard that cannot verify must not answer "safe" (#3050).';
+    assert.equal(r.reason, base + describeSentinelDiscard(r.sentinelDiscarded));
+    writeSentinel(dir, { isolation: 'harness-worktree' });
+    assert.equal(evaluateRootIsolation(dir, undefined, { clock }).reason, base);
+  });
+
+  test('cannot determine isolation: the full reason, with a discarded decision appended', (t) => {
+    const { dir } = project(t, { runtime: 'cursor' });
+    writeSentinel(dir, { isolation: 'none', phase: '3' });
+    const realpath = (p) => { if (p === dir) throw new Error('ENOENT'); return fs.realpathSync(p); };
+    const r = evaluateRootIsolation(dir, 'gsd-executor', { clock, realpath, dispatchIds: { phase: '4', plan: null } });
+    const base = 'GSD subagent isolation guard: this project\'s dispatch isolation resolves to "harness-worktree", but ' +
+      `whether "${dir}" is running in an isolated Cursor worktree could not be determined (git did not respond). ` +
+      'Refusing to allow subagent_type="gsd-executor" to spawn without being able to verify isolation — a guard that ' +
+      'cannot verify must not answer "safe" (#3050). Retry once git is responsive.';
+    assert.equal(r.reason, base + describeSentinelDiscard(r.sentinelDiscarded));
+  });
+
+  test('git timing out on the linkage check is cannot-determine', (t) => {
+    const { dir } = project(t);
+    const hook = loadHookWith(t, { [WORKTREE_SAFETY_PATH]: { resolveWorktreeLinkage: () => ({ reason: 'git_timed_out' }) } });
+    assert.deepEqual(hook.resolveIsolationEvidence(dir), { isolated: false, cannotDetermine: true, notApplicable: false });
+  });
+
+  test('a non-git root is not applicable, exactly', (t) => {
+    project(t);
+    const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-cur-unit-plain-')));
+    t.after(() => cleanup(dir));
+    assert.deepEqual(resolveIsolationEvidence(dir), { isolated: false, cannotDetermine: false, notApplicable: true });
+  });
+
+  test('every root allowing is an allow', (t) => {
+    const a = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-cur-unit-a-'));
+    t.after(() => cleanup(a));
+    assert.deepEqual(resolveIsolationDecision({ subagent_type: 'gsd-executor', workspace_roots: [a] }, { clock }), { action: 'allow' });
+  });
+
+  test('a deny carries a discarded decision in the written output', (t) => {
+    const { dir } = project(t, { runtime: 'cursor' });
+    writeSentinel(dir, { isolation: 'none', phase: '3' });
+    const out = hookOutputFor(JSON.stringify({ subagent_type: 'gsd-executor', workspace_roots: [dir], task: '[gsd:dispatch phase="4" plan="04-01"] go' }), { clock });
+    assert.deepEqual(out.sentinel_discarded, { sentinel: { phase: '3', plan: null }, dispatch: { phase: '4', plan: '04-01' } });
+  });
+
+  test('the fallback reads a non-object config as no runtime signal, and still honors GSD_RUNTIME', (t) => {
+    const { dir } = project(t);
+    const cfg = path.join(dir, '.planning', 'config.json');
+    withEnv(t, { GSD_RUNTIME: 'cursor' });
+    for (const content of ['null', '"text"', '[]']) {
+      fs.writeFileSync(cfg, content);
+      assert.equal(resolveFallbackIsolation(dir, cfg), 'harness-worktree', content);
+    }
+  });
+
+  test('an unknown runtime is inert; use_worktrees only ever opts a harness-worktree runtime out', (t) => {
+    const { dir } = project(t, { runtime: 'not-a-runtime' });
+    const cfg = path.join(dir, '.planning', 'config.json');
+    assert.equal(resolveFallbackIsolation(dir, cfg), 'none');
+    fs.writeFileSync(cfg, JSON.stringify({ runtime: 'codex', workflow: { use_worktrees: false } }));
+    assert.equal(resolveFallbackIsolation(dir, cfg), 'orchestrator-worktree');
+  });
+});
+
