@@ -271,7 +271,7 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
   }
 
   // The bound is project-root's own constant, not a copy of its value.
-  for (const [depth, unresolved] of [[3, false], [4, true]]) {
+  for (const [depth, unresolved] of [[2, false], [3, false], [4, true]]) {
     test(`the ancestor bound is the one project-root exports: ${depth} levels with a bound of 3 -> ${unresolved ? 'unresolved' : 'not a project'}`, (t) => {
       const { sub } = projectTree(t, depth);
       const { resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d, maxDepth: 3 });
@@ -357,6 +357,70 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
     assert.deepEqual(resolveGuardProject(child), { project: false });
     assert.equal(calls.build, 1);
   });
+
+  // trek-e review 5563999745 (Minor 3): the pre-filter reads each config through
+  // a bounded read. Up to the cap it is parsed (here: no declaration, nothing
+  // built); past it the resolver decides, since it reads the file whole and
+  // could honor a claim in it.
+  const CAP = 1024 * 1024;
+  const sizedConfig = (bytes) => {
+    const head = '{"pad":"';
+    return head + 'x'.repeat(bytes - head.length - 2) + '"}';
+  };
+  for (const [bytes, build] of [[CAP - 1, 0], [CAP, 0], [CAP + 1, 1]]) {
+    test(`a non-declaring config of ${bytes} bytes (cap ${CAP}) -> ${build ? 'past the cap: the resolver decides' : 'parsed: nothing built'}`, (t) => {
+      const raw = sizedConfig(bytes);
+      assert.equal(Buffer.byteLength(raw), bytes);
+      const { child } = nestedRepo(t, raw);
+      const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+      assert.deepEqual(resolveGuardProject(child), { project: false });
+      assert.equal(calls.build, build);
+    });
+  }
+
+  test('a FIFO at the project\'s .planning/config.json does not hang the guard', { skip: process.platform === 'win32' }, (t) => {
+    // Read blocking, a FIFO there hung the guard until it was killed. The real
+    // module runs in a child process, so a regression fails on the timeout
+    // instead of hanging this suite.
+    const { runHook, runNode } = require('./helpers/process-seam.cjs');
+    const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+    const { root, child } = nestedRepo(t, '{}');
+    const config = path.join(root, '.planning', 'config.json');
+    fs.unlinkSync(config);
+    const made = runHook(config, [], { interpreter: 'mkfifo', timeoutMs: PROBE_TIMEOUT_MS });
+    assert.equal(made.exitCode, 0, `mkfifo ${config}: ${made.stderr}`);
+    const program = `process.stdout.write(JSON.stringify(require(${JSON.stringify(SENTINEL_MODULE_PATH)}).resolveGuardProject(${JSON.stringify(child)})))`;
+    const r = runNode(['-e', program], { timeoutMs: PROBE_TIMEOUT_MS });
+    assert.equal(r.exitCode, 0, `the guard returned (${r.outcome}): ${r.stderr}`);
+    assert.deepEqual(JSON.parse(r.stdout), { project: false });
+  });
+
+  // trek-e review 5563999745 (Minor 3): findProjectRoot never reads a claim at
+  // or above $HOME, so neither does the pre-filter.
+  for (const [label, homeOf, build] of [['is $HOME', (ws) => ws, 0], ['is below $HOME', (ws) => path.dirname(ws), 1]]) {
+    test(`a declaring config in a directory that ${label} -> ${build ? 'the resolver decides' : 'not read; nothing built'}`, (t) => {
+      const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-guard-home-'));
+      t.after(() => cleanup(ws));
+      fs.mkdirSync(path.join(ws, '.planning'));
+      fs.writeFileSync(path.join(ws, '.planning', 'config.json'), '{"sub_repos":["inner"]}');
+      const inner = path.join(ws, 'inner');
+      fs.mkdirSync(path.join(inner, '.planning'), { recursive: true });
+      fs.writeFileSync(path.join(inner, '.planning', 'config.json'), '{}');
+      const child = path.join(inner, 'vendor', 'child');
+      fs.mkdirSync(child, { recursive: true });
+      require('node:child_process').execFileSync('git', ['init', '-q'], { cwd: child, timeout: require('./helpers/timeouts.cjs').GIT_FIXTURE_TIMEOUT_MS });
+      const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+      t.after(() => {
+        for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+      });
+      process.env.HOME = homeOf(ws);
+      process.env.USERPROFILE = homeOf(ws);
+      assert.equal(os.homedir(), homeOf(ws));
+      const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+      assert.deepEqual(resolveGuardProject(child), { project: false });
+      assert.equal(calls.build, build);
+    });
+  }
 });
 
 // #4885 review (M4): the hook decides "which project, if any" BEFORE any build,
@@ -501,5 +565,37 @@ describe('#4885 parity: resolveGuardProject agrees with findProjectRoot (review 
     fs.writeFileSync(path.join(project, '.planning', 'config.json'), JSON.stringify({ multiRepo: true }));
     fs.mkdirSync(path.join(nested, '.planning'));
     assert.deepEqual(assertAgree(path.join(nested, 'src')), { project: false });
+  });
+
+  // trek-e review 5563999745 (Nit 5): the same contract as a property over
+  // generated claim shapes. For any project config and nested-repository
+  // placement, the hook and findProjectRoot name the same root; and a config
+  // declaring no nested repositories (the pre-filter's build-free case) never
+  // lets findProjectRoot claim the nested repository.
+  test('property: for any claim shape, the hook and findProjectRoot agree, and no declaration means no claim', (t) => {
+    const fc = require('fast-check');
+    const { project, nested } = world(t);
+    const name = fc.constantFrom('vendor', 'other', 'vendor/child', '');
+    const subRepos = fc.oneof(fc.array(name, { maxLength: 2 }), name, fc.constant(null));
+    const config = fc.record({
+      sub_repos: subRepos,
+      planning: fc.oneof(fc.record({ sub_repos: subRepos }, { requiredKeys: [] }), fc.constant('vendor')),
+      multiRepo: fc.constantFrom(true, false, 'true'),
+    }, { requiredKeys: [] });
+    const { findProjectRoot } = require(PROJECT_ROOT_PATH);
+    fc.assert(
+      fc.property(config, fc.boolean(), fc.constantFrom('', 'src'), (cfg, ownPlanning, below) => {
+        fs.writeFileSync(path.join(project, '.planning', 'config.json'), JSON.stringify(cfg));
+        fs.rmSync(path.join(nested, '.planning'), { recursive: true, force: true });
+        if (ownPlanning) fs.mkdirSync(path.join(nested, '.planning'));
+        const cwd = path.join(nested, below);
+        assertAgree(cwd);
+        const declared = cfg.multiRepo === true
+          || [cfg.sub_repos ?? (cfg.planning && typeof cfg.planning === 'object' ? cfg.planning.sub_repos : undefined)]
+            .some((v) => Array.isArray(v) && v.length > 0);
+        if (!declared) assert.notEqual(real(findProjectRoot(cwd)), real(project), `${JSON.stringify(cfg)}: claimed without a declaration`);
+      }),
+      { numRuns: 60 },
+    );
   });
 });

@@ -55,6 +55,7 @@
 // file can predict) rather than a path derivable from `cwd`.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { classifyGitProbe, BLOCKING_GUARD_PROBE_TIMEOUT_MS } = require('./git-probe.js');
@@ -284,25 +285,57 @@ function resolveGuardProject(cwd) {
   return { project: false };
 }
 
+/** Configs the claim pre-filter parses are at most this size; a larger one goes to the resolver. */
+const CONFIG_FILE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * #4885 review: whether the config `file` may declare nested repositories as
+ * its own — non-empty `sub_repos` (top-level or under `planning`) or legacy
+ * `multiRepo: true`. Only a regular file is read, opened non-blocking and
+ * checked through its own descriptor, so a FIFO cannot hang the guard. A
+ * regular file over CONFIG_FILE_MAX_BYTES is not parsed here and counts as a
+ * declaration: the resolver reads it whole and could honor a claim in it, and
+ * a guard that cannot tell must not answer "independent" (#3050).
+ */
+function configMayDeclareNestedRepositories(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0));
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return false;
+    if (st.size > CONFIG_FILE_MAX_BYTES) return true;
+    const buf = Buffer.alloc(st.size);
+    let n = 0;
+    for (let r; n < buf.length && (r = fs.readSync(fd, buf, n, buf.length - n, n)) > 0;) n += r;
+    const config = JSON.parse(buf.toString('utf8', 0, n));
+    if (!config || typeof config !== 'object') return false;
+    const subRepos = config.sub_repos ?? (config.planning && typeof config.planning === 'object' ? config.planning.sub_repos : undefined);
+    return config.multiRepo === true || (Array.isArray(subRepos) && subRepos.length > 0);
+  } catch {
+    return false; // absent, unreadable or unparseable — no claim, as for findProjectRoot
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+  }
+}
+
 /**
  * #4885 review: whether any GSD config at or above `cwd` (lexical or canonical)
- * declares nested repositories as its own — non-empty `sub_repos` (top-level or
- * under `planning`) or legacy `multiRepo: true`. findProjectRoot honors such a
+ * may declare nested repositories as its own. findProjectRoot honors such a
  * claim before its #2843 boundary, so where one is declared only the resolver
  * can say whether a nested repository is the workspace's; where none is, it
- * cannot be, and the boundary is decided here without a build. Pure fs.
+ * cannot be, and the boundary is decided here without a build. The walk stops
+ * below `$HOME`, as findProjectRoot's does: it never reads a claim there or
+ * above. Pure fs.
  */
 function declaresNestedRepositories(cwd) {
+  const home = os.homedir();
   const starts = [path.resolve(cwd)];
   try { starts.push(fs.realpathSync.native(cwd)); } catch { /* lexical only */ }
   for (const start of starts) {
-    for (let dir = start; ; dir = path.dirname(dir)) {
-      let config = null;
-      try { config = JSON.parse(fs.readFileSync(path.join(dir, '.planning', 'config.json'), 'utf8')); } catch { /* none here */ }
-      if (config && typeof config === 'object') {
-        const subRepos = config.sub_repos ?? (config.planning && typeof config.planning === 'object' ? config.planning.sub_repos : undefined);
-        if (config.multiRepo === true || (Array.isArray(subRepos) && subRepos.length > 0)) return true;
-      }
+    for (let dir = start; dir !== home; dir = path.dirname(dir)) {
+      if (configMayDeclareNestedRepositories(path.join(dir, '.planning', 'config.json'))) return true;
       if (path.dirname(dir) === dir) break;
     }
   }
