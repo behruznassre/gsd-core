@@ -5141,7 +5141,12 @@ function readStateTarget(
     const section = collectSection(body, (h: HeadingToken) => h.text === field);
     return section !== null ? section.body.trim() : null;
   }
-  const bodyValue = stateExtractField(body, field);
+  // #4998 review: a session field is read where `state update` / `state patch`
+  // write it — the session section, fenced examples blanked — or an unchanged
+  // fenced example above the live line hides the write and reports it missing.
+  const bodyValue = stateTransitionMod.isSessionScopedBodyField(field)
+    ? stateExtractField(readableBoldLabels(sessionFieldScope(body)), field)
+    : stateExtractField(body, field);
   if (bodyValue !== null) return bodyValue;
   if (Object.prototype.hasOwnProperty.call(fm, field)) return String(fm[field]);
   if (field.includes('.')) {

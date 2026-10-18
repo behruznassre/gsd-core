@@ -309,6 +309,14 @@ export const FRONTMATTER_BODY_SOURCE: Readonly<Record<string, readonly string[]>
 const SESSION_SCOPED_KEYS: ReadonlySet<string> = new Set(['stopped_at', 'paused_at']);
 
 /**
+ * #4998 review: the `## Session` fields with no frontmatter key. `state-snapshot`
+ * reads them from the session section only, with fenced blocks blanked, so
+ * `state update` / `state patch` write them there too — never a fenced example
+ * above the live line, and never an archive section's copy.
+ */
+const SESSION_BODY_FIELDS: ReadonlySet<string> = new Set(['resume file', 'last session', 'last date']);
+
+/**
  * The `(primary, fallback)` label pair for a session-scoped frontmatter KEY.
  */
 function sessionLabelsForKey(key: string): { primary: string; fallback: string | null } | null {
@@ -319,7 +327,8 @@ function sessionLabelsForKey(key: string): { primary: string; fallback: string |
 
 /**
  * The same pair, resolved from a BODY LABEL the caller named (`Stopped At`,
- * `Stopped at`, `Paused At`). `null` for anything else.
+ * `Stopped at`, `Paused At`, or a SESSION_BODY_FIELDS label as named). `null`
+ * for anything else.
  *
  * Deliberately does NOT accept a frontmatter key. An earlier cut resolved both
  * spellings through one function and used it for the write, which made
@@ -330,7 +339,13 @@ function sessionLabelsForKey(key: string): { primary: string; fallback: string |
  */
 function sessionLabelsForBodyField(field: string): { primary: string; fallback: string | null } | null {
   const key = frontmatterKeyForBodyField(field);
-  return key === null ? null : sessionLabelsForKey(key);
+  if (key !== null) return sessionLabelsForKey(key);
+  return SESSION_BODY_FIELDS.has(field.trim().toLowerCase()) ? { primary: field, fallback: null } : null;
+}
+
+/** #4998 review: whether `state update` / `state patch` write the body field `field` inside the session section. */
+export function isSessionScopedBodyField(field: string): boolean {
+  return sessionLabelsForBodyField(field) !== null;
 }
 
 /**

@@ -22433,6 +22433,36 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.strictEqual(frontmatterStoppedAt(), 'new', readState());
   });
 
+  // trek-e review 5563202317 (Major 2): every session field `state update` /
+  // `state patch` writes goes inside the session section, never a fenced example
+  // — and the call reports the write it made.
+  for (const [label, line] of [['Resume File', 'Resume file'], ['Last session', 'Last session'], ['Last Date', 'Last Date']]) {
+    for (const verb of ['update', 'patch']) {
+      test(`(review Major 2) \`state ${verb}\` of ${label} writes the live session line, not a fenced example`, () => {
+        const example = ['```md', `${line}: example`, '```'];
+        seed([], [...example, `${line}: old`, 'Stopped at: real'], '## Session');
+        const args = verb === 'update' ? ['update', label, 'new'] : ['patch', `--${label}`, 'new'];
+        const rec = runTool('state', ...args);
+        assert.strictEqual(rec.exitCode, 0, rec.stderr);
+        const reported = JSON.parse(rec.stdout).updated;
+        assert.ok(verb === 'update' ? reported === true : reported.includes(label), rec.stdout);
+        assert.ok(session().includes(example.join('\n')), session());
+        assert.match(session(), new RegExp(`\\n${line}: new\\n`));
+        assert.ok(!session().includes(`${line}: old`), session());
+      });
+    }
+  }
+
+  test('(review Major 2) `state update "Resume File"` writes the session line, not an archive section\'s copy above it', () => {
+    fs.writeFileSync(statePath(), ['---', 'gsd_state_version: 1.0', 'status: executing', '---', '', '# Project State', '',
+      '## Session Continuity Archive', '', 'Resume file: archived.md', '', '## Session', '', 'Resume file: plan.md', ''].join('\n'));
+    const rec = runTool('state', 'update', 'Resume File', 'next.md');
+    assert.strictEqual(rec.exitCode, 0, rec.stderr);
+    assert.strictEqual(JSON.parse(rec.stdout).updated, true, rec.stdout);
+    assert.ok(readState().includes('## Session Continuity Archive\n\nResume file: archived.md\n'), readState());
+    assert.match(session(), /\nResume file: next\.md\n/);
+  });
+
   test('(Codex r2) no session heading: `**Label**:` values are carried, a skipped wrapped one included', () => {
     fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
       '**Last session**: started', 'continued here', '**Resume file**: plan.md', ''].join('\n'));
