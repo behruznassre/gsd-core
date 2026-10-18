@@ -214,8 +214,9 @@ function nearestProjectConfigDir(cwd) {
  *   - a resolution failure or git timeout is unresolved (deny);
  *   - the writer's root holding `.planning/config.json` is the project;
  *   - `cwd` in a different repository from the project above (an independent
- *     nested repository, #2843) is not that project's, unless the project's
- *     config claims it (`sub_repos`, `multiRepo`) as findProjectRoot honors;
+ *     nested repository, #2843) is not that project's — decided without a
+ *     build unless a config at or above declares nested repositories
+ *     (`sub_repos`, `multiRepo`), when the resolver decides as for gsd-tools;
  *   - the writer's root holding a `.planning/` with no config, or `cwd` past
  *     the ancestor bound `findProjectRoot` walks (so it found nothing), is a
  *     directory inside a GSD project whose governing configuration cannot be
@@ -259,7 +260,8 @@ function resolveGuardProject(cwd) {
   if (ownRepo.undetermined || projectRepo.undetermined) {
     return unresolved(`git could not say which repository '${cwd}' belongs to (${ownRepo.undetermined || projectRepo.undetermined}).`);
   }
-  if (ownRepo.dir !== projectRepo.dir && !claimsNestedRepository(anchor, base)) return { project: false };
+  const nested = ownRepo.dir !== projectRepo.dir;
+  if (nested && !declaresNestedRepositories(cwd)) return { project: false };
   let resolved;
   try {
     resolved = resolveProjectRootOrThrow(from);
@@ -269,6 +271,9 @@ function resolveGuardProject(cwd) {
   if (resolved.reason === 'git_timed_out') return unresolved(`git timed out resolving which checkout '${cwd}' belongs to.`);
   const root = resolved.root;
   if (fs.existsSync(path.join(root, '.planning', 'config.json'))) return { project: true, root, sentinelRoot: sentinelRootFor(root) };
+  // A nested repository the resolver did not place in a configured project is
+  // independent (#2843), as it is for gsd-tools — never an unresolved denial.
+  if (nested) return { project: false };
   if (isDirectory(path.join(root, '.planning'))) {
     return unresolved(`'${root}' holds a .planning/ with no config.json, inside the GSD project at '${anchor}'.`);
   }
@@ -280,25 +285,28 @@ function resolveGuardProject(cwd) {
 }
 
 /**
- * #4885 review: whether the project at `anchor` explicitly claims the nested
- * repository `base` sits in, as findProjectRoot honors it before its own #2843
- * boundary: `sub_repos` (top-level or under `planning`) naming `base`'s first
- * path segment below `anchor`, or legacy `multiRepo: true`. gsd-tools writes a
- * claimed repository's decisions at the workspace, so the guard must not call
- * it "not a project"; findProjectRoot still decides the root. Pure fs, so the
- * boundary stays decided before any build.
+ * #4885 review: whether any GSD config at or above `cwd` (lexical or canonical)
+ * declares nested repositories as its own — non-empty `sub_repos` (top-level or
+ * under `planning`) or legacy `multiRepo: true`. findProjectRoot honors such a
+ * claim before its #2843 boundary, so where one is declared only the resolver
+ * can say whether a nested repository is the workspace's; where none is, it
+ * cannot be, and the boundary is decided here without a build. Pure fs.
  */
-function claimsNestedRepository(anchor, base) {
-  let config;
-  try {
-    config = JSON.parse(fs.readFileSync(path.join(anchor, '.planning', 'config.json'), 'utf8'));
-  } catch {
-    return false;
+function declaresNestedRepositories(cwd) {
+  const starts = [path.resolve(cwd)];
+  try { starts.push(fs.realpathSync.native(cwd)); } catch { /* lexical only */ }
+  for (const start of starts) {
+    for (let dir = start; ; dir = path.dirname(dir)) {
+      let config = null;
+      try { config = JSON.parse(fs.readFileSync(path.join(dir, '.planning', 'config.json'), 'utf8')); } catch { /* none here */ }
+      if (config && typeof config === 'object') {
+        const subRepos = config.sub_repos ?? (config.planning && typeof config.planning === 'object' ? config.planning.sub_repos : undefined);
+        if (config.multiRepo === true || (Array.isArray(subRepos) && subRepos.length > 0)) return true;
+      }
+      if (path.dirname(dir) === dir) break;
+    }
   }
-  if (!config || typeof config !== 'object') return false;
-  if (config.multiRepo === true) return true;
-  const subRepos = config.sub_repos ?? (config.planning && typeof config.planning === 'object' ? config.planning.sub_repos : undefined);
-  return Array.isArray(subRepos) && subRepos.includes(path.relative(anchor, base).split(path.sep)[0]);
+  return false;
 }
 
 /**

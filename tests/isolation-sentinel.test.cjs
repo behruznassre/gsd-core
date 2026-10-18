@@ -404,4 +404,33 @@ describe('#4885 parity: resolveGuardProject agrees with findProjectRoot (review 
       }
     });
   }
+
+  // Codex review, round 2: the claim is the resolver's to decide, wherever it
+  // is declared and however the cwd is spelled.
+  test('a claim declared above a configured project still makes its nested repository the workspace\'s', (t) => {
+    const { project, nested } = world(t);
+    // vendor/ is a configured project of its own; the claim on vendor/ is project's.
+    fs.mkdirSync(path.join(project, 'vendor', '.planning'));
+    fs.writeFileSync(path.join(project, 'vendor', '.planning', 'config.json'), '{}');
+    fs.writeFileSync(path.join(project, '.planning', 'config.json'), JSON.stringify({ sub_repos: ['vendor'] }));
+    const verdict = assertAgree(path.join(nested, 'src'));
+    assert.equal(real(verdict.root), real(project));
+  });
+
+  test('a claimed nested repository reached through a symlinked alias is still the workspace\'s', (t) => {
+    const { project, nested } = world(t);
+    fs.writeFileSync(path.join(project, '.planning', 'config.json'), JSON.stringify({ sub_repos: ['vendor'] }));
+    const alias = path.join(project, 'link');
+    fs.symlinkSync(path.join(nested, 'src'), alias, 'junction');
+    const verdict = assertAgree(alias);
+    assert.equal(real(verdict.root), real(project));
+    assert.equal(real(verdict.sentinelRoot), real(project));
+  });
+
+  test('a nested repository the resolver keeps as its own (config-less .planning/) under multiRepo is not the workspace\'s', (t) => {
+    const { project, nested } = world(t);
+    fs.writeFileSync(path.join(project, '.planning', 'config.json'), JSON.stringify({ multiRepo: true }));
+    fs.mkdirSync(path.join(nested, '.planning'));
+    assert.deepEqual(assertAgree(path.join(nested, 'src')), { project: false });
+  });
 });
