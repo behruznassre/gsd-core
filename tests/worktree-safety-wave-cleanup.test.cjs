@@ -1,3 +1,4 @@
+// docs-guard-exempt: docs/other.md below is a stubbed git diff output line; this file reads no docs/ file.
 'use strict';
 
 /**

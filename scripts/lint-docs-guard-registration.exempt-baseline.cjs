@@ -89,6 +89,8 @@ const DOCS_GUARD_EXEMPT_BASELINE = [
   'shipped-reference-cites.test.cjs',
   'state.test.cjs',
   'verification-status.test.cjs',
+  'worktree-safety-cleanup-manifest.test.cjs',
+  'worktree-safety-wave-cleanup.test.cjs',
   'worktree-safety.test.cjs',
 ];
 

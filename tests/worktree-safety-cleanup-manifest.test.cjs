@@ -1,3 +1,4 @@
+// docs-guard-exempt: docs/*.md strings below are path inputs to planWaveScopeConformance and docs/CLI-TOOLS.md is cited in a comment; this file reads no docs/ file.
 'use strict';
 
 /**
