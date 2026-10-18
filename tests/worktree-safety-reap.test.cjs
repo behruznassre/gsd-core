@@ -1105,6 +1105,48 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.strictEqual(fs.readFileSync(path.join(notes, 'file.txt'), 'utf8'), 'x\n');
   });
 
+  // #4941 review (trek-e): a child the sweep renamed to `.gsd-reap-<hex>` and
+  // then could not remove (the process died, or the rename back failed) was
+  // rejected by the name check on every later sweep and never reclaimed.
+  test('a .gsd-reap-<16 hex> directory stranded mid-removal is reclaimed without a harness branch', () => {
+    const repoDir = path.join(tmpBase, 'repo-stranded');
+    initRepo(repoDir);
+    const stranded = plainChild(repoDir, '.gsd-reap-0123456789abcdef');
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.deepStrictEqual([canonicalPath(row.path), row.status, row.reason], [canonicalPath(stranded), 'reaped', 'unregistered_residue']);
+    assert.ok(!fs.existsSync(stranded));
+  });
+
+  test('a stranded .gsd-reap-* directory still passes every other guard: tracked or repository-bearing ones are kept', () => {
+    const repoDir = path.join(tmpBase, 'repo-stranded-kept');
+    initRepo(repoDir);
+    const tracked = plainChild(repoDir, '.gsd-reap-aaaaaaaaaaaaaaaa');
+    git(['add', '-A'], repoDir);
+    git(['commit', '-m', 'commit a directory under .claude/worktrees'], repoDir);
+    const withRepo = plainChild(repoDir, '.gsd-reap-bbbbbbbbbbbbbbbb');
+    fs.mkdirSync(path.join(withRepo, 'nested'));
+    git(['init', '-q'], path.join(withRepo, 'nested'));
+    fs.writeFileSync(path.join(withRepo, 'nested', 'work.txt'), 'uncommitted\n');
+    const results = reapOrphanWorktrees(repoDir, deadOwnerDeps());
+    assert.deepStrictEqual(rows(results), [
+      [canonicalPath(tracked), 'skipped', 'residue_tracked'],
+      [canonicalPath(withRepo), 'skipped', 'residue_contains_repository'],
+    ]);
+    assert.ok(fs.existsSync(path.join(tracked, 'file.txt')));
+    assert.ok(fs.existsSync(path.join(withRepo, 'nested', 'work.txt')));
+  });
+
+  for (const name of ['.gsd-reap-0123456789abcde', '.gsd-reap-0123456789abcdef0', '.gsd-reap-0123456789ABCDEF', 'gsd-reap-0123456789abcdef']) {
+    test(`a near-miss of the stranded name (${name}) is not this sweep's and is kept`, () => {
+      const repoDir = path.join(tmpBase, 'repo-near-miss');
+      initRepo(repoDir);
+      const child = plainChild(repoDir, name);
+      const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+      assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_not_harness_named']);
+      assert.ok(fs.existsSync(path.join(child, 'file.txt')));
+    });
+  }
+
   test('a child holding a file git tracks is kept — committed content is never residue', () => {
     const repoDir = path.join(tmpBase, 'repo-tracked');
     initRepo(repoDir);

@@ -2550,6 +2550,15 @@ interface ReapScan {
 /** Claude Code names its harness worktrees `agent-<id>`; only those are ever removed as residue (#4941). A bare `agent-` has no id. */
 const HARNESS_WORKTREE_NAME_RE = /^agent-./su;
 
+/**
+ * The name the residue sweep renames a child to just before removing it
+ * (`findUnregisteredResidue`). One left behind — the process died between the
+ * rename and the removal, or a failed removal could not be renamed back — is
+ * this sweep's own, so it needs no harness name or branch; every other guard
+ * still applies (#4941 review).
+ */
+const STRANDED_REAP_NAME_RE = /^\.gsd-reap-[0-9a-f]{16}$/u;
+
 /** The reap results alone — the pre-#4941 signature; `reapOrphanWorktreesWithScan` adds what was read. */
 function reapOrphanWorktrees(repoRoot: string, deps: WorktreeDeps = {}): ReapResult[] {
   return reapOrphanWorktreesWithScan(repoRoot, deps).results;
@@ -2803,7 +2812,8 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
  *   - it is older than the lock path's mtime guard (it may be mid-creation);
  *   - it is named `agent-<id>` (`residue_not_harness_named`) and a harness
  *     branch for it exists — `agent-<id>` or `worktree-agent-<id>`
- *     (`residue_no_harness_branch`);
+ *     (`residue_no_harness_branch`); or it is a `.gsd-reap-<16 hex>` this
+ *     sweep stranded mid-removal, which has neither and needs neither;
  *   - git tracks no file under it, asked per child with a literal,
  *     case-insensitive pathspec, so a case-only rename or a backslash in a
  *     POSIX name cannot hide one (`residue_tracked`; fails closed);
@@ -2949,11 +2959,12 @@ function findUnregisteredResidue(
       continue;
     }
     if (children.length === 0) continue; // nothing to reclaim; a possible `worktree add` target
-    if (!HARNESS_WORKTREE_NAME_RE.test(name)) {
+    const stranded = STRANDED_REAP_NAME_RE.test(name);
+    if (!stranded && !HARNESS_WORKTREE_NAME_RE.test(name)) {
       results.push({ path: p, status: 'skipped', reason: 'residue_not_harness_named' });
       continue;
     }
-    if (!hasBranch(name) && !hasBranch(`worktree-${name}`)) {
+    if (!stranded && !hasBranch(name) && !hasBranch(`worktree-${name}`)) {
       results.push({ path: p, status: 'skipped', reason: 'residue_no_harness_branch' });
       continue;
     }
