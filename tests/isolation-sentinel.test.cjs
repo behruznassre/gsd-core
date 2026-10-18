@@ -586,7 +586,7 @@ describe('#4885 parity: resolveGuardProject agrees with findProjectRoot (review 
     fc.assert(
       fc.property(config, fc.boolean(), fc.constantFrom('', 'src'), (cfg, ownPlanning, below) => {
         fs.writeFileSync(path.join(project, '.planning', 'config.json'), JSON.stringify(cfg));
-        fs.rmSync(path.join(nested, '.planning'), { recursive: true, force: true });
+        cleanup(path.join(nested, '.planning'));
         if (ownPlanning) fs.mkdirSync(path.join(nested, '.planning'));
         const cwd = path.join(nested, below);
         assertAgree(cwd);
