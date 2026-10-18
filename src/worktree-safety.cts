@@ -3028,7 +3028,15 @@ function findUnregisteredResidue(
       removeDir(doomed);
       results.push({ path: p, status: 'reaped', reason: 'unregistered_residue' });
     } catch {
-      results.push({ path: restore(), status: 'skipped', reason: 'residue_remove_failed' });
+      // A concurrent sweep can take this reserved name as stranded and remove it
+      // first — a rename keeps the directory's mtime — so the walk here fails on
+      // a vanished entry. Gone is reaped, not a failure naming a missing path
+      // (#4941 review).
+      let gone = false;
+      try { fs.lstatSync(doomed); } catch (e) { gone = (e as NodeJS.ErrnoException).code === 'ENOENT'; }
+      results.push(gone
+        ? { path: p, status: 'reaped', reason: 'unregistered_residue' }
+        : { path: restore(), status: 'skipped', reason: 'residue_remove_failed' });
     }
   }
   return { results, status: 'scanned' };

@@ -1607,6 +1607,64 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(fs.existsSync(path.join(row.path, 'node_modules')), 'the reported path holds the residue');
   });
 
+  // trek-e review 5563200267 (Minor 1): a concurrent sweep can reclaim this
+  // sweep's in-flight `.gsd-reap-<hex>` as stranded, so this removal fails on a
+  // directory that is already gone. That is reaped, not residue_remove_failed
+  // naming a missing path.
+  test('a removal that fails because the directory is already gone is reported reaped', () => {
+    const { repoDir, residue } = repoWithResidue('rmgone');
+    const removeDir = (doomed) => {
+      cleanup(doomed);
+      throw new Error('ENOENT: injected, the directory vanished mid-walk');
+    };
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ removeDir })));
+    assert.deepStrictEqual([canonicalPath(row.path), row.status, row.reason], [canonicalPath(residue), 'reaped', 'unregistered_residue']);
+    assert.ok(!fs.existsSync(residue));
+    assert.deepStrictEqual(fs.readdirSync(path.dirname(residue)), [], 'nothing is left under a reserved name');
+  });
+
+  // trek-e review 5563200267 (Nit 1a): a stranded name is still under the mtime guard.
+  test('a .gsd-reap-<16 hex> directory newer than the mtime guard is not reported and not removed', () => {
+    const repoDir = path.join(tmpBase, 'repo-stranded-young');
+    initRepo(repoDir);
+    const stranded = plainChild(repoDir, '.gsd-reap-0123456789abcdef');
+    assert.deepStrictEqual(reapOrphanWorktrees(repoDir, deadOwnerDeps({ mtimeSafe: () => new Date(1000), nowMs: 1000 })), []);
+    assert.ok(fs.existsSync(path.join(stranded, 'file.txt')));
+  });
+
+  // trek-e review 5563200267 (Nit 1b): when the renamed directory is not where
+  // it should have landed and the rename back fails, the row names the
+  // reserved path, the one left holding the files.
+  test('a rename that did not land and cannot be renamed back reports the .gsd-reap-* path', (t) => {
+    if (process.platform === 'win32') {
+      t.skip('a rename onto a non-empty directory fails differently on Windows');
+      return;
+    }
+    const { repoDir, residue } = repoWithResidue('notlanded-stuck');
+    const realRename = fs.renameSync;
+    let held = null;
+    const results = withFaultyFs({
+      renameSync: (from, to) => {
+        if (held === null && path.basename(String(to)).startsWith('.gsd-reap-')) {
+          // The rename lands somewhere else (the reserved name is only a link
+          // to it), and the original path is recreated, so the rename back fails.
+          held = path.join(tmpBase, 'notlanded-held');
+          realRename(from, held);
+          fs.symlinkSync(held, to, 'junction');
+          fs.mkdirSync(residue);
+          fs.writeFileSync(path.join(residue, 'new.txt'), 'recreated\n');
+          return undefined;
+        }
+        return realRename(from, to);
+      },
+    }, () => reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.ok(held !== null, 'the reaper renamed the residue');
+    const row = onlyRow(results);
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_unreadable']);
+    assert.match(path.basename(row.path), /^\.gsd-reap-[0-9a-f]{16}$/u);
+    assert.ok(fs.existsSync(path.join(row.path, 'node_modules')), 'the reported path leads to the residue');
+  });
+
   test('a residue newer than the mtime guard is not reported and not removed (it may be mid-creation)', () => {
     const { repoDir, residue } = repoWithResidue('fresh');
     assert.deepStrictEqual(reapOrphanWorktrees(repoDir, { mtimeSafe: () => new Date(1000), nowMs: 1000 }), []);
