@@ -589,6 +589,23 @@ function evaluateDispatch(data, { clock = Date } = {}) {
   return { action: 'block', reason, reasonCode: REASON_CODE.HARNESS_FLAG_MISSING, sentinelDiscarded: state.sentinelDiscarded };
 }
 
+/**
+ * The block payload `main()` writes for one raw stdin string, or `null` when
+ * the dispatch is allowed. Throws on an unparseable payload, which `main()`
+ * turns into its fail-open crash path. Split from `main()` so the payload
+ * shape is testable in-process (#4885 review: mutation coverage).
+ */
+function blockOutputFor(input, { clock = Date } = {}) {
+  const decision = evaluateDispatch(JSON.parse(input), { clock });
+  if (decision.action !== 'block') return null;
+  return {
+    decision: 'block',
+    reason: decision.reason,
+    reason_code: decision.reasonCode,
+    sentinel_discarded: decision.sentinelDiscarded ?? null,
+  };
+}
+
 /* istanbul ignore next -- stdin adapter, exercised via spawnSync in tests */
 function main() {
   let input = '';
@@ -598,18 +615,9 @@ function main() {
   process.stdin.on('end', () => {
     clearTimeout(stdinTimeout);
     try {
-      const data = JSON.parse(input);
-      const decision = evaluateDispatch(data);
-      if (decision.action === 'block') {
-        const out = {
-          decision: 'block',
-          reason: decision.reason,
-          reason_code: decision.reasonCode,
-          sentinel_discarded: decision.sentinelDiscarded ?? null,
-        };
-        // Kimi feeds stderr (not stdout) back to the model on exit 2.
-        deny(out, decision.reason);
-      }
+      const out = blockOutputFor(input);
+      // Kimi feeds stderr (not stdout) back to the model on exit 2.
+      if (out) deny(out, out.reason);
       allow(undefined);
     } catch {
       // Silent fail — never block valid tool calls due to hook errors
@@ -629,6 +637,7 @@ if (require.main === module) {
 
 module.exports = {
   evaluateDispatch,
+  blockOutputFor,
   resolveIsolationState,
   resolveRuntimeIdentity,
   resolveHarnessFlag,

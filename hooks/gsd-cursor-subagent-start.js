@@ -616,6 +616,60 @@ function evaluateRootIsolation(root, subagentType, { clock = Date, dispatchIds =
   };
 }
 
+/**
+ * The JSON object `main()` writes for one raw stdin string: a deny with the
+ * state reminder riding along, or the reminder alone. Split from `main()` so
+ * the output is testable in-process (#4885 review: mutation coverage).
+ */
+function hookOutputFor(raw, { clock = Date, realpath = fs.realpathSync } = {}) {
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    data = null;
+  }
+
+  // Resolve the state-reminder context ONCE, up front, so it can ride along
+  // with EITHER outcome below (#3045 MINOR: a deny previously dropped this
+  // reminder entirely — process.stdout.write for the deny branch returned
+  // before the additional_context block ever ran — instead of preserving it
+  // alongside the deny; the subagent still benefits from phase/blocker
+  // context even when its dispatch is refused).
+  let additionalContext = null;
+  try {
+    const statePath = resolveStatePath(raw);
+    const statePresent = fs.existsSync(statePath);
+    additionalContext = statePresent ? MSG_PRESENT : MSG_ABSENT;
+  } catch {
+    additionalContext = null;
+  }
+
+  if (data && typeof data === 'object') {
+    let decision = { action: 'allow' };
+    try {
+      decision = resolveIsolationDecision(data, { clock, realpath });
+    } catch {
+      // Defense in depth only: every verify-and-deny path above has its own
+      // explicit try/catch that resolves to a deny with a distinct reason.
+      // Anything reaching here is an unexpected failure outside those paths
+      // (e.g. malformed workspace_roots entries) — never crash the hook.
+      decision = { action: 'allow' };
+    }
+    if (decision.action === 'deny') {
+      const out = {
+        permission: 'deny',
+        user_message: decision.reason,
+        reason_code: decision.reasonCode,
+        sentinel_discarded: decision.sentinelDiscarded ?? null,
+      };
+      if (additionalContext !== null) out.additional_context = additionalContext;
+      return out;
+    }
+  }
+
+  return additionalContext !== null ? { additional_context: additionalContext } : {};
+}
+
 /* istanbul ignore next -- stdin adapter, exercised via spawnSync in tests */
 function main() {
   let raw = '';
@@ -627,54 +681,7 @@ function main() {
   process.stdin.on('data', (chunk) => { raw += chunk; });
   process.stdin.on('end', () => {
     clearTimeout(stdinTimeout);
-
-    let data = null;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      data = null;
-    }
-
-    // Resolve the state-reminder context ONCE, up front, so it can ride along
-    // with EITHER outcome below (#3045 MINOR: a deny previously dropped this
-    // reminder entirely — process.stdout.write for the deny branch returned
-    // before the additional_context block ever ran — instead of preserving it
-    // alongside the deny; the subagent still benefits from phase/blocker
-    // context even when its dispatch is refused).
-    let additionalContext = null;
-    try {
-      const statePath = resolveStatePath(raw);
-      const statePresent = fs.existsSync(statePath);
-      additionalContext = statePresent ? MSG_PRESENT : MSG_ABSENT;
-    } catch {
-      additionalContext = null;
-    }
-
-    if (data && typeof data === 'object') {
-      let decision = { action: 'allow' };
-      try {
-        decision = resolveIsolationDecision(data);
-      } catch {
-        // Defense in depth only: every verify-and-deny path above has its own
-        // explicit try/catch that resolves to a deny with a distinct reason.
-        // Anything reaching here is an unexpected failure outside those paths
-        // (e.g. malformed workspace_roots entries) — never crash the hook.
-        decision = { action: 'allow' };
-      }
-      if (decision.action === 'deny') {
-        const out = {
-          permission: 'deny',
-          user_message: decision.reason,
-          reason_code: decision.reasonCode,
-          sentinel_discarded: decision.sentinelDiscarded ?? null,
-        };
-        if (additionalContext !== null) out.additional_context = additionalContext;
-        process.stdout.write(JSON.stringify(out));
-        return;
-      }
-    }
-
-    process.stdout.write(JSON.stringify(additionalContext !== null ? { additional_context: additionalContext } : {}));
+    process.stdout.write(JSON.stringify(hookOutputFor(raw)));
   });
 }
 
@@ -687,6 +694,7 @@ if (require.main === module) {
 // per the repo's clock-seam convention, instead of racing real `Date.now()`
 // across a spawned subprocess boundary.
 module.exports = {
+  hookOutputFor,
   resolveIsolationDecision,
   evaluateRootIsolation,
   resolveFallbackIsolation,

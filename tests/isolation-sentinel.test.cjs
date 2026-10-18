@@ -178,7 +178,8 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
       FIND_PROJECT_ROOT_MAX_DEPTH: maxDepth,
     });
     delete require.cache[SENTINEL_RESOLVED];
-    return { calls, FakeRuntimeBuildError, resolveGuardProject: require(SENTINEL_MODULE_PATH).resolveGuardProject };
+    const lib = require(SENTINEL_MODULE_PATH);
+    return { calls, FakeRuntimeBuildError, resolveGuardProject: lib.resolveGuardProject, resolveSentinelRoot: lib.resolveSentinelRoot };
   }
 
   function projectTree(t, depth) {
@@ -268,6 +269,24 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
       }
     });
   }
+
+  // The bound is project-root's own constant, not a copy of its value.
+  for (const [depth, unresolved] of [[3, false], [4, true]]) {
+    test(`the ancestor bound is the one project-root exports: ${depth} levels with a bound of 3 -> ${unresolved ? 'unresolved' : 'not a project'}`, (t) => {
+      const { sub } = projectTree(t, depth);
+      const { resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d, maxDepth: 3 });
+      const verdict = resolveGuardProject(sub);
+      if (unresolved) assert.match(verdict.error.message, /4 directories below the GSD project at .*, past the 3 that/);
+      else assert.deepEqual(verdict, { project: false });
+    });
+  }
+
+  test('resolveSentinelRoot answers a cwd holding .planning/ itself, with nothing built or run', (t) => {
+    const { calls, resolveSentinelRoot } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: () => '/elsewhere' });
+    const { root } = projectTree(t, 0);
+    assert.equal(resolveSentinelRoot(root), root);
+    assert.deepEqual(calls, { build: 0, worktree: 0, projectRoot: 0 });
+  });
 
   test('Major 4: a writer root that is a .planning/ with no config is unresolved, never another root\'s config', (t) => {
     const { root, sub } = projectTree(t, 3);
