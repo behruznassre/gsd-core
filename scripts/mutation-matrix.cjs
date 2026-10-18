@@ -670,10 +670,9 @@ const COVERED = {
   // (gsd-agent-isolation-guard.test.cjs, cursor-subagent-isolation.test.cjs) drive
   // the hooks as subprocesses, which Stryker cannot attribute to a mutant, and
   // would only add their full runtime to every mutant they happen to cover.
-  // Measured locally on #5232 (concurrency 4, timeoutFactor 3): 88.31% (86.18%
-  // killed only; 892 killed, 22 timeout, 98 survived, 23 no coverage of 1035
-  // counted). Floor = floor(86.18) - 1 = 85, to be re-set from this shard's
-  // first CI measurement per the HOW TO UPDATE procedure above.
+  // CI mutation run 39143208612, job 117721775325 (#5232, head 8cd2fa9df): 88.31%
+  // (890 killed, 24 timeout, 98 survived, 23 no coverage of 1035 counted). Floor =
+  // floor(88.31) - 1 = 87 per the HOW TO UPDATE procedure above.
   'isolation-hooks': {
     mutate: [
       'hooks/lib/isolation-sentinel.js',
@@ -691,28 +690,25 @@ const COVERED = {
       'isolation-sentinel.test.cjs',
       'isolation-sentinel.unit.test.cjs',
     ],
-    minScore: 85,
-    // Measured need: the local run above took 18m48s (1053 mutants, 4 runners; 22m14s when it
-    // shared the machine with another Stryker run), past the 15-minute default.
-    timeoutMinutes: 40,
+    minScore: 87,
+    // No timeoutMinutes override: the CI run above finished Stryker in 5m03s (the job in
+    // 5m35s), about a third of the 15-minute default.
   },
   // #4885 review (maintainer ruling): worktree-safety owns the resolver gsd-tools and the
   // isolation hooks share (resolvePlanningWorktreeRoot). Derived: the worktree-safety*.test.cjs
   // files. extraTests: two in-process files that require the module but sit outside the
   // naming rule — worktree-worker-log.test.cjs (the worker-record commands, ~240 cjs lines
   // nothing derived reached) and prune-orphaned-worktrees.test.cjs (pruneOrphanedWorktrees);
-  // about one second each. Measured locally on #5232 (concurrency 4, timeoutFactor 3):
-  // 94.67% (94.48% killed only; 2517 killed, 5 timeout, 122 survived, 20 no coverage of
-  // 2664). Floor = floor(94.48) - 1 = 93, to be re-set from this shard's first CI
-  // measurement per the HOW TO UPDATE procedure above.
+  // about one second each. CI mutation run 39143208612, job 117721775289 (#5232, head
+  // 8cd2fa9df): 94.67% (2517 killed, 5 timeout, 122 survived, 20 no coverage of 2664).
+  // Floor = floor(94.67) - 1 = 93 per the HOW TO UPDATE procedure above.
   'worktree-safety': {
     cjs: 'gsd-core/bin/lib/worktree-safety.cjs',
     extraTests: ['prune-orphaned-worktrees.test.cjs', 'worktree-worker-log.test.cjs'],
     minScore: 93,
-    // Measured need: the local run took 57m43s on 4 runners. A CI runner measured about
-    // 1.7x slower on the same dry run (frontmatter: 3.32s vs 1.95s), so ~100 minutes in CI;
-    // 200 leaves twice that, inside GitHub's 6-hour job cap.
-    timeoutMinutes: 200,
+    // Measured need: the CI run above finished Stryker in 36m11s (the job in 36m52s), past
+    // the 15-minute default. 60 is 1.63x the job's wall time, under the 90% near-cap advisory.
+    timeoutMinutes: 60,
   },
 };
 
