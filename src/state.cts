@@ -725,7 +725,7 @@ function cmdStatePatch(cwd: string, patches: Record<string, string>, raw: boolea
     // `applyStatePreservation` restored that this patch never named at all
     // (#3345's direction), a case the pre-#3471 version of this command never
     // covered.
-    const updated = reconcileReportedFields(statePath, preWriteState, precomputed.updated, divergedFields);
+    const updated = reconcileReportedFields(statePath, preWriteState, precomputed.updated, divergedFields, NO_SECTION_TARGETS, true);
     const updatedSet = new Set(updated);
     const failed = Object.keys(patches).filter((field) => !updatedSet.has(field));
     const results = { updated, failed };
@@ -858,7 +858,7 @@ function cmdStateUpdate(cwd: string, field: string | undefined, value: string | 
     // restored during this write that this command never touched at all
     // (#3345's direction) — reported separately from `updated` because this
     // command's contract is a single-field boolean, not a per-field array.
-    const reconciled = reconcileReportedFields(statePath, preWriteState, updated ? [field as string] : [], divergedFields);
+    const reconciled = reconcileReportedFields(statePath, preWriteState, updated ? [field as string] : [], divergedFields, NO_SECTION_TARGETS, true);
     // #4488: `updateCore` itself already told us whether it matched the field
     // (`updated`, captured above `readModifyWriteStateMd` runs it) — that is a
     // real signal, not a guess. `reconcileReportedFields` answers a DIFFERENT
@@ -5157,6 +5157,7 @@ function readStateTarget(
   body: string,
   field: string,
   sectionTargets: ReadonlySet<string>,
+  sessionScope = false,
 ): string | null {
   if (field === 'Current Position') {
     const section = stateTransitionMod.sliceCurrentPositionSection(body);
@@ -5166,10 +5167,12 @@ function readStateTarget(
     const section = collectSection(body, (h: HeadingToken) => h.text === field);
     return section !== null ? section.body.trim() : null;
   }
-  // #4998 review: a session field is read where `state update` / `state patch`
-  // write it — the session section, fenced examples blanked — or an unchanged
-  // fenced example above the live line hides the write and reports it missing.
-  const bodyValue = stateTransitionMod.isSessionScopedBodyField(field)
+  // #4998 review: with `sessionScope` (the writers that write a session field
+  // inside the session section: `state update` / `state patch`), a session
+  // field is read there too, fenced examples blanked — or an unchanged fenced
+  // example above the live line hides the write and reports it missing. Every
+  // other caller reads as its document-wide writer writes (record-session, #4763).
+  const bodyValue = sessionScope && stateTransitionMod.isSessionScopedBodyField(field)
     ? stateExtractField(readableBoldLabels(sessionFieldScope(body)), field)
     : stateExtractField(body, field);
   if (bodyValue !== null) return bodyValue;
@@ -5206,6 +5209,7 @@ function stateTargetChanged(
   persistedBody: string,
   field: string,
   sectionTargets: ReadonlySet<string>,
+  sessionScope = false,
 ): boolean {
   const isDeclaredDerivedLeaf = field.includes('.') && Object.prototype.hasOwnProperty.call(FIELD_CLASSIFICATION, field);
   if (isDeclaredDerivedLeaf && !sectionTargets.has(field)) {
@@ -5217,8 +5221,8 @@ function stateTargetChanged(
     if (before === STATE_FIELD_ABSENT && after !== STATE_FIELD_ABSENT) return false;
     return stateFieldValuesDiffer(before, after);
   }
-  const before = readStateTarget(snapshotFm, snapshotBody, field, sectionTargets);
-  const after = readStateTarget(persistedFm, persistedBody, field, sectionTargets);
+  const before = readStateTarget(snapshotFm, snapshotBody, field, sectionTargets, sessionScope);
+  const after = readStateTarget(persistedFm, persistedBody, field, sectionTargets, sessionScope);
   if (before === null && after === null) return false;
   if (before === null || after === null) return true;
   return before.trim() !== after.trim();
@@ -5233,6 +5237,8 @@ function reconcileReportedFields(
   // `target: 'section'` assertions, measured as whole-section deltas. Omitted
   // by every pre-C2 caller, whose output is unchanged.
   sectionTargets: ReadonlySet<string> = NO_SECTION_TARGETS,
+  // #4998 review: the caller writes session fields inside the session section.
+  sessionScope = false,
 ): string[] {
   void divergedFields; // ADR-3473 §8.7 D18: out-param only, not a candidate source here.
   if (preWriteState.fm === undefined || preWriteState.body === undefined) return [];
@@ -5244,7 +5250,7 @@ function reconcileReportedFields(
   const snapshotBody = preWriteState.body;
 
   const changed = (field: string): boolean =>
-    stateTargetChanged(snapshotFm, snapshotBody, persistedFm, persistedBody, field, sectionTargets);
+    stateTargetChanged(snapshotFm, snapshotBody, persistedFm, persistedBody, field, sectionTargets, sessionScope);
 
   // Candidate set = `reported` ∪ every frontmatter key (dotted-leaf
   // granularity) whose persisted value differs from the snapshot, minus the

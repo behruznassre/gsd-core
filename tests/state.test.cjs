@@ -22703,6 +22703,29 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     }
   }
 
+  // Codex review of this round: the session-scoped read is for the verbs that
+  // write in the session section; record-session's writer is document-wide
+  // (#4763), and its report must still see what that writer changed.
+  test('(review Major 2) record-session over an archive above ## Session still reports what it displaced', () => {
+    fs.writeFileSync(statePath(), ['---', 'gsd_state_version: 1.0', 'status: executing', '---', '', '# Project State', '',
+      '## Session Continuity Archive', '', 'Last session: archived date', 'Stopped at: archived handoff', 'Resume file: archived.md', '',
+      '## Session', '', 'Last session: live date', 'Stopped at: live handoff', 'Resume file: live.md', ''].join('\n'));
+    const { json } = recordSession('--stopped-at', 'new handoff', '--resume-file', 'new.md');
+    assert.strictEqual(json.recorded, true, JSON.stringify(json));
+    assert.deepStrictEqual(json.replacedRecord, { 'Stopped At': 'archived handoff', 'Resume File': 'archived.md' });
+  });
+
+  test('(review Major 2) a same-value `state update` of a session field reports it updated, not "not found"', () => {
+    seed([], ['Last session: 2026-01-01', 'Stopped at: real', 'Resume file: plan.md'], '## Session');
+    // A first write normalizes the frontmatter, so the measured call changes no byte (#4488).
+    assert.strictEqual(runTool('state', 'update', 'Resume File', 'first.md').exitCode, 0);
+    const before = readState();
+    const rec = runTool('state', 'update', 'Resume File', 'first.md');
+    assert.strictEqual(rec.exitCode, 0, rec.stderr);
+    assert.strictEqual(JSON.parse(rec.stdout).updated, true, rec.stdout);
+    assert.strictEqual(readState(), before);
+  });
+
   test('(review Major 2) `state update "Resume File"` writes the session line, not an archive section\'s copy above it', () => {
     fs.writeFileSync(statePath(), ['---', 'gsd_state_version: 1.0', 'status: executing', '---', '', '# Project State', '',
       '## Session Continuity Archive', '', 'Resume file: archived.md', '', '## Session', '', 'Resume file: plan.md', ''].join('\n'));

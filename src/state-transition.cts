@@ -2881,7 +2881,9 @@ function patchCore(
     let replaced: string | null;
     if (sessionWriteLabels) {
       const inSession = stateReplaceFieldInSession(body, sessionWriteLabels.primary, sessionWriteLabels.fallback, value);
-      replaced = inSession === body ? null : inSession;
+      // Unchanged is a miss only when the field is absent: one already holding
+      // the value matched (#4488), as stateReplaceField reports it.
+      replaced = inSession !== body || sessionSourceExists(body, sessionWriteLabels) ? inSession : null;
     } else {
       replaced = stateReplaceField(body, field, value);
     }
@@ -2959,10 +2961,10 @@ function updateCore(
   const sessionWriteLabels = sessionLabelsForBodyField(intent.field);
   let result: string | null;
   if (sessionWriteLabels) {
-    // Replace-only by contract: unchanged content means the field is not in the
-    // session section, which is a miss, not a write.
+    // Replace-only by contract: the session writer never inserts a missing field.
     const replaced = stateReplaceFieldInSession(body, sessionWriteLabels.primary, sessionWriteLabels.fallback, intent.value);
-    result = replaced === body ? null : replaced;
+    // A field already holding the value matched; unchanged with no field is the miss (#4488).
+    result = replaced !== body || sessionSourceExists(body, sessionWriteLabels) ? replaced : null;
   } else {
     result = stateReplaceField(body, intent.field, intent.value);
   }
