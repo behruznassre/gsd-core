@@ -171,7 +171,7 @@ function makeFixture(tmpBase, name, options = {}) {
 
 /** Deps every "owner is dead, lock is stale" test shares. */
 function deadOwnerDeps(extra = {}) {
-  return { isPidAlive: () => false, mtimeSafe: () => STALE_MTIME, ...extra };
+  return { isPidAlive: () => false, mtimeSafe: () => STALE_MTIME, ctimeSafe: () => STALE_MTIME, ...extra };
 }
 
 /** Assert exactly one result row, and return it. */
@@ -1607,20 +1607,56 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(fs.existsSync(path.join(row.path, 'node_modules')), 'the reported path holds the residue');
   });
 
-  // trek-e review 5563200267 (Minor 1): a concurrent sweep can reclaim this
-  // sweep's in-flight `.gsd-reap-<hex>` as stranded, so this removal fails on a
-  // directory that is already gone. That is reaped, not residue_remove_failed
-  // naming a missing path.
-  test('a removal that fails because the directory is already gone is reported reaped', () => {
-    const { repoDir, residue } = repoWithResidue('rmgone');
-    const removeDir = (doomed) => {
-      cleanup(doomed);
-      throw new Error('ENOENT: injected, the directory vanished mid-walk');
-    };
-    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ removeDir })));
-    assert.deepStrictEqual([canonicalPath(row.path), row.status, row.reason], [canonicalPath(residue), 'reaped', 'unregistered_residue']);
-    assert.ok(!fs.existsSync(residue));
-    assert.deepStrictEqual(fs.readdirSync(path.dirname(residue)), [], 'nothing is left under a reserved name');
+  // trek-e review 5563200267 (Minor 1): a sweep's rename to the reserved name
+  // keeps the directory's mtime, so a second sweep running at the same time saw
+  // the first one's in-flight `.gsd-reap-<hex>` as stranded and removed it under
+  // it. The rename sets the ctime, so a reserved name changed inside the guard
+  // window is left for a later sweep. guardMs-1 is still in flight; guardMs and
+  // guardMs+1 are stranded and reclaimed.
+  for (const [age, removed] of [[-1, false], [0, true], [1, true]]) {
+    test(`a .gsd-reap-<16 hex> renamed guardMs${age < 0 ? '-1' : age > 0 ? '+1' : ''} ago is ${removed ? 'reclaimed' : 'left alone'}`, () => {
+      const guardMs = 60_000;
+      const repoDir = path.join(tmpBase, `repo-inflight${age}`);
+      initRepo(repoDir);
+      const stranded = plainChild(repoDir, '.gsd-reap-0123456789abcdef');
+      // The mtime is a day older than the ctime, so only the ctime decides.
+      const renamedAt = 86_400_000;
+      const results = reapOrphanWorktrees(repoDir, deadOwnerDeps({
+        reapMtimeGuardMs: guardMs,
+        mtimeSafe: () => new Date(0),
+        ctimeSafe: () => new Date(renamedAt),
+        nowMs: renamedAt + guardMs + age,
+      }));
+      assert.deepStrictEqual(rows(results), removed ? [[canonicalPath(stranded), 'reaped', 'unregistered_residue']] : []);
+      assert.strictEqual(fs.existsSync(path.join(stranded, 'file.txt')), !removed);
+    });
+  }
+
+  test('a .gsd-reap-<16 hex> whose ctime cannot be read is reported, not removed', () => {
+    const repoDir = path.join(tmpBase, 'repo-inflight-unknown');
+    initRepo(repoDir);
+    const stranded = plainChild(repoDir, '.gsd-reap-0123456789abcdef');
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ ctimeSafe: () => null })));
+    assert.deepStrictEqual([canonicalPath(row.path), row.status, row.reason], [canonicalPath(stranded), 'skipped', 'residue_age_unknown']);
+    assert.ok(fs.existsSync(path.join(stranded, 'file.txt')));
+  });
+
+  test('with the real ctime, a .gsd-reap-<16 hex> renamed just now is left alone even when its mtime is old', () => {
+    const repoDir = path.join(tmpBase, 'repo-inflight-real');
+    initRepo(repoDir);
+    const residue = plainChild(repoDir, 'agent-inflight');
+    const stranded = path.join(path.dirname(residue), '.gsd-reap-0123456789abcdef');
+    fs.renameSync(residue, stranded);
+    assert.deepStrictEqual(reapOrphanWorktrees(repoDir, { isPidAlive: () => false, mtimeSafe: () => STALE_MTIME }), []);
+    assert.ok(fs.existsSync(path.join(stranded, 'file.txt')));
+  });
+
+  // The guard applies to the reserved name only: a harness-named residue is
+  // aged by its mtime, as before.
+  test('an agent-<id> residue is not held back by a fresh ctime', () => {
+    const { repoDir, residue } = repoWithResidue('ctime-agent');
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ ctimeSafe: () => new Date(Date.now()) })));
+    assert.deepStrictEqual([canonicalPath(row.path), row.status], [canonicalPath(residue), 'reaped']);
   });
 
   // trek-e review 5563200267 (Nit 1a): a stranded name is still under the mtime guard.

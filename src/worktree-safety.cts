@@ -138,6 +138,8 @@ interface WorktreeDeps {
   readDirSafe?: (dir: string) => string[] | null;
   readFileSafe?: (file: string) => string | null;
   mtimeSafe?: (file: string) => Date | null;
+  /** #4941 review: the inode change time (a rename sets it, unlike mtime); defaults to `fs.statSync(file).ctime`. */
+  ctimeSafe?: (file: string) => Date | null;
   reapMtimeGuardMs?: number;
   /** Injected current time in ms since epoch for deterministic tests (#1191). */
   nowMs?: number;
@@ -2838,6 +2840,7 @@ function findUnregisteredResidue(
 ): { results: ReapResult[]; status: ResidueDirStatus } {
   const execGit = deps.execGit || execGitDefault;
   const mtimeSafe = deps.mtimeSafe || defaultMtimeSafe;
+  const ctimeSafe = deps.ctimeSafe || defaultCtimeSafe;
   const readDirSafe = deps.readDirSafe || defaultReadDirSafe;
   const removeDir = deps.removeDir || ((p: string) => fs.rmSync(p, { recursive: true, maxRetries: 2 }));
   const walkLimit = deps.residueWalkLimit ?? RESIDUE_WALK_LIMIT;
@@ -2963,6 +2966,18 @@ function findUnregisteredResidue(
     }
     if (children.length === 0) continue; // nothing to reclaim; a possible `worktree add` target
     const stranded = STRANDED_REAP_NAME_RE.test(name);
+    // A sweep's own rename to the reserved name keeps the directory's mtime but
+    // sets its ctime, so a reserved name changed inside the guard window may be
+    // another sweep's removal in flight: left alone, as a young residue is, and
+    // reclaimed by a later sweep once the window has passed (#4941 review).
+    if (stranded) {
+      const ctime = ctimeSafe(p);
+      if (!ctime) {
+        results.push({ path: p, status: 'skipped', reason: 'residue_age_unknown' });
+        continue;
+      }
+      if (nowMs - ctime.getTime() < guardMs) continue;
+    }
     if (!stranded && !HARNESS_WORKTREE_NAME_RE.test(name)) {
       results.push({ path: p, status: 'skipped', reason: 'residue_not_harness_named' });
       continue;
@@ -3028,15 +3043,7 @@ function findUnregisteredResidue(
       removeDir(doomed);
       results.push({ path: p, status: 'reaped', reason: 'unregistered_residue' });
     } catch {
-      // A concurrent sweep can take this reserved name as stranded and remove it
-      // first — a rename keeps the directory's mtime — so the walk here fails on
-      // a vanished entry. Gone is reaped, not a failure naming a missing path
-      // (#4941 review).
-      let gone = false;
-      try { fs.lstatSync(doomed); } catch (e) { gone = (e as NodeJS.ErrnoException).code === 'ENOENT'; }
-      results.push(gone
-        ? { path: p, status: 'reaped', reason: 'unregistered_residue' }
-        : { path: restore(), status: 'skipped', reason: 'residue_remove_failed' });
+      results.push({ path: restore(), status: 'skipped', reason: 'residue_remove_failed' });
     }
   }
   return { results, status: 'scanned' };
@@ -3189,6 +3196,10 @@ function defaultReadFileSafe(file: string): string | null {
 
 function defaultMtimeSafe(file: string): Date | null {
   try { return fs.statSync(file).mtime; } catch { return null; }
+}
+
+function defaultCtimeSafe(file: string): Date | null {
+  try { return fs.statSync(file).ctime; } catch { return null; }
 }
 
 function cmdWorktreeReapOrphans(cwd: string, deps: RecordAgentCmdDeps & WorktreeDeps = {}): void {
