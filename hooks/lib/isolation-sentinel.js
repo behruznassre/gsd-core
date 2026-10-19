@@ -301,23 +301,26 @@ function configMayDeclareNestedRepositories(file) {
   let fd;
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0));
+  } catch {
+    return false; // absent or unreadable — no claim, as for findProjectRoot
+  }
+  try {
     const st = fs.fstatSync(fd);
+    // Stryker disable next-line ConditionalExpression: any non-regular file also fails the read below; this check stops that read from blocking or never ending (a FIFO, /dev/zero), which the FIFO row covers in a child process
     if (!st.isFile()) return false;
     if (st.size > CONFIG_FILE_MAX_BYTES) return true;
-    const buf = Buffer.alloc(st.size);
-    let n = 0;
-    for (let r; n < buf.length && (r = fs.readSync(fd, buf, n, buf.length - n, n)) > 0;) n += r;
-    const config = JSON.parse(buf.toString('utf8', 0, n));
-    if (!config || typeof config !== 'object') return false;
-    const subRepos = config.sub_repos ?? (config.planning && typeof config.planning === 'object' ? config.planning.sub_repos : undefined);
+    const config = JSON.parse(fs.readFileSync(fd, 'utf8'));
+    // A `null` config throws here and declares nothing, as for findProjectRoot.
+    const subRepos = config.sub_repos ?? config.planning?.sub_repos;
     return config.multiRepo === true || (Array.isArray(subRepos) && subRepos.length > 0);
+    // Stryker disable BlockStatement: an emptied catch returns undefined, read as false like the
+    // `false` it replaces, and closing the descriptor has no effect a test can observe
   } catch {
-    return false; // absent, unreadable or unparseable — no claim, as for findProjectRoot
+    return false; // unparseable — no claim, as for findProjectRoot
   } finally {
-    if (fd !== undefined) {
-      try { fs.closeSync(fd); } catch { /* already closed */ }
-    }
+    fs.closeSync(fd);
   }
+  // Stryker restore BlockStatement
 }
 
 /**

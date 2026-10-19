@@ -378,6 +378,16 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
     });
   }
 
+  test('a directory where the project\'s .planning/config.json should be declares nothing', (t) => {
+    const { root, child } = nestedRepo(t, '{}');
+    const config = path.join(root, '.planning', 'config.json');
+    fs.unlinkSync(config);
+    fs.mkdirSync(config);
+    const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+    assert.deepEqual(resolveGuardProject(child), { project: false });
+    assert.equal(calls.build, 0);
+  });
+
   test('a FIFO at the project\'s .planning/config.json does not hang the guard', { skip: process.platform === 'win32' }, (t) => {
     // Read blocking, a FIFO there hung the guard until it was killed. The real
     // module runs in a child process, so a regression fails on the timeout
