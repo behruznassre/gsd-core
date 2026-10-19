@@ -313,14 +313,11 @@ function configMayDeclareNestedRepositories(file) {
     // A `null` config throws here and declares nothing, as for findProjectRoot.
     const subRepos = config.sub_repos ?? config.planning?.sub_repos;
     return config.multiRepo === true || (Array.isArray(subRepos) && subRepos.length > 0);
-    // Stryker disable BlockStatement: an emptied catch returns undefined, read as false like the
-    // `false` it replaces, and closing the descriptor has no effect a test can observe
   } catch {
     return false; // unparseable — no claim, as for findProjectRoot
   } finally {
     fs.closeSync(fd);
   }
-  // Stryker restore BlockStatement
 }
 
 /**
