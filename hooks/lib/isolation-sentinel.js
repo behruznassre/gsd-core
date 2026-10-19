@@ -326,17 +326,19 @@ function configMayDeclareNestedRepositories(file) {
  * claim before its #2843 boundary, so where one is declared only the resolver
  * can say whether a nested repository is the workspace's; where none is, it
  * cannot be, and the boundary is decided here without a build. The walk stops
- * below `$HOME`, as findProjectRoot's does: it never reads a claim there or
- * above. Pure fs.
+ * where findProjectRoot's does: before stepping up into `$HOME`, so a start
+ * below `$HOME` never reads a claim there or above, and a start at `$HOME`
+ * itself still climbs. Pure fs.
  */
 function declaresNestedRepositories(cwd) {
   const home = os.homedir();
   const starts = [path.resolve(cwd)];
   try { starts.push(fs.realpathSync.native(cwd)); } catch { /* lexical only */ }
   for (const start of starts) {
-    for (let dir = start; dir !== home; dir = path.dirname(dir)) {
+    for (let dir = start; ; dir = path.dirname(dir)) {
       if (configMayDeclareNestedRepositories(path.join(dir, '.planning', 'config.json'))) return true;
-      if (path.dirname(dir) === dir) break;
+      const parent = path.dirname(dir);
+      if (parent === dir || parent === home) break;
     }
   }
   return false;

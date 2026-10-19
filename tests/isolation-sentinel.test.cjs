@@ -399,7 +399,8 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
   // or above $HOME, so neither does the pre-filter.
   for (const [label, homeOf, build] of [['is $HOME', (ws) => ws, 0], ['is below $HOME', (ws) => path.dirname(ws), 1]]) {
     test(`a declaring config in a directory that ${label} -> ${build ? 'the resolver decides' : 'not read; nothing built'}`, (t) => {
-      const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-guard-home-'));
+      // Canonical, so the lexical and canonical walks meet the same $HOME (macOS /var -> /private/var).
+      const ws = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-guard-home-')));
       t.after(() => cleanup(ws));
       fs.mkdirSync(path.join(ws, '.planning'));
       fs.writeFileSync(path.join(ws, '.planning', 'config.json'), '{"sub_repos":["inner"]}');
@@ -565,6 +566,21 @@ describe('#4885 parity: resolveGuardProject agrees with findProjectRoot (review 
     fs.writeFileSync(path.join(project, '.planning', 'config.json'), JSON.stringify({ multiRepo: true }));
     fs.mkdirSync(path.join(nested, '.planning'));
     assert.deepEqual(assertAgree(path.join(nested, 'src')), { project: false });
+  });
+
+  // Codex review (this round): findProjectRoot stops before stepping up INTO
+  // $HOME, so a cwd at $HOME itself still climbs and honors a claim above it —
+  // the guard's pre-filter must too (a sandbox whose HOME is a claimed repository).
+  test('a claimed nested repository that is itself $HOME is still the workspace\'s', (t) => {
+    const { project, nested } = world(t);
+    fs.writeFileSync(path.join(project, '.planning', 'config.json'), JSON.stringify({ sub_repos: ['vendor'] }));
+    const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+    t.after(() => {
+      for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    });
+    process.env.HOME = nested;
+    process.env.USERPROFILE = nested;
+    assert.equal(real(assertAgree(nested).root), real(project));
   });
 
   // trek-e review 5563999745 (Nit 5): the same contract as a property over
