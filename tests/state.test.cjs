@@ -22715,6 +22715,15 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.deepStrictEqual(json.replacedRecord, { 'Stopped At': 'archived handoff', 'Resume File': 'archived.md' });
   });
 
+  test('(review Major 2) record-session below fenced examples reports the live fields it wrote and what it displaced', () => {
+    seed([], ['```md', 'Last session: example date', 'Resume file: example.md', '```', '', 'Last session: old date', 'Resume file: old.md'], '## Session');
+    const { json } = recordSession('--resume-file', 'next.md');
+    assert.strictEqual(json.recorded, true, JSON.stringify(json));
+    assert.deepStrictEqual(json.updated, ['Last session', 'Resume File']);
+    assert.deepStrictEqual(json.replacedRecord, { 'Resume File': 'old.md' });
+    assert.ok(session().includes('```md\nLast session: example date\nResume file: example.md\n```'), session());
+  });
+
   test('(review Major 2) a same-value `state update` of a session field reports it updated, not "not found"', () => {
     seed([], ['Last session: 2026-01-01', 'Stopped at: real', 'Resume file: plan.md'], '## Session');
     // A first write normalizes the frontmatter, so the measured call changes no byte (#4488).

@@ -5167,13 +5167,14 @@ function readStateTarget(
     const section = collectSection(body, (h: HeadingToken) => h.text === field);
     return section !== null ? section.body.trim() : null;
   }
-  // #4998 review: with `sessionScope` (the writers that write a session field
-  // inside the session section: `state update` / `state patch`), a session
-  // field is read there too, fenced examples blanked — or an unchanged fenced
-  // example above the live line hides the write and reports it missing. Every
-  // other caller reads as its document-wide writer writes (record-session, #4763).
-  const bodyValue = sessionScope && stateTransitionMod.isSessionScopedBodyField(field)
-    ? stateExtractField(readableBoldLabels(sessionFieldScope(body)), field)
+  // #4998 review: no session writer changes a fenced example line, so a session
+  // field is read with fences blanked — an unchanged example above the live
+  // line hid the write and reported it missing. With `sessionScope` (`state
+  // update` / `state patch`, which write inside the session section) it is read
+  // there; otherwise from the whole document, as record-session's document-wide
+  // writer writes it (#4763).
+  const bodyValue = stateTransitionMod.isSessionScopedBodyField(field)
+    ? stateExtractField(readableBoldLabels(sessionScope ? sessionFieldScope(body) : maskFencedLines(body)), field)
     : stateExtractField(body, field);
   if (bodyValue !== null) return bodyValue;
   if (Object.prototype.hasOwnProperty.call(fm, field)) return String(fm[field]);
