@@ -309,6 +309,104 @@ function runHook(hookFile, payload, opts = {}) {
   return { stdout, exitCode, timedOut: !!(result && result.signal === 'SIGTERM') };
 }
 
+// ── workflow hand-off (#5547) ─────────────────────────────────────────────────
+// `/gsd <command>` used to be a data dispatcher only: `/gsd init new-project`
+// printed the init JSON and stopped, because Pi had no entry point that mapped a
+// GSD command to its workflow. The installer now writes each command as a Pi
+// skill (`<config>/skills/gsd-<command>/SKILL.md`, invoked `/skill:gsd-<command>`),
+// so a command that names one of those skills hands off to it instead.
+
+// `/gsd init <workflow>` is a data call (the init bundle a workflow consumes).
+// This maps each `gsd-tools init` workflow that has a GSD command to the command
+// stem whose skill runs it — most are the same name, a few differ (`resume` ->
+// `resume-work`, `new-workspace` -> `workspace`, ...). tests/pi-workflow-handoff
+// pins every target to a commands/gsd/<name>.md file and every `gsd-tools init`
+// workflow to either an entry here or an explicit no-skill reason.
+const PI_WORKFLOW_INIT_COMMANDS = Object.freeze({
+  'execute-phase': 'execute-phase',
+  'plan-phase': 'plan-phase',
+  'new-project': 'new-project',
+  'new-milestone': 'new-milestone',
+  onboard: 'onboard',
+  quick: 'quick',
+  'quick-batch': 'quick-batch',
+  'ingest-docs': 'ingest-docs',
+  'verify-work': 'verify-work',
+  'code-review': 'code-review',
+  review: 'review',
+  'map-codebase': 'map-codebase',
+  progress: 'progress',
+  manager: 'manager',
+  'complete-milestone': 'complete-milestone',
+  autonomous: 'autonomous',
+  'docs-update': 'docs-update',
+  update: 'update',
+  debug: 'debug',
+  resume: 'resume-work',
+  'discuss-phase-assumptions': 'discuss-phase',
+  'new-workspace': 'workspace',
+});
+
+/**
+ * Whether the installed tree carries `skills/gsd-<name>/SKILL.md`. Local to the
+ * config dir the extension was installed into, so a data-only (pre-#5547) tree
+ * or a partial install simply has no hand-off and keeps the data behavior.
+ * @param {string} name  bare command stem, e.g. "new-project"
+ * @param {string} [engineRoot]
+ * @returns {boolean}
+ */
+function hasWorkflowSkill(name, engineRoot = ENGINE_ROOT) {
+  if (typeof name !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(name)) return false;
+  try {
+    return fs.statSync(path.join(engineRoot, 'skills', `gsd-${name}`, 'SKILL.md')).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Decide whether `/gsd <family> ...` is a workflow command. The data families
+ * (`init`, `state`, `phase`, ...) keep their scripted data semantics, so
+ * `/gsd phase list` and `gsd_invoke` are unchanged; anything else that names an
+ * installed `gsd-<name>` skill is handed off to it.
+ * @param {string} rawArgs  the raw `/gsd` argument string
+ * @param {string} [engineRoot]
+ * @returns {{ skill: string, message: string } | null}
+ */
+function resolveWorkflowHandoff(rawArgs, engineRoot = ENGINE_ROOT) {
+  const { family } = parseGsdCommandArgs(rawArgs);
+  if (PI_COMMAND_FAMILIES.includes(family)) return null;
+  if (!hasWorkflowSkill(family, engineRoot)) return null;
+  // The remainder is forwarded verbatim (not re-joined from tokens) so quoting
+  // the user typed survives into the skill's argument text.
+  const trimmed = String(rawArgs || '').trim();
+  const remainder = trimmed.slice(trimmed.indexOf(family) + family.length).trim();
+  const skill = `gsd-${family}`;
+  return { skill, message: remainder ? `/skill:${skill} ${remainder}` : `/skill:${skill}` };
+}
+
+/**
+ * The next-step line appended to `/gsd init <workflow>` output. `init <workflow>`
+ * is a data call the workflow itself makes, so it keeps returning its JSON; for
+ * a human at the prompt that JSON is a dead end, so name the way to run the
+ * workflow. Never added to `gsd_invoke`, whose output is parsed by callers.
+ * @param {{ family: string, subcommand?: string, args?: string[] }} parsed  the tokenized
+ *   `/gsd` call, as returned by parseGsdCommandArgs
+ * @param {string} [engineRoot]
+ * @returns {string} the line to append, or '' when none applies
+ */
+function nextStepFor({ family, subcommand, args: rest = [] }, engineRoot = ENGINE_ROOT) {
+  if (family !== 'init' || typeof subcommand !== 'string') return '';
+  if (!Object.prototype.hasOwnProperty.call(PI_WORKFLOW_INIT_COMMANDS, subcommand)) return '';
+  const command = PI_WORKFLOW_INIT_COMMANDS[subcommand];
+  if (!hasWorkflowSkill(command, engineRoot)) return '';
+  // Positional arguments (a phase number, say) carry over; flags belong to the
+  // init data call and are not guaranteed to mean anything to the workflow.
+  const positional = (Array.isArray(rest) ? rest : []).filter((a) => typeof a === 'string' && !a.startsWith('-'));
+  const tail = positional.length > 0 ? ` ${positional.join(' ')}` : '';
+  return `\n\nNext: run /gsd ${command}${tail} (or /skill:gsd-${command}${tail}) to start the ${command} workflow — this output is only its init data.`;
+}
+
 module.exports = function gsdPiExtension(pi) {
   if (!pi || typeof pi !== 'object') {
     throw new TypeError('gsdPiExtension: pi ExtensionAPI is required');
@@ -332,6 +430,20 @@ module.exports = function gsdPiExtension(pi) {
       const notify = (ctx && ctx.ui && typeof ctx.ui.notify === 'function')
         ? (message, type) => ctx.ui.notify(message, type)
         : null;
+      // #5547: a workflow-backed command starts its workflow instead of
+      // printing data. `sendUserMessage` with `expandPromptTemplates` makes Pi
+      // expand the `/skill:` command, so the agent follows the installed skill.
+      const handoff = resolveWorkflowHandoff(args);
+      if (handoff) {
+        if (typeof pi.sendUserMessage === 'function') {
+          pi.sendUserMessage(handoff.message, { deliverAs: 'followUp', expandPromptTemplates: true });
+        } else if (notify) {
+          // A host without sendUserMessage cannot be handed off to; say how to
+          // start the workflow by hand rather than running its data command.
+          notify(`This pi host cannot start a skill from /gsd. Run ${handoff.message} to start the ${handoff.skill} workflow.`, 'info');
+        }
+        return;
+      }
       const { family, subcommand, args: rest } = parseGsdCommandArgs(args);
       let dispatchGsdCommand;
       try {
@@ -344,7 +456,7 @@ module.exports = function gsdPiExtension(pi) {
       }
       const result = dispatchGsdCommand({ family, subcommand, args: rest, cwd });
       const text = result.ok
-        ? result.stdout
+        ? `${result.stdout}${nextStepFor({ family, subcommand, args: rest })}`
         : `GSD error: ${result.stderr || result.stdout || `dispatch failed (exit ${result.code})`}`;
       if (notify) {
         notify(text, result.ok ? 'info' : 'error');
@@ -441,4 +553,8 @@ module.exports._internals = {
   buildBeforeProviderRequestHandler,
   buildGsdInvokeParameters,
   runHook,
+  hasWorkflowSkill,
+  resolveWorkflowHandoff,
+  nextStepFor,
+  PI_WORKFLOW_INIT_COMMANDS,
 };
