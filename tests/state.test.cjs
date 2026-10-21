@@ -22745,6 +22745,92 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.match(session(), /\nResume file: next\.md\n/);
   });
 
+  // trek-e review 5593733001 (Minors 2-3, Nit 4): the behavior change the
+  // session-scoped write makes. Before it, `state update` / `state patch` of
+  // these three labels replaced the first match anywhere in the document; now a
+  // document with no session section reports the field not found and keeps it.
+  const SESSION_BODY_LABELS = [['Resume File', 'Resume file'], ['Last session', 'Last session'], ['Last Date', 'Last Date']];
+  for (const [label, line] of SESSION_BODY_LABELS) {
+    test(`(review 5593733001) no session section: \`state update\` and \`state patch\` of ${label} report it not found and leave the line`, () => {
+      seed([], [`${line}: old`], '## Notes');
+      const before = readState();
+      const upd = runTool('state', 'update', label, 'new');
+      assert.strictEqual(upd.exitCode, 0, upd.stderr);
+      assert.deepStrictEqual(JSON.parse(upd.stdout), { updated: false, reason: `Field "${label}" not found in STATE.md`, preserved: [] });
+      const pat = runTool('state', 'patch', `--${label}`, 'new');
+      assert.strictEqual(pat.exitCode, 0, pat.stderr);
+      assert.deepStrictEqual(JSON.parse(pat.stdout), { updated: [], failed: [label] });
+      assert.strictEqual(readState(), before);
+    });
+  }
+
+  for (const verb of ['update', 'patch']) {
+    test(`(review 5593733001) \`state ${verb}\` writes the three session labels under \`## Session Continuity\` in their bold form`, () => {
+      seed([], ['**Last session:** old', '**Last Date:** old', '**Resume file:** old.md']);
+      for (const [label] of SESSION_BODY_LABELS) {
+        const rec = runTool('state', ...(verb === 'update' ? ['update', label, 'v'] : ['patch', `--${label}`, 'v']));
+        assert.strictEqual(rec.exitCode, 0, rec.stderr);
+        const reported = JSON.parse(rec.stdout).updated;
+        assert.ok(verb === 'update' ? reported === true : reported.includes(label), rec.stdout);
+      }
+      assert.strictEqual(session(), ['## Session Continuity', '', '**Last session:** v', '**Last Date:** v', '**Resume file:** v', ''].join('\n'));
+    });
+  }
+
+  test('(review 5593733001) with both headings, `## Session` is written and `## Session Continuity` keeps its copy', () => {
+    fs.writeFileSync(statePath(), ['---', 'gsd_state_version: 1.0', 'status: executing', '---', '', '# Project State', '',
+      '## Session Continuity', '', 'Resume file: continuity.md', '', '## Session', '', 'Resume file: plan.md', ''].join('\n'));
+    const rec = runTool('state', 'patch', '--Resume File', 'next.md');
+    assert.strictEqual(rec.exitCode, 0, rec.stderr);
+    assert.deepStrictEqual(JSON.parse(rec.stdout).updated, ['Resume File']);
+    assert.ok(readState().includes('## Session Continuity\n\nResume file: continuity.md\n'), readState());
+    assert.ok(readState().endsWith('## Session\n\nResume file: next.md\n'), readState());
+  });
+
+  test('(review 5593733001) a CRLF STATE.md: each session label is found and written', () => {
+    fs.writeFileSync(statePath(), ['---', 'gsd_state_version: 1.0', 'status: executing', '---', '', '# Project State', '',
+      '## Session Continuity', '', '**Resume file:** old.md', 'Last session: old', 'Last Date: old', ''].join('\r\n'));
+    const upd = runTool('state', 'update', 'Resume File', 'new.md');
+    assert.strictEqual(JSON.parse(upd.stdout).updated, true, upd.stdout);
+    const pat = runTool('state', 'patch', '--Last session', 's', '--Last Date', 'd');
+    assert.deepStrictEqual(JSON.parse(pat.stdout), { updated: ['Last session', 'Last Date'], failed: [] });
+    // The state writer stores LF, as on next; the values are what this row pins.
+    assert.match(session(), /\*\*Resume file:\*\* new\.md\r?\nLast session: s\r?\nLast Date: d\r?\n/);
+  });
+
+  test('(review 5593733001) a same-value `state patch` of a session field reports it updated and changes no byte', () => {
+    seed([], ['Last session: 2026-01-01', 'Stopped at: real', 'Resume file: plan.md'], '## Session');
+    // A first write normalizes the frontmatter, so the measured call changes no byte (#4488).
+    assert.strictEqual(runTool('state', 'patch', '--Resume File', 'first.md').exitCode, 0);
+    const before = readState();
+    const rec = runTool('state', 'patch', '--Resume File', 'first.md');
+    assert.strictEqual(rec.exitCode, 0, rec.stderr);
+    assert.deepStrictEqual(JSON.parse(rec.stdout), { updated: ['Resume File'], failed: [] });
+    assert.strictEqual(readState(), before);
+  });
+
+  test('(review 5593733001) a `state patch` that changes one field reports a same-value session field beside it updated too', () => {
+    seed([], ['Last session: 2026-01-01', 'Stopped at: real', 'Resume file: plan.md'], '## Session');
+    const rec = runTool('state', 'patch', '--Last session', '2026-02-02', '--Resume File', 'plan.md');
+    assert.strictEqual(rec.exitCode, 0, rec.stderr);
+    assert.deepStrictEqual(JSON.parse(rec.stdout), { updated: ['Last session', 'Resume File'], failed: [] });
+    assert.match(session(), /\nLast session: 2026-02-02\nStopped at: real\nResume file: plan\.md\n/);
+  });
+
+  // Nit 4: the writer and the session-section reader (`state-snapshot`) agree
+  // on every layout — the write lands exactly where the snapshot reads, and with
+  // no session section neither side takes a line from elsewhere.
+  for (const [layout, heading] of [['## Session', '## Session'], ['## Session Continuity', '## Session Continuity'], ['no session section', '## Notes']]) {
+    test(`(review 5593733001) writer/reader parity for Resume File: ${layout}`, () => {
+      seed([], ['Resume file: old.md'], heading);
+      const rec = runTool('state', 'update', 'Resume File', 'new.md');
+      const landed = JSON.parse(rec.stdout).updated;
+      const snap = JSON.parse(runTool('state-snapshot').stdout);
+      assert.strictEqual(landed, heading !== '## Notes', rec.stdout);
+      assert.strictEqual(snap.session.resume_file, landed ? 'new.md' : null, JSON.stringify(snap.session));
+    });
+  }
+
   test('(Codex r2) no session heading: `**Label**:` values are carried, a skipped wrapped one included', () => {
     fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
       '**Last session**: started', 'continued here', '**Resume file**: plan.md', ''].join('\n'));

@@ -725,7 +725,20 @@ function cmdStatePatch(cwd: string, patches: Record<string, string>, raw: boolea
     // `applyStatePreservation` restored that this patch never named at all
     // (#3345's direction), a case the pre-#3471 version of this command never
     // covered.
-    const updated = reconcileReportedFields(statePath, preWriteState, precomputed.updated, divergedFields, NO_SECTION_TARGETS, true);
+    const reconciled = reconcileReportedFields(statePath, preWriteState, precomputed.updated, divergedFields, NO_SECTION_TARGETS, true);
+    // #4488, as in cmdStateUpdate: a field patchCore matched that already held
+    // the requested value changes no byte, so the reconcile above (which asks
+    // "what changed") drops it — alone (no snapshot at all) or beside a field
+    // that did change. It is updated when the persisted value is the requested
+    // one; a value the write pipeline discarded still differs and stays failed
+    // (trek-e review 5593733001, Minor 3).
+    const persisted = platformReadSync(statePath) || '';
+    const persistedFm = extractFrontmatter(persisted, statePath) as Record<string, unknown>;
+    const persistedBody = stripFrontmatter(persisted);
+    const alreadyHeld = precomputed.updated.filter((field) => !reconciled.includes(field)
+      && !STATE_UPDATED_PROVENANCE_EXCLUSION.includes(field)
+      && readStateTarget(persistedFm, persistedBody, field, NO_SECTION_TARGETS, true)?.trim() === String(patches[field]).trim());
+    const updated = [...reconciled, ...alreadyHeld];
     const updatedSet = new Set(updated);
     const failed = Object.keys(patches).filter((field) => !updatedSet.has(field));
     const results = { updated, failed };
