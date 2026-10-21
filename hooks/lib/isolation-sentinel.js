@@ -295,7 +295,9 @@ const CONFIG_FILE_MAX_BYTES = 1024 * 1024;
  * checked through its own descriptor, so a FIFO cannot hang the guard. A
  * regular file over CONFIG_FILE_MAX_BYTES is not parsed here and counts as a
  * declaration: the resolver reads it whole and could honor a claim in it, and
- * a guard that cannot tell must not answer "independent" (#3050).
+ * a guard that cannot tell must not answer "independent" (#3050). The cap is
+ * applied to the bytes read, not the size fstat reported, so a file that grows
+ * after the fstat is still read at most one byte past it.
  */
 function configMayDeclareNestedRepositories(file) {
   let fd;
@@ -308,8 +310,12 @@ function configMayDeclareNestedRepositories(file) {
     const st = fs.fstatSync(fd);
     // Stryker disable next-line ConditionalExpression: any non-regular file also fails the read below; this check stops that read from blocking or never ending (a FIFO, /dev/zero), which the FIFO row covers in a child process
     if (!st.isFile()) return false;
-    if (st.size > CONFIG_FILE_MAX_BYTES) return true;
-    const config = JSON.parse(fs.readFileSync(fd, 'utf8'));
+    const buf = Buffer.alloc(CONFIG_FILE_MAX_BYTES + 1);
+    let length = 0;
+    // A full buffer asks for 0 bytes, which reads 0 and ends the loop.
+    for (let n; (n = fs.readSync(fd, buf, length, buf.length - length, null)) > 0;) length += n;
+    if (length > CONFIG_FILE_MAX_BYTES) return true;
+    const config = JSON.parse(buf.toString('utf8', 0, length));
     // A `null` config throws here and declares nothing, as for findProjectRoot.
     const subRepos = config.sub_repos ?? config.planning?.sub_repos;
     return config.multiRepo === true || (Array.isArray(subRepos) && subRepos.length > 0);
@@ -328,17 +334,19 @@ function configMayDeclareNestedRepositories(file) {
  * cannot be, and the boundary is decided here without a build. The walk stops
  * where findProjectRoot's does: before stepping up into `$HOME`, so a start
  * below `$HOME` never reads a claim there or above, and a start at `$HOME`
- * itself still climbs. Pure fs.
+ * itself still climbs. `$HOME` is matched in both spellings, as the starts
+ * are: a symlinked HOME's canonical walk never meets its lexical path. Pure fs.
  */
 function declaresNestedRepositories(cwd) {
-  const home = os.homedir();
+  const homes = new Set([os.homedir()]);
+  try { homes.add(fs.realpathSync.native(os.homedir())); } catch { /* lexical only */ }
   const starts = [path.resolve(cwd)];
   try { starts.push(fs.realpathSync.native(cwd)); } catch { /* lexical only */ }
   for (const start of starts) {
     for (let dir = start; ; dir = path.dirname(dir)) {
       if (configMayDeclareNestedRepositories(path.join(dir, '.planning', 'config.json'))) return true;
       const parent = path.dirname(dir);
-      if (parent === dir || parent === home) break;
+      if (parent === dir || homes.has(parent)) break;
     }
   }
   return false;

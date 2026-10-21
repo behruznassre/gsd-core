@@ -432,6 +432,50 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
       assert.equal(calls.build, build);
     });
   }
+
+  // trek-e review 5593724092 (Minor 1): with HOME a symlink, the canonical walk
+  // never met the lexical $HOME and read the home config. Both cwd spellings.
+  for (const spelling of ['through the symlink', 'canonical']) {
+    test(`a declaring config at a symlinked $HOME, cwd ${spelling} -> not read; nothing built`, { skip: process.platform === 'win32' }, (t) => {
+      const top = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-guard-home-link-')));
+      t.after(() => cleanup(top));
+      const ws = path.join(top, 'real-home');
+      fs.mkdirSync(path.join(ws, '.planning'), { recursive: true });
+      fs.writeFileSync(path.join(ws, '.planning', 'config.json'), '{"sub_repos":["inner"]}');
+      const link = path.join(top, 'home-link');
+      fs.symlinkSync(ws, link);
+      const inner = path.join(ws, 'inner');
+      fs.mkdirSync(path.join(inner, '.planning'), { recursive: true });
+      fs.writeFileSync(path.join(inner, '.planning', 'config.json'), '{}');
+      const child = path.join(inner, 'vendor', 'child');
+      fs.mkdirSync(child, { recursive: true });
+      require('node:child_process').execFileSync('git', ['init', '-q'], { cwd: child, timeout: require('./helpers/timeouts.cjs').GIT_FIXTURE_TIMEOUT_MS });
+      const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+      t.after(() => {
+        for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+      });
+      process.env.HOME = link;
+      process.env.USERPROFILE = link;
+      assert.equal(os.homedir(), link);
+      const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+      const cwd = spelling === 'canonical' ? child : path.join(link, 'inner', 'vendor', 'child');
+      assert.deepEqual(resolveGuardProject(cwd), { project: false });
+      assert.equal(calls.build, 0);
+    });
+  }
+
+  // trek-e review 5593724092 (Nit 2): the cap bounds the bytes read, not the
+  // size fstat saw — here fstat reports a small file that is past the cap by the
+  // time it is read, as one that grew in between.
+  test('a config that grows past the cap after its fstat -> the resolver decides', (t) => {
+    const raw = sizedConfig(CAP + 1);
+    const { child } = nestedRepo(t, raw);
+    const fstatSync = fs.fstatSync;
+    t.mock.method(fs, 'fstatSync', (fd) => Object.assign(fstatSync(fd), { size: 2 }));
+    const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
+    assert.deepEqual(resolveGuardProject(child), { project: false });
+    assert.equal(calls.build, 1);
+  });
 });
 
 // #4885 review (M4): the hook decides "which project, if any" BEFORE any build,
