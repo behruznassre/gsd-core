@@ -3034,7 +3034,9 @@ function findUnregisteredResidue(
     try {
       retryRenameSync(target, doomed);
     } catch {
-      if (!gone(target)) results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
+      // Only a candidate missing from a still-real `.claude/worktrees` was taken by
+      // another sweep; a moved parent took it nowhere this sweep can vouch for.
+      if (!(gone(target) && chainIsReal())) results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
       continue;
     }
     let landed = false;

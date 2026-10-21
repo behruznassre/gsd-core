@@ -1695,6 +1695,28 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     });
   }
 
+  // Codex review of this round: a candidate missing because `.claude/worktrees`
+  // itself moved was not taken by another sweep, so the failure is reported.
+  test('a failed rename to the reserved name after .claude/worktrees moved -> residue_remove_failed', () => {
+    const { repoDir, residue } = repoWithResidue('rename-race-parent');
+    const residueDir = path.dirname(residue);
+    const moved = path.join(tmpBase, 'rename-race-parent-moved');
+    const realRename = fs.renameSync;
+    let raced = false;
+    const results = withFaultyFs({
+      renameSync: (from, to) => {
+        if (!raced && path.basename(String(to)).startsWith('.gsd-reap-')) {
+          raced = true;
+          realRename(residueDir, moved);
+        }
+        return realRename(from, to);
+      },
+    }, () => reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.ok(raced, 'the move ran');
+    assert.deepStrictEqual(rows(results), [[canonicalPath(residue), 'skipped', 'residue_remove_failed']]);
+    assert.ok(fs.existsSync(path.join(moved, path.basename(residue))), 'the residue moved with its parent');
+  });
+
   // trek-e review 5593733152 (Nit 4): the reserved name is exactly
   // `.gsd-reap-` and 16 lower-case hex digits; one digit more or fewer, or any
   // other character, is not this sweep's and is held to the harness-name rule.
