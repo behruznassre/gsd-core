@@ -2283,7 +2283,12 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // an unclosed block only as its LAST record (the fence runs to EOF), so
         // `closeLineIdx === -1` here means exactly "the tail is inside a fence".
         if (markdownFencedBlocks(content.split('\n'), { document: true }).some((b) => b.closeLineIdx === -1)) {
-          for (const [label] of scaffoldFields) skippedFields.push({ field: label, reason: 'unclosed_fence' });
+          // A field already replaced in place above was written: it is not
+          // skipped too (Codex review).
+          const written = new Set(updated.map((f) => (f === 'Last Date' ? 'last session' : f.toLowerCase())));
+          for (const [label] of scaffoldFields) {
+            if (!written.has(label.toLowerCase())) skippedFields.push({ field: label, reason: 'unclosed_fence' });
+          }
         } else {
           const scaffold = ['', '## Session', '', ...scaffoldLines, ''].join('\n');
           content = content.trimEnd() + '\n' + scaffold;

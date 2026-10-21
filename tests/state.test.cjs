@@ -22849,6 +22849,16 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.strictEqual(readState(), before);
   });
 
+  test('(Codex, review round 5593733001) a field written in place before an unclosed fence is updated, not also skipped', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
+      'Stopped at: old', '', 'Some notes', '', '```md', 'example', ''].join('\n'));
+    const { json, stderr } = recordSession('--stopped-at', 'new');
+    assert.ok(json.updated.includes('Stopped At'), JSON.stringify(json));
+    assert.deepStrictEqual(json.skipped, [{ field: 'Last session', reason: 'unclosed_fence' }, { field: 'Resume file', reason: 'unclosed_fence' }]);
+    assert.doesNotMatch(stderr, /did not write Stopped at/);
+    assert.match(readState(), /\nStopped at: new\n/);
+  });
+
   // Review 2026-10-14 Minor 3: the guard scans the whole document, but refuses
   // only when the TAIL is fenced — closed fences earlier on do not block.
   test('no session heading and only closed fences: the session section is appended after them', () => {
