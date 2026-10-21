@@ -334,19 +334,22 @@ function configMayDeclareNestedRepositories(file) {
  * cannot be, and the boundary is decided here without a build. The walk stops
  * where findProjectRoot's does: before stepping up into `$HOME`, so a start
  * below `$HOME` never reads a claim there or above, and a start at `$HOME`
- * itself still climbs. `$HOME` is matched in both spellings, as the starts
- * are: a symlinked HOME's canonical walk never meets its lexical path. Pure fs.
+ * itself still climbs. Like findProjectRoot, it compares each parent with
+ * `$HOME` as spelled, never its realpath: findProjectRoot given the canonical
+ * path under a symlinked HOME never meets that spelling and does read the
+ * configs above it, so a walk that stopped there would answer "independent"
+ * for a repository gsd-tools treats as claimed (trek-e review 5593724092,
+ * Minor 1; the parity rows pin it). Pure fs.
  */
 function declaresNestedRepositories(cwd) {
-  const homes = new Set([os.homedir()]);
-  try { homes.add(fs.realpathSync.native(os.homedir())); } catch { /* lexical only */ }
+  const home = os.homedir();
   const starts = [path.resolve(cwd)];
   try { starts.push(fs.realpathSync.native(cwd)); } catch { /* lexical only */ }
   for (const start of starts) {
     for (let dir = start; ; dir = path.dirname(dir)) {
       if (configMayDeclareNestedRepositories(path.join(dir, '.planning', 'config.json'))) return true;
       const parent = path.dirname(dir);
-      if (parent === dir || homes.has(parent)) break;
+      if (parent === dir || parent === home) break;
     }
   }
   return false;

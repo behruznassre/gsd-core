@@ -433,37 +433,6 @@ describe('hooks/lib/isolation-sentinel.js: resolveGuardProject (#4885 review)', 
     });
   }
 
-  // trek-e review 5593724092 (Minor 1): with HOME a symlink, the canonical walk
-  // never met the lexical $HOME and read the home config. Both cwd spellings.
-  for (const spelling of ['through the symlink', 'canonical']) {
-    test(`a declaring config at a symlinked $HOME, cwd ${spelling} -> not read; nothing built`, { skip: process.platform === 'win32' }, (t) => {
-      const top = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-guard-home-link-')));
-      t.after(() => cleanup(top));
-      const ws = path.join(top, 'real-home');
-      fs.mkdirSync(path.join(ws, '.planning'), { recursive: true });
-      fs.writeFileSync(path.join(ws, '.planning', 'config.json'), '{"sub_repos":["inner"]}');
-      const link = path.join(top, 'home-link');
-      fs.symlinkSync(ws, link);
-      const inner = path.join(ws, 'inner');
-      fs.mkdirSync(path.join(inner, '.planning'), { recursive: true });
-      fs.writeFileSync(path.join(inner, '.planning', 'config.json'), '{}');
-      const child = path.join(inner, 'vendor', 'child');
-      fs.mkdirSync(child, { recursive: true });
-      require('node:child_process').execFileSync('git', ['init', '-q'], { cwd: child, timeout: require('./helpers/timeouts.cjs').GIT_FIXTURE_TIMEOUT_MS });
-      const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
-      t.after(() => {
-        for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
-      });
-      process.env.HOME = link;
-      process.env.USERPROFILE = link;
-      assert.equal(os.homedir(), link);
-      const { calls, resolveGuardProject } = withFakes(t, { resolvePlanningWorktreeRoot: identity, findProjectRoot: (d) => d });
-      const cwd = spelling === 'canonical' ? child : path.join(link, 'inner', 'vendor', 'child');
-      assert.deepEqual(resolveGuardProject(cwd), { project: false });
-      assert.equal(calls.build, 0);
-    });
-  }
-
   // trek-e review 5593724092 (Nit 2): the cap bounds the bytes read, not the
   // size fstat saw — here fstat reports a small file that is past the cap by the
   // time it is read, as one that grew in between.
@@ -589,6 +558,38 @@ describe('#4885 parity: resolveGuardProject agrees with findProjectRoot (review 
     assert.equal(real(verdict.root), real(project));
     assert.equal(real(verdict.sentinelRoot), real(project));
   });
+
+  // trek-e review 5593724092 (Minor 1): with HOME a symlink, findProjectRoot
+  // compares ancestors with HOME as spelled, so from the canonical path it
+  // climbs into the real home directory and honors the claim there; through
+  // the link it stops. The hook agrees for both spellings — a walk that also
+  // stopped at realpath(HOME) answered "not a project" for the canonical one.
+  for (const spelling of ['canonical', 'through the HOME symlink']) {
+    test(`a workspace that IS a symlinked $HOME, claiming a nested repository: the same answer, cwd ${spelling}`, { skip: process.platform === 'win32' }, (t) => {
+      const top = real(fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-guard-parity-home-')));
+      t.after(() => cleanup(top));
+      const realHome = path.join(top, 'real-home');
+      fs.mkdirSync(path.join(realHome, '.planning'), { recursive: true });
+      fs.writeFileSync(path.join(realHome, '.planning', 'config.json'), JSON.stringify({ sub_repos: ['vendor'] }));
+      gitInit(realHome);
+      const nested = path.join(realHome, 'vendor', 'child');
+      fs.mkdirSync(path.join(nested, 'src'), { recursive: true });
+      gitInit(nested);
+      const link = path.join(top, 'home-link');
+      fs.symlinkSync(realHome, link);
+      const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+      t.after(() => {
+        for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+      });
+      process.env.HOME = link;
+      process.env.USERPROFILE = link;
+      const canonical = spelling === 'canonical';
+      const cwd = canonical ? path.join(nested, 'src') : path.join(link, 'vendor', 'child', 'src');
+      const verdict = assertAgree(cwd);
+      // From the canonical path gsd-tools honors the claim, so the hook must check it.
+      if (canonical) assert.equal(real(verdict.root), realHome);
+    });
+  }
 
   test('a claimed nested repository reached through an alias from OUTSIDE the workspace is governed by the workspace\'s config', (t) => {
     const { project, nested } = world(t);
