@@ -17385,3 +17385,459 @@ describe('#4972: phase complete warns when an active verify:post audit is missin
     }
   });
 });
+
+// #5165: milestone-grouped roadmaps — scoped progress, phase.complete re-runs, write-scoped
+// Markdown normalization at the ROADMAP/STATE seam, and ship tracking.
+{
+  const TIMEOUT_MS = PHASE_COMPLETE_TIMEOUT_MS;
+
+  const ROADMAP_HEAD = `# Roadmap: Demo
+
+  ## Milestones
+
+  - ✅ **v1.0 MVP** - Phases 1-2 (shipped 2026-09-01)
+  - 🚧 **v1.1 Next** - Phases 3-5 (in progress)
+
+  ## Phases
+
+  <details>
+  <summary>✅ v1.0 MVP (Phases 1-2) - SHIPPED 2026-09-01</summary>
+
+  ### Phase 1: One
+  **Goal**: one
+  **Plans**: 1 plan
+
+  ### Phase 2: Two
+  **Goal**: two
+  **Plans**: 1 plan
+
+  </details>
+
+  ### 🚧 v1.1 Next (In Progress)
+
+  **Milestone Goal:** next
+  `;
+
+  // The fixture templates below are indented two spaces to sit inside this block.
+  const dedent = (text) => text.replace(/^ {2}/gm, '');
+
+  function roadmapText({ box3 = 'x', box4 = ' ' } = {}) {
+    return dedent(`${ROADMAP_HEAD}
+  - [${box3}] **Phase 3: Three** - three${box3 === 'x' ? ' (completed 2026-09-20)' : ''}
+  - [${box4}] **Phase 4: Four** - four${box4 === 'x' ? ' (completed 2026-09-25)' : ''}
+  - [ ] **Phase 04.1: Hotfix** - hotfix (INSERTED)
+  - [ ] **Phase 5: Five** - five
+
+  #### Phase 3: Three
+  **Goal**: three
+  **Plans**: 1/1 plans complete
+
+  #### Phase 4: Four
+  **Goal**: four
+  **Success Criteria**:
+    1. it works
+  **Plans**: 1 plan
+
+  #### Phase 04.1: Hotfix (INSERTED)
+  **Goal**: hotfix
+  **Plans**: TBD
+
+  #### Phase 5: Five
+  **Goal**: five
+  **Plans**: TBD
+
+  ## Progress
+
+  | Phase | Milestone | Plans Complete | Status | Completed |
+  |-------|-----------|----------------|--------|-----------|
+  | 1. One | v1.0 | 1/1 | Complete | 2026-08-20 |
+  | 2. Two | v1.0 | 1/1 | Complete | 2026-09-01 |
+  | 3. Three | v1.1 | 1/1 | ${box3 === 'x' ? 'Complete   ' : 'In progress'} | ${box3 === 'x' ? '2026-09-20' : '-'} |
+  | 4. Four | v1.1 | 0/1 | In progress | - |
+  | 04.1. Hotfix | v1.1 | 0/0 | Not started | - |
+  | 5. Five | v1.1 | 0/0 | Not started | - |
+  `);
+  }
+
+  function stateText({ currentPhase = '4', name = 'Four' } = {}) {
+    return dedent(`---
+  gsd_state_version: '1.0'
+  milestone: v1.1
+  milestone_name: Next
+  status: executing
+  progress:
+    total_phases: 4
+    completed_phases: 1
+    total_plans: 2
+    completed_plans: 2
+    percent: 25
+  ---
+
+  # Project State
+
+  ## Current Position
+
+  Phase: ${currentPhase} of 4 (${name})
+  Plan: 1 of 1 in current phase
+  Status: In progress
+  Last activity: 2026-10-01 — Plan 04-01 complete
+
+  Progress: [██░░░░░░░░] 25%
+
+  ## Session Continuity
+
+  Last session: 2026-10-01T00:00:00.000Z
+  Stopped at: Plan 04-01 complete
+  Resume file: None
+  `);
+  }
+
+  function gsd(cwd, ...args) {
+    const r = runNode([GSD_TOOLS_BIN, 'query', ...args], {
+      cwd,
+      env: { ...process.env, HOME: cwd },
+      timeoutMs: TIMEOUT_MS,
+    });
+    assert.equal(r.exitCode, 0, `gsd ${args.join(' ')} failed: ${r.stderr}`);
+    return r.stdout;
+  }
+
+  function git(cwd, ...args) {
+    gitOrThrow(args, { cwd });
+  }
+
+  /** A project whose phases 1-2 are shipped (dirs still on disk) and 3-4 verified. */
+  function makeProject({ roadmap = roadmapText(), state = stateText() } = {}) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-5165-'));
+    const phases = path.join(dir, '.planning', 'phases');
+    const dirs = [['01-one', '01'], ['02-two', '02'], ['03-three', '03'], ['04-four', '04']];
+    for (const [d, n] of dirs) {
+      fs.mkdirSync(path.join(phases, d), { recursive: true });
+      const fm = `---\nphase: ${n}\nplan: 01\n---\n# x\n`;
+      fs.writeFileSync(path.join(phases, d, `${n}-01-PLAN.md`), fm);
+      fs.writeFileSync(path.join(phases, d, `${n}-01-SUMMARY.md`), fm);
+      fs.writeFileSync(path.join(phases, d, `${n}-VERIFICATION.md`), `---\nphase: ${n}\nstatus: passed\n---\n# Verification\n`);
+    }
+    fs.mkdirSync(path.join(phases, '04.1-hotfix'), { recursive: true });
+    fs.writeFileSync(path.join(phases, '04.1-hotfix', '04.1-CONTEXT.md'), '# context\n');
+    fs.writeFileSync(path.join(dir, '.planning', 'ROADMAP.md'), roadmap);
+    fs.writeFileSync(path.join(dir, '.planning', 'STATE.md'), state);
+    git(dir, 'init', '-q');
+    git(dir, 'config', 'user.email', 'test@example.com');
+    git(dir, 'config', 'user.name', 'Test');
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'base');
+    // Prime STATE once with a write that changes no value, so later diffs leave
+    // out gsd-core's own one-time re-derivation.
+    gsd(dir, 'state.record-session', '--stopped-at', 'Plan 04-01 complete', '--resume-file', 'None');
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'primed');
+    return dir;
+  }
+
+  const read = (dir, file) => fs.readFileSync(path.join(dir, '.planning', file), 'utf8');
+  const field = (text, re) => (text.match(re) || [])[1];
+  const percentOf = (state) => Number(field(state, /^ {2}percent: (\d+)/m));
+  const completedOf = (state) => Number(field(state, /^ {2}completed_phases: (\d+)/m));
+  const barOf = (state) => field(state, /^Progress: (.*)$/m);
+
+  /** STATE.md with provenance-only lines removed, for no-op comparisons. */
+  const withoutTimestamps = (s) => s
+    .replace(/^last_updated:.*$/m, '')
+    .replace(/^state_head:.*$/m, '')
+    .replace(/^Last session:.*$/m, '');
+
+
+
+  describe('#5165 phase.complete on a milestone-grouped roadmap', () => {
+    test('R1: completed_phases, percent and the body bar count the current milestone and survive a resyncing write', () => {
+      const dir = makeProject();
+      try {
+        gsd(dir, 'phase.complete', '4');
+        const afterComplete = read(dir, 'STATE.md');
+        assert.equal(completedOf(afterComplete), 2, 'Phases 3 and 4 of v1.1, not the v1.0 rows');
+        assert.equal(percentOf(afterComplete), 50);
+        assert.equal(barOf(afterComplete), '[█████░░░░░] 50%');
+
+        gsd(dir, 'state.record-session', '--stopped-at', 'X', '--resume-file', 'Y');
+        const afterSession = read(dir, 'STATE.md');
+        assert.equal(completedOf(afterSession), 2);
+        assert.equal(percentOf(afterSession), 50, 'record-session must not move what phase.complete wrote');
+        assert.equal(barOf(afterSession), '[█████░░░░░] 50%');
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    test('R1 control: state.record-session alone counts only the current milestone', () => {
+      const dir = makeProject({ roadmap: roadmapText({ box3: ' ' }) });
+      try {
+        gsd(dir, 'state.record-session', '--stopped-at', 'a', '--resume-file', 'b');
+        const state = read(dir, 'STATE.md');
+        assert.ok(completedOf(state) <= 2, `v1.0 rows must not floor the counter (got ${completedOf(state)})`);
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    test('R2: re-completing an already-complete phase while STATE is past it changes no STATE field and does not re-pad the cell', () => {
+      const dir = makeProject();
+      try {
+        const stateBefore = read(dir, 'STATE.md');
+        const roadmapBefore = read(dir, 'ROADMAP.md');
+        gsd(dir, 'phase.complete', '3');
+        assert.equal(withoutTimestamps(read(dir, 'STATE.md')), withoutTimestamps(stateBefore));
+        assert.equal(read(dir, 'ROADMAP.md'), roadmapBefore, 'the Complete cell and every other region stay byte-identical');
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    test('R2e: a phase complete only in the Progress table (box unchecked) is no-op for STATE when STATE is past it', () => {
+      const roadmap = roadmapText({ box3: ' ' })
+        .replace('| 3. Three | v1.1 | 1/1 | In progress | - |', '| 3. Three | v1.1 | 1/1 | Complete | 2026-09-20 |');
+      assert.match(roadmap, /\| 3\. Three \| v1\.1 \| 1\/1 \| Complete \|/, 'fixture: row reads Complete');
+      assert.match(roadmap, /^- \[ \] \*\*Phase 3: Three\*\*/m, 'fixture: box unchecked');
+      const dir = makeProject({ roadmap });
+      try {
+        const stateBefore = read(dir, 'STATE.md');
+        gsd(dir, 'phase.complete', '3');
+        assert.equal(withoutTimestamps(read(dir, 'STATE.md')), withoutTimestamps(stateBefore));
+        assert.doesNotMatch(read(dir, 'STATE.md'), /^Stopped at: Phase 3 complete/m);
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    test('R1b: with no milestone in STATE frontmatter the body bar and frontmatter progress still count the ROADMAP milestone', () => {
+      const state = stateText().replace(/^ *milestone: v1\.1\n/m, '');
+      assert.doesNotMatch(state, /^ *milestone: /m, 'fixture: no milestone key');
+      const dir = makeProject({ state });
+      try {
+        gsd(dir, 'phase.complete', '4');
+        const state = read(dir, 'STATE.md');
+        assert.equal(percentOf(state), 50);
+        assert.equal(barOf(state), '[█████░░░░░] 50%', 'body counter and frontmatter percent agree');
+        // parity: a later resyncing write resolves the milestone the same way
+        gsd(dir, 'state.record-session', '--stopped-at', 'X', '--resume-file', 'Y');
+        const resynced = read(dir, 'STATE.md');
+        assert.equal(percentOf(resynced), 50);
+        assert.equal(completedOf(resynced), completedOf(state));
+        assert.equal(barOf(resynced), barOf(state));
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    test('R2: a second consecutive phase.complete is a no-op for STATE and ROADMAP', () => {
+      const dir = makeProject();
+      try {
+        gsd(dir, 'phase.complete', '4');
+        const state = read(dir, 'STATE.md');
+        const roadmap = read(dir, 'ROADMAP.md');
+        gsd(dir, 'phase.complete', '4');
+        assert.equal(withoutTimestamps(read(dir, 'STATE.md')), withoutTimestamps(state));
+        assert.equal(read(dir, 'ROADMAP.md'), roadmap);
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    test('R2b: completing the current phase still transitions position, plan and stopped-at', () => {
+      const dir = makeProject();
+      try {
+        gsd(dir, 'phase.complete', '4');
+        const state = read(dir, 'STATE.md');
+        assert.match(state, /^current_phase: "?04\.1"?$/m, 'advances to the next phase');
+        assert.match(state, /^Stopped at: Phase 4 complete/m);
+        assert.match(state, /^Status: Ready to plan/m);
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    test('R2c: a hand-flipped [x] box with STATE still AT the phase still transitions', () => {
+      const roadmap = roadmapText({ box4: 'x' });
+      const dir = makeProject({ roadmap });
+      try {
+        gsd(dir, 'phase.complete', '4');
+        assert.match(read(dir, 'STATE.md'), /^Stopped at: Phase 4 complete/m);
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    test('R2d: an unchecked phase STATE has moved past (out-of-order completion) still transitions', () => {
+      const dir = makeProject({ roadmap: roadmapText({ box3: ' ' }) });
+      try {
+        gsd(dir, 'phase.complete', '3');
+        assert.match(read(dir, 'ROADMAP.md'), /^- \[x\] \*\*Phase 3: Three\*\*/m, 'the box is checked');
+        assert.match(read(dir, 'STATE.md'), /^Stopped at: Phase 3 complete/m, 'a first-time completion writes its transition');
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    test('R3: the ROADMAP phase.complete writes differs from its input only at the checkbox, the Plans line and the progress row', () => {
+      const dir = makeProject();
+      try {
+        const before = read(dir, 'ROADMAP.md').split('\n');
+        gsd(dir, 'phase.complete', '4');
+        const after = read(dir, 'ROADMAP.md').split('\n');
+        assert.equal(after.length, before.length, 'no blank line is added anywhere');
+        const changed = after.map((line, i) => (line === before[i] ? null : line)).filter((l) => l !== null);
+        assert.equal(changed.length, 3, `changed lines: ${JSON.stringify(changed)}`);
+        assert.match(changed[0], /^- \[x\] \*\*Phase 4: Four\*\*/);
+        assert.match(changed[1], /^\*\*Plans\*\*: 1\/1 plans complete/);
+        assert.match(changed[2], /^\| 4\. Four \| v1\.1 \| 1\/1 \| Complete/);
+      } finally {
+        cleanup(dir);
+      }
+    });
+  });
+
+
+
+  describe('#5165 ship tracking', () => {
+    test('the activity line keeps its description and frontmatter status stays put', () => {
+      const dir = makeProject();
+      try {
+        gsd(dir, 'phase.complete', '4');
+        const statusBefore = field(read(dir, 'STATE.md'), /^status: (.*)$/m);
+        gsd(dir, 'state.update', 'Last Activity', '2026-10-02 -- Phase 4 shipped as PR #7');
+        const state = read(dir, 'STATE.md');
+        assert.match(state, /^last_activity_desc: .*Phase 4 shipped as PR #7/m);
+        assert.match(state, /^Last activity: .*Phase 4 shipped as PR #7/m);
+        assert.equal(field(state, /^status: (.*)$/m), statusBefore, 'status is not written by the ship step');
+        assert.equal(JSON.parse(gsd(dir, 'state.validate')).valid, true);
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    test('normalizeStateStatus still passes unrecognised prose through verbatim (unchanged by design)', () => {
+      const dir = makeProject();
+      try {
+        gsd(dir, 'state.update', 'Status', 'Phase 4 shipped — PR #7');
+        assert.equal(field(read(dir, 'STATE.md'), /^status: (.*)$/m), '"Phase 4 shipped — PR #7"');
+      } finally {
+        cleanup(dir);
+      }
+    });
+  });
+
+}
+
+// #5543: with no resolvable active milestone, `phase complete` must not write
+// into a shipped (archived) <details> block.
+describe('#5543 phase complete confines the unresolved-milestone fallback to the active region', () => {
+  const SHIPPED = `<details>
+<summary>v1.0 (shipped)</summary>
+
+### Phase 1: Old
+
+**Goal:** old
+**Plans:** 1/1
+Plans:
+- [ ] 01-01-PLAN.md
+
+</details>
+`;
+  const ACTIVE = `
+## v2.0 Active
+
+- [ ] **Phase 1: New**
+
+### Phase 1: New
+
+**Goal:** new
+**Plans:** 0/1
+Plans:
+- [ ] 01-01-PLAN.md
+`;
+  let dir;
+  const seed = (roadmap, state) => {
+    fs.mkdirSync(path.join(dir, '.planning', 'phases', '01-new'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.planning', 'config.json'), '{}');
+    fs.writeFileSync(path.join(dir, '.planning', 'STATE.md'), state);
+    fs.writeFileSync(path.join(dir, '.planning', 'phases', '01-new', '01-01-PLAN.md'),
+      '---\nphase: new\nplan: 01-01\nwave: 1\n---\n# Plan\n');
+    fs.writeFileSync(path.join(dir, '.planning', 'phases', '01-new', '01-01-SUMMARY.md'),
+      '---\nphase: new\nplan: 01-01\n---\n# Summary\n');
+    fs.writeFileSync(path.join(dir, '.planning', 'phases', '01-new', '01-VERIFICATION.md'),
+      '---\nstatus: passed\n---\n# Verification\n');
+    fs.writeFileSync(path.join(dir, '.planning', 'ROADMAP.md'), `# Roadmap\n\n${roadmap}`);
+  };
+  const roadmapText = () => fs.readFileSync(path.join(dir, '.planning', 'ROADMAP.md'), 'utf8');
+  const complete = () => {
+    const r = runGsdTools('phase complete 1', dir);
+    assert.ok(r.success, `phase complete failed: ${r.error}`);
+  };
+
+  beforeEach(() => { dir = createTempProject(); });
+  afterEach(() => { cleanup(dir); });
+
+  test('ticks the active phase and leaves the shipped <details> block byte-identical', () => {
+    seed(SHIPPED + ACTIVE, '# State\n');
+    complete();
+    const out = roadmapText();
+    assert.ok(out.includes(SHIPPED), `shipped block was modified:\n${out}`);
+    const active = out.slice(out.lastIndexOf('</details>'));
+    assert.match(active, /- \[x\] 01-01-PLAN\.md/);
+    assert.match(active, /- \[x\] \*\*Phase 1: New\*\*/);
+  });
+
+  test('with two shipped blocks only the region after the last one is written', () => {
+    const second = SHIPPED.replace('v1.0', 'v1.5').replace('Phase 1: Old', 'Phase 1: Older');
+    seed(SHIPPED + '\n' + second + ACTIVE, '# State\n');
+    complete();
+    const out = roadmapText();
+    assert.ok(out.includes(SHIPPED) && out.includes(second), `a shipped block was modified:\n${out}`);
+    assert.match(out.slice(out.lastIndexOf('</details>')), /- \[x\] 01-01-PLAN\.md/);
+  });
+
+  test('a sole-milestone ROADMAP without a milestone key still completes its phase', () => {
+    seed(ACTIVE.trimStart(), '# State\n');
+    complete();
+    const out = roadmapText();
+    assert.match(out, /- \[x\] 01-01-PLAN\.md/);
+    assert.match(out, /- \[x\] \*\*Phase 1: New\*\*/);
+  });
+
+  test('a resolvable milestone in STATE.md still scopes to it', () => {
+    seed(SHIPPED + ACTIVE, '---\nmilestone: v2.0\n---\n# State\n');
+    complete();
+    const out = roadmapText();
+    assert.ok(out.includes(SHIPPED), `shipped block was modified:\n${out}`);
+    assert.match(out.slice(out.lastIndexOf('</details>')), /- \[x\] 01-01-PLAN\.md/);
+  });
+
+  test('an active phase listed BEFORE a trailing shipped block is completed and the block is untouched', () => {
+    seed(ACTIVE.trimStart() + '\n' + SHIPPED, '# State\n');
+    complete();
+    const out = roadmapText();
+    assert.ok(out.endsWith(SHIPPED), `shipped block was modified:\n${out}`);
+    const active = out.slice(0, out.indexOf('<details>'));
+    assert.match(active, /- \[x\] 01-01-PLAN\.md/);
+    assert.match(active, /- \[x\] \*\*Phase 1: New\*\*/);
+  });
+
+  test('a </details> inside a code fence before the active phase does not hide the active phase', () => {
+    const fenced = '```html\n</details>\n```\n';
+    seed(fenced + ACTIVE, '# State\n');
+    complete();
+    const out = roadmapText();
+    assert.ok(out.startsWith(`# Roadmap\n\n${fenced}`), out);
+    assert.match(out, /- \[x\] 01-01-PLAN\.md/);
+    assert.match(out, /- \[x\] \*\*Phase 1: New\*\*/);
+  });
+
+  test('a </details> in prose after the active phase does not hide the active phase', () => {
+    seed(ACTIVE.trimStart() + '\nNote: shipped blocks end with `</details>`.\n', '# State\n');
+    complete();
+    const out = roadmapText();
+    assert.match(out, /- \[x\] 01-01-PLAN\.md/);
+    assert.match(out, /- \[x\] \*\*Phase 1: New\*\*/);
+    assert.ok(out.includes('Note: shipped blocks end with `</details>`.'), out);
+  });
+});
