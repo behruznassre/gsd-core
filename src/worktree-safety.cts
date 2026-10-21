@@ -2886,6 +2886,17 @@ function findUnregisteredResidue(
     }
   };
   const chainIsReal = (): boolean => realDirectory(claudeDir) === true && realDirectory(residueDir) === true;
+  // A candidate gone when this sweep renames it was taken by a concurrent
+  // sweep, which reports it itself: this sweep has no failure to report
+  // (#4941 review).
+  const gone = (p: string): boolean => {
+    try {
+      fs.lstatSync(p);
+      return false;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'ENOENT';
+    }
+  };
 
   const listing = readDirSafe(residueDir);
   if (!listing) {
@@ -2969,7 +2980,9 @@ function findUnregisteredResidue(
     // A sweep's own rename to the reserved name keeps the directory's mtime but
     // sets its ctime, so a reserved name changed inside the guard window may be
     // another sweep's removal in flight: left alone, as a young residue is, and
-    // reclaimed by a later sweep once the window has passed (#4941 review).
+    // reclaimed by a later sweep once the window has passed (#4941 review). That
+    // a rename advances the ctime is pinned by a real-rename row in
+    // tests/worktree-safety-reap.test.cjs, run on the Linux, macOS and Windows lanes.
     if (stranded) {
       const ctime = ctimeSafe(p);
       if (!ctime) {
@@ -3021,7 +3034,7 @@ function findUnregisteredResidue(
     try {
       retryRenameSync(target, doomed);
     } catch {
-      results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
+      if (!gone(target)) results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
       continue;
     }
     let landed = false;

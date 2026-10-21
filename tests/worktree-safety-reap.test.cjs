@@ -1641,14 +1641,81 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(fs.existsSync(path.join(stranded, 'file.txt')));
   });
 
-  test('with the real ctime, a .gsd-reap-<16 hex> renamed just now is left alone even when its mtime is old', () => {
+  // trek-e review 5593733152 (Minor 1, Nit 2): the guard needs this platform's
+  // rename to advance the directory's ctime. Measured against the filesystem's
+  // own clock, not the wall clock: wait until a probe write is stamped a
+  // millisecond past the directory's ctime, rename, and require the ctime to
+  // have moved — then sweep at the instant the creation ctime would be exactly
+  // guardMs old (reclaimed, per the rows above) with the real ctime.
+  test('a rename advances the directory\'s real ctime, so a .gsd-reap-<16 hex> renamed just now is left alone', () => {
+    const guardMs = 60_000;
     const repoDir = path.join(tmpBase, 'repo-inflight-real');
     initRepo(repoDir);
     const residue = plainChild(repoDir, 'agent-inflight');
+    const createdMs = Math.floor(fs.statSync(residue).ctimeMs);
+    const probe = path.join(tmpBase, 'ctime-probe');
+    let stamped = createdMs;
+    for (let i = 0; i < 100_000 && stamped <= createdMs; i++) {
+      fs.writeFileSync(probe, String(i));
+      stamped = Math.floor(fs.statSync(probe).mtimeMs);
+    }
+    assert.ok(stamped > createdMs, 'the filesystem clock moved past the directory\'s ctime');
     const stranded = path.join(path.dirname(residue), '.gsd-reap-0123456789abcdef');
     fs.renameSync(residue, stranded);
-    assert.deepStrictEqual(reapOrphanWorktrees(repoDir, { isPidAlive: () => false, mtimeSafe: () => STALE_MTIME }), []);
+    assert.ok(Math.floor(fs.statSync(stranded).ctimeMs) > createdMs, `this platform's rename advanced the ctime (${process.platform})`);
+    const results = reapOrphanWorktrees(repoDir, { isPidAlive: () => false, mtimeSafe: () => STALE_MTIME, reapMtimeGuardMs: guardMs, nowMs: createdMs + guardMs });
+    assert.deepStrictEqual(results, []);
     assert.ok(fs.existsSync(path.join(stranded, 'file.txt')));
+  });
+
+  // trek-e review 5593733152 (Nit 3): a concurrent sweep that renames the
+  // candidate away just before this sweep's own rename leaves this sweep a
+  // failed rename of a path that moved — not a removal failure to report.
+  // A rename that fails with the candidate still in place is still reported.
+  for (const [label, takenAway] of [['a concurrent sweep took it', true], ['it is still in place', false]]) {
+    test(`a failed rename to the reserved name when ${label} -> ${takenAway ? 'no row' : 'residue_remove_failed'}`, () => {
+      const { repoDir, residue } = repoWithResidue(`rename-race-${takenAway}`);
+      const other = path.join(path.dirname(residue), '.gsd-reap-ffffffffffffffff');
+      const realRename = fs.renameSync;
+      let raced = false;
+      const results = withFaultyFs({
+        renameSync: (from, to) => {
+          if (path.basename(String(to)).startsWith('.gsd-reap-')) {
+            if (takenAway && !raced) realRename(from, other);
+            raced = true;
+            // Every attempt, since retryRenameSync retries a transient code.
+            if (!takenAway) throw Object.assign(new Error('EACCES: injected'), { code: 'EACCES' });
+          }
+          return realRename(from, to);
+        },
+      }, () => reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+      assert.ok(raced, 'the race ran');
+      assert.deepStrictEqual(rows(results), takenAway ? [] : [[canonicalPath(residue), 'skipped', 'residue_remove_failed']]);
+      assert.ok(fs.existsSync(takenAway ? other : residue), 'the residue is where the race left it');
+    });
+  }
+
+  // trek-e review 5593733152 (Nit 4): the reserved name is exactly
+  // `.gsd-reap-` and 16 lower-case hex digits; one digit more or fewer, or any
+  // other character, is not this sweep's and is held to the harness-name rule.
+  test('property: only `.gsd-reap-` + 16 lower-case hex is taken as a stranded removal', () => {
+    const fc = require('fast-check');
+    const hex = '0123456789abcdef';
+    const hexOf = (n) => fc.array(fc.constantFrom(...hex), { minLength: n, maxLength: n }).map((a) => a.join(''));
+    const name = fc.oneof(
+      hexOf(16).map((h) => ({ suffix: h, stranded: true })),
+      fc.constantFrom(15, 17).chain(hexOf).map((h) => ({ suffix: h, stranded: false })),
+      fc.tuple(hexOf(15), fc.constantFrom(...'ABCDEFgxz-_.'), fc.nat(15))
+        .map(([h, bad, at]) => ({ suffix: h.slice(0, at) + bad + h.slice(at), stranded: false })),
+    );
+    const repoDir = path.join(tmpBase, 'repo-stranded-property');
+    initRepo(repoDir);
+    fc.assert(fc.property(name, ({ suffix, stranded }) => {
+      const child = plainChild(repoDir, `.gsd-reap-${suffix}`);
+      const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+      cleanup(child);
+      assert.deepStrictEqual([row.status, row.reason], stranded ? ['reaped', 'unregistered_residue'] : ['skipped', 'residue_not_harness_named']);
+    }), { numRuns: 40 });
   });
 
   // The guard applies to the reserved name only: a harness-named residue is
