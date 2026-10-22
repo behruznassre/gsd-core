@@ -3740,11 +3740,13 @@ describe('cmdStateRecordSession (state record-session)', () => {
     );
   });
 
-  test('#4763: an archive-section Stopped At displaced by the document-wide writer is surfaced', () => {
-    // The writer replaces the FIRST case-insensitive label match anywhere in
-    // the document; a Session Continuity Archive line can precede the live
-    // block. The capture mirrors the writer (document-wide), so the displaced
-    // archive record is surfaced instead of silently lost.
+  test('#4763: an archive-section Stopped At above ## Session is left as is; the session section gets the write', () => {
+    // #4998 review (trek-e 5608265301, Major 1): the writer used to replace the
+    // FIRST label match anywhere, so an archive line above the live block took
+    // the write while the session section — the one the frontmatter sync and
+    // state-snapshot read — stayed stale. It now writes in the session section,
+    // as `state update` does, and the capture mirrors it: the archive line was
+    // not displaced, so it is not reported as displaced.
     const withArchive = [
       '# Project State',
       '',
@@ -3763,11 +3765,12 @@ describe('cmdStateRecordSession (state record-session)', () => {
     assert.ok(result.success, `Command failed: ${result.error}`);
 
     const output = JSON.parse(result.output);
-    assert.strictEqual(
-      output.replacedRecord['Stopped At'],
-      'archived Phase 1 record',
-      'the displaced archive line must be surfaced — the writer is document-wide',
-    );
+    assert.ok(output.updated.includes('Stopped At'), result.output);
+    assert.strictEqual(output.replacedRecord, undefined, 'the archive line was not displaced');
+    const after = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8');
+    assert.ok(after.includes('## Session Continuity Archive\n\n**Stopped at:** archived Phase 1 record\n'), after);
+    assert.match(after.slice(after.indexOf('\n## Session\n')), /\*\*Stopped at:\*\* Phase 2\n/);
+    assert.match(after, /^stopped_at: Phase 2$/m, 'the frontmatter syncs the value written');
   });
 
   test('#4763/#4998: a wrapped multi-line Stopped At record is left whole and reported, not displaced', () => {
@@ -22298,6 +22301,21 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     ].join('\n'));
   });
 
+  // trek-e review 5608265301 (Minor 2): the continuation is STATE.md text of any
+  // length, so at most 200 characters of it are echoed, in the JSON and on stderr.
+  for (const length of [199, 200, 201]) {
+    test(`a ${length}-character continuation is echoed ${length > 200 ? 'cut to 200 characters and marked' : 'whole'}`, () => {
+      const tail = 'w'.repeat(length);
+      seed([], ['Last session: 2026-01-01', 'Stopped at: Phase 2 complete', tail, 'Resume file: None']);
+      const { json, stderr } = recordSession('--stopped-at', 'Phase 3');
+      const echoed = length > 200 ? `${'w'.repeat(200)}…` : tail;
+      assert.deepStrictEqual(json.skipped, [{ field: 'Stopped At', reason: 'wrapped_value', continuation: echoed }]);
+      assert.ok(stderr.includes(JSON.stringify(echoed)), stderr);
+      assert.ok(!stderr.includes('w'.repeat(201)), 'stderr never carries more than the bound');
+      assert.ok(session().includes(`Stopped at: Phase 2 complete\n${tail}\n`), 'the file keeps the whole value');
+    });
+  }
+
   // Codex review of the first draft: a separate note directly below a field
   // looks exactly like a wrapped value, so deleting the "tail" deletes the note.
   for (const [name, note] of [
@@ -22706,16 +22724,47 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     }
   }
 
-  // Codex review of this round: the session-scoped read is for the verbs that
-  // write in the session section; record-session's writer is document-wide
-  // (#4763), and its report must still see what that writer changed.
-  test('(review Major 2) record-session over an archive above ## Session still reports what it displaced', () => {
+  // trek-e review 5608265301 (Major 1): record-session writes in the session
+  // section, as `state update` does, so an archive above it is left as is and
+  // the report names the live record it replaced.
+  test('(review Major 2) record-session over an archive above ## Session writes the live record and reports it displaced', () => {
+    const archive = ['## Session Continuity Archive', '', 'Last session: archived date', 'Stopped at: archived handoff', 'Resume file: archived.md', ''];
     fs.writeFileSync(statePath(), ['---', 'gsd_state_version: 1.0', 'status: executing', '---', '', '# Project State', '',
-      '## Session Continuity Archive', '', 'Last session: archived date', 'Stopped at: archived handoff', 'Resume file: archived.md', '',
-      '## Session', '', 'Last session: live date', 'Stopped at: live handoff', 'Resume file: live.md', ''].join('\n'));
+      ...archive, '## Session', '', 'Last session: live date', 'Stopped at: live handoff', 'Resume file: live.md', ''].join('\n'));
     const { json } = recordSession('--stopped-at', 'new handoff', '--resume-file', 'new.md');
     assert.strictEqual(json.recorded, true, JSON.stringify(json));
-    assert.deepStrictEqual(json.replacedRecord, { 'Stopped At': 'archived handoff', 'Resume File': 'archived.md' });
+    assert.deepStrictEqual(json.replacedRecord, { 'Stopped At': 'live handoff', 'Resume File': 'live.md' });
+    assert.ok(readState().includes(archive.join('\n')), readState());
+    assert.match(readState(), /\n## Session\n\nLast session: \S+\nStopped at: new handoff\nResume file: new\.md\n/);
+  });
+
+  // trek-e review 5608265301 (Major 1): a field whose only line is outside the
+  // session section is inserted into that section — where the frontmatter sync
+  // and state-snapshot read it — not written on the outside line, which left
+  // `stopped_at` stale behind a reported success.
+  for (const [layout, outside, lines] of [
+    ['a bold-label line above an empty ## Session', '**Stopped at**: old', ['## Session', '## Session Continuity', '']],
+    ['a bold line above a ## Session holding a table row and an unclosed fence', '**Stopped at:** old',
+      ['', '## Session', '', '| Stopped at | old |', '', '~~~', 'unclosed', '']],
+  ]) {
+    test(`(review 5608265301) ${layout}: the session section takes the write and the frontmatter syncs it`, () => {
+      fs.writeFileSync(statePath(), ['# S', '', 'prose', outside, ...lines].join('\n'));
+      const { json } = recordSession('--stopped-at', 'NEWVAL');
+      assert.strictEqual(json.recorded, true, JSON.stringify(json));
+      assert.ok(json.updated.includes('Stopped At'), JSON.stringify(json));
+      const after = readState();
+      assert.ok(after.includes(`\nprose\n${outside}\n`), 'the line outside the section is left as is');
+      assert.match(after, /^stopped_at: NEWVAL$/m, after);
+      const sessionBody = after.slice(after.indexOf('\n## Session\n'));
+      assert.match(sessionBody, /Stopped at(:\*\*|\s*\|) NEWVAL/, sessionBody);
+    });
+  }
+  test('(review 5608265301) a bold-label line above an empty ## Session: state-snapshot reads the value written', () => {
+    fs.writeFileSync(statePath(), ['# S', '', 'prose', '**Stopped at**: old', '## Session', '## Session Continuity', ''].join('\n'));
+    recordSession('--stopped-at', 'NEWVAL');
+    const snap = runTool('state-snapshot');
+    assert.strictEqual(snap.exitCode, 0, snap.stderr);
+    assert.strictEqual(JSON.parse(snap.stdout).session.stopped_at, 'NEWVAL', snap.stdout);
   });
 
   test('(review Major 2) record-session below fenced examples reports the live fields it wrote and what it displaced', () => {
@@ -22857,9 +22906,25 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
       'Stopped at: old', '', 'Some notes', '', '```md', 'example', ''].join('\n'));
     const { json, stderr } = recordSession('--stopped-at', 'new');
     assert.ok(json.updated.includes('Stopped At'), JSON.stringify(json));
-    assert.deepStrictEqual(json.skipped, [{ field: 'Last session', reason: 'unclosed_fence' }, { field: 'Resume file', reason: 'unclosed_fence' }]);
-    assert.doesNotMatch(stderr, /did not write Stopped at/);
+    // trek-e review 5608265301 (Minor 3): Resume file was not passed, so it is not named.
+    assert.deepStrictEqual(json.skipped, [{ field: 'Last session', reason: 'unclosed_fence' }]);
+    assert.doesNotMatch(stderr, /did not write (Stopped at|Resume file)/);
     assert.match(readState(), /\nStopped at: new\n/);
+  });
+
+  // trek-e review 5608265301 (Minor 3): a field already skipped as wrapped is
+  // not named a second time as unclosed_fence; a passed --resume-file is.
+  test('(review 5608265301) before an unclosed fence, a wrapped field is skipped once and only fields passed are named', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
+      'Stopped at: old', 'its continuation', '', '```md', 'example', ''].join('\n'));
+    const before = readState();
+    const { json } = recordSession('--stopped-at', 'new', '--resume-file', 'next.md');
+    assert.deepStrictEqual(json.skipped, [
+      { field: 'Stopped At', reason: 'wrapped_value', continuation: 'its continuation' },
+      { field: 'Last session', reason: 'unclosed_fence' },
+      { field: 'Resume file', reason: 'unclosed_fence' },
+    ]);
+    assert.strictEqual(readState(), before);
   });
 
   // Review 2026-10-14 Minor 3: the guard scans the whole document, but refuses

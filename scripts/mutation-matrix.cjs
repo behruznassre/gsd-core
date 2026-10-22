@@ -659,6 +659,22 @@ const COVERED = {
     excludeTests: ['state-contract.test.cjs'],
     minScore: 65,
   },
+  // #4998 review (trek-e 5563202317 Nit 6, 5608265301 Minor 4): the STATE.md and
+  // planning-document field readers and writers #4998 grew. minScore 50 (the range
+  // minimum) is provisional until this PR's CI shard measures them; it is then set to
+  // floor(measured) - 1 per the HOW TO UPDATE procedure above.
+  'state-document': {
+    cjs: 'gsd-core/bin/lib/state-document.cjs',
+    minScore: 50,
+  },
+  // planning-document.test.cjs requires the module through a MODULE_PATH constant, which
+  // the require derivation cannot follow; frontmatter-fence.test.cjs requires it directly
+  // but sits outside the naming rule. Both run in-process, with no subprocess.
+  'planning-document': {
+    cjs: 'gsd-core/bin/lib/planning-document.cjs',
+    extraTests: ['frontmatter-fence.test.cjs', 'planning-document.test.cjs'],
+    minScore: 50,
+  },
 };
 
 // Compute the final, derived `tests` array for every COVERED entry. Done once, after the

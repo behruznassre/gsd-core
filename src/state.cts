@@ -1807,7 +1807,11 @@ function cmdStateAddRoadmapEvolution(cwd: string, options: StateAddRoadmapEvolut
   // Internal spacing (e.g. dollar columns) is preserved. #4998: every
   // FIELD_LINE_BREAK_RE character, so a U+2028/U+2029 cannot survive into the
   // bullet and start a forged `**Field:**` line for the `m`-flag readers.
-  const flatNote = noteText.replace(new RegExp(`\\s*${FIELD_LINE_BREAK_RE.source}+\\s*`, 'g'), ' ').trim();
+  // Split and trimmed rather than one `\s*<break>+\s*` replace, which
+  // backtracks quadratically over a long whitespace run with no break in it
+  // (trek-e review 5608265301, Nit 5); the result is the same.
+  const flatNote = noteText.split(new RegExp(`${FIELD_LINE_BREAK_RE.source}+`))
+    .map((piece) => piece.trim()).filter(Boolean).join(' ');
 
   const actionText = (action && action.trim()) || 'changed';
   const afterText = after && after.trim() ? ` after Phase ${after.trim()}` : '';
@@ -1999,6 +2003,20 @@ function cmdStateResolveBlocker(cwd: string, text: string, raw: boolean): void {
   }
 }
 
+/**
+ * #4998 review (trek-e 5608265301, Minor 2): at most this many characters of a
+ * wrapped value's continuation are echoed back — it is STATE.md text, and its
+ * length is whatever the file holds.
+ */
+const SKIPPED_CONTINUATION_MAX_CHARS = 200;
+
+function boundedContinuation(text: string): string {
+  if (text.length <= SKIPPED_CONTINUATION_MAX_CHARS) return text;
+  // Never end on half a surrogate pair.
+  const end = /[\uD800-\uDBFF]/.test(text[SKIPPED_CONTINUATION_MAX_CHARS - 1]) ? SKIPPED_CONTINUATION_MAX_CHARS - 1 : SKIPPED_CONTINUATION_MAX_CHARS;
+  return `${text.slice(0, end)}…`;
+}
+
 function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, raw: boolean): void {
   // #4186: a bare invocation is a usage error, not a heartbeat write. The
   // pre-#4186 handler accepted zero arguments and still refreshed
@@ -2043,16 +2061,37 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
   const skipWrapped = (field: string, before: string, after: string): boolean => {
     const continuation = editedLineContinuation(before, after);
     if (continuation === null) return false;
-    skippedFields.push({ field, reason: 'wrapped_value', continuation });
+    skippedFields.push({ field, reason: 'wrapped_value', continuation: boundedContinuation(continuation) });
     return true;
   };
 
   readModifyWriteStateMd(statePath, (content) => {
+    // #4998 review (trek-e 5608265301, Major 1): every field written here is read
+    // from the session section when there is one (`## Session`, else `## Session
+    // Continuity` — matchSessionSection, state-snapshot, the frontmatter sync), so
+    // it is written there too. A line outside that section is not the field: a
+    // write that landed on it reported success while the synced value stayed
+    // stale. With no session section the readers read the whole body, and so
+    // does the writer. Located on the masked text (same offsets), as below.
+    const sessionSection = () => {
+      const masked = maskFencedLines(content, { document: true });
+      return collectSection(masked, (h) => h.level === 2 && h.text.trim().toLowerCase() === 'session', { levelBounded: true })
+        ?? collectSection(masked, (h) => h.level === 2 && h.text.trim().toLowerCase() === 'session continuity', { levelBounded: true });
+    };
+    const inSessionScope = (write: (visible: string) => string | null): string | null => {
+      const section = sessionSection();
+      if (!section) return writeOutsideFences(content, write, { document: true });
+      const body = writeOutsideFences(content.slice(section.bodyStart, section.bodyEnd), write);
+      return body === null ? null : replaceSection(content, section, body);
+    };
+    const sessionScopeText = (): string => {
+      const masked = maskFencedLines(content, { document: true });
+      const section = sessionSection();
+      return readableBoldLabels(section ? masked.slice(section.bodyStart, section.bodyEnd) : masked);
+    };
     // #4763 (1): read the pre-write session record. The capture mirrors the
-    // WRITER, not the snapshot reader: stateReplaceField replaces the FIRST
-    // case-insensitive label match anywhere in the document, so the capture is
-    // document-wide too — scoping it to ## Session would miss an archive-section
-    // line the writer actually displaced. Continuation lines join via
+    // WRITER: the first case-insensitive label match in the scope above, so a
+    // line the writer did not displace is not reported as displaced. Continuation lines join via
     // stateFieldContinuation (the sanctioned joiner — stateExtractField alone is
     // first-line-only), so a wrapped multi-line handoff is surfaced whole.
     // #4998: a line inside a fenced block is an example, not a field — the
@@ -2060,7 +2099,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     // the same unfenced text they write.
     // A `**Label**:` line the writer can replace is read too (readableBoldLabels).
     const capturePrior = (fieldName: string): string | undefined => {
-      const visible = readableBoldLabels(maskFencedLines(content, { document: true }));
+      const visible = sessionScopeText();
       const first = stateExtractField(visible, fieldName);
       if (first === null) return undefined;
       const cont = stateFieldContinuation(visible, fieldName);
@@ -2077,14 +2116,14 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     // #4998: every in-place write skips fenced blocks, as the insertion
     // below does — a fenced example line is never the occurrence replaced.
     const replaceField = (fieldName: string, value: string): string | null =>
-      writeOutsideFences(content, (visible) => stateReplaceField(visible, fieldName, value), { document: true });
+      inSessionScope((visible) => stateReplaceField(visible, fieldName, value));
     // The template check reads the field the way the writer finds it: an
     // authored `**Resume file**: plan.md` read as absent and was reset to None.
     const replaceFieldIfTemplate = (fieldName: string, defaults: string[], value: string): string => {
-      const current = stateExtractField(readableBoldLabels(maskFencedLines(content, { document: true })), fieldName);
+      const current = stateExtractField(sessionScopeText(), fieldName);
       if (current !== null && current.trim() !== ''
           && !defaults.some((d) => d.toLowerCase() === current.trim().toLowerCase())) return content;
-      return writeOutsideFences(content, (visible) => stateReplaceFieldIfTemplate(visible, fieldName, defaults, value), { document: true }) ?? content;
+      return inSessionScope((visible) => stateReplaceFieldIfTemplate(visible, fieldName, defaults, value)) ?? content;
     };
 
     // Update Last session / Last Date
@@ -2267,14 +2306,6 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
           ['Stopped at', needsStoppedAt ? stoppedAtValue : carried(['Stopped At'], stoppedAtValue)],
           ['Resume file', needsResumeFile ? resumeValue : carried(['Resume File'], resumeValue)],
         ];
-        // A carried value holding a line separator (a hand-written table cell
-        // can) would forge a line once written as a bold field: leave that
-        // field out, and say so.
-        const scaffoldLines: string[] = [];
-        for (const [label, value] of scaffoldFields) {
-          if (FIELD_LINE_BREAK_RE.test(value)) skippedFields.push({ field: label, reason: 'line_separator' });
-          else scaffoldLines.push(`**${label}:** ${value}`);
-        }
         // A document that ends inside an unclosed fence would swallow the
         // appended section — nothing reads it there. Write nothing, and say so.
         // The whole document is scanned on purpose: whether its tail is fenced
@@ -2283,13 +2314,27 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // an unclosed block only as its LAST record (the fence runs to EOF), so
         // `closeLineIdx === -1` here means exactly "the tail is inside a fence".
         if (markdownFencedBlocks(content.split('\n'), { document: true }).some((b) => b.closeLineIdx === -1)) {
-          // A field already replaced in place above was written: it is not
-          // skipped too (Codex review).
-          const written = new Set(updated.map((f) => (f === 'Last Date' ? 'last session' : f.toLowerCase())));
+          // Named only for a field this call writes (Last session always, the
+          // others when passed) and not already written in place or skipped
+          // for another reason (Codex review; trek-e review 5608265301, Minor 3).
+          const fieldKey = (f: string): string => (f === 'Last Date' ? 'last session' : f.toLowerCase());
+          const requested = new Set(['last session']);
+          if (options.stopped_at) requested.add('stopped at');
+          if (options.resume_file !== undefined && options.resume_file !== null) requested.add('resume file');
+          const settled = new Set([...updated, ...skippedFields.map((s) => s.field)].map(fieldKey));
           for (const [label] of scaffoldFields) {
-            if (!written.has(label.toLowerCase())) skippedFields.push({ field: label, reason: 'unclosed_fence' });
+            const key = fieldKey(label);
+            if (requested.has(key) && !settled.has(key)) skippedFields.push({ field: label, reason: 'unclosed_fence' });
           }
         } else {
+          // A carried value holding a line separator (a hand-written table cell
+          // can) would forge a line once written as a bold field: leave that
+          // field out, and say so.
+          const scaffoldLines: string[] = [];
+          for (const [label, value] of scaffoldFields) {
+            if (FIELD_LINE_BREAK_RE.test(value)) skippedFields.push({ field: label, reason: 'line_separator' });
+            else scaffoldLines.push(`**${label}:** ${value}`);
+          }
           const scaffold = ['', '## Session', '', ...scaffoldLines, ''].join('\n');
           content = content.trimEnd() + '\n' + scaffold;
           rewriteMatched = true;
@@ -2324,7 +2369,8 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
   // bytes actually persisted (fix(#3351) generalized) and fold in any field
   // preservation restored that this transform never touched (#3345's
   // direction).
-  const reconciledUpdated = reconcileReportedFields(statePath, preWriteState, updated, divergedFields);
+  // #4998 review: read back where the fields were written — the session section.
+  const reconciledUpdated = reconcileReportedFields(statePath, preWriteState, updated, divergedFields, NO_SECTION_TARGETS, true);
 
   // #4998: name every field left whole because its value wraps, and how to fix it.
   const skippedRows = skippedFields;
@@ -5209,9 +5255,8 @@ function readStateTarget(
   // #4998 review: no session writer changes a fenced example line, so a session
   // field is read with fences blanked — an unchanged example above the live
   // line hid the write and reported it missing. With `sessionScope` (`state
-  // update` / `state patch`, which write inside the session section) it is read
-  // there; otherwise from the whole document, as record-session's document-wide
-  // writer writes it (#4763).
+  // update`, `state patch` and `state record-session`, which write inside the
+  // session section) it is read there; otherwise from the whole document.
   const bodyValue = stateTransitionMod.isSessionScopedBodyField(field)
     ? stateExtractField(readableBoldLabels(sessionScope ? sessionFieldScope(body) : maskFencedLines(body)), field)
     : stateExtractField(body, field);
