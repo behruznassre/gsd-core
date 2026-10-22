@@ -660,12 +660,16 @@ const COVERED = {
     minScore: 65,
   },
   // #4998 review (trek-e 5563202317 Nit 6, 5608265301 Minor 4): the STATE.md and
-  // planning-document field readers and writers #4998 grew. minScore 50 (the range
-  // minimum) is provisional until this PR's CI shard measures them; it is then set to
-  // floor(measured) - 1 per the HOW TO UPDATE procedure above.
+  // planning-document field readers and writers #4998 grew.
+  // state-document: minScore 50 (the range minimum) is provisional — the first CI shard
+  // (run 39736529871, job 119683571232) was cancelled at the 15-minute default with 506
+  // mutants tested and ~66 minutes remaining by Stryker's own estimate, so no score yet.
+  // 120 is about 1.5x that estimated ~80-minute run; floor and budget are re-set from the
+  // measured run per the HOW TO UPDATE procedure above.
   'state-document': {
     cjs: 'gsd-core/bin/lib/state-document.cjs',
     minScore: 50,
+    timeoutMinutes: 120,
   },
   // planning-document.test.cjs requires the module through a MODULE_PATH constant, which
   // the require derivation cannot follow; frontmatter-fence.test.cjs requires it directly
@@ -673,7 +677,9 @@ const COVERED = {
   'planning-document': {
     cjs: 'gsd-core/bin/lib/planning-document.cjs',
     extraTests: ['frontmatter-fence.test.cjs', 'planning-document.test.cjs'],
-    minScore: 50,
+    // CI run 39736529871, job 119683571231 (#5234, head 43f1bfa93): 75.14%, Stryker in
+    // about 3 minutes. Floor = floor(75.14) - 1 = 74.
+    minScore: 74,
   },
 };
 
