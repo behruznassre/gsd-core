@@ -2897,6 +2897,16 @@ function findUnregisteredResidue(
       return (err as NodeJS.ErrnoException).code === 'ENOENT';
     }
   };
+  // Which directory a path is, so one moved aside and recreated in place is
+  // told from the one this sweep verified (#4941 review).
+  const identity = (p: string): string | null => {
+    try {
+      const st = fs.lstatSync(p, { bigint: true });
+      return `${st.dev}:${st.ino}`;
+    } catch {
+      return null;
+    }
+  };
 
   const listing = readDirSafe(residueDir);
   if (!listing) {
@@ -3018,8 +3028,10 @@ function findUnregisteredResidue(
     // resolution and the unlink: only a process that can already write the
     // checkout could use it, and it could delete the checkout outright.
     let target: string;
+    let parentId: string | null;
     try {
       if (!chainIsReal() || isBareDirectory(p) !== true) throw new Error('changed');
+      parentId = identity(residueDir);
       target = fs.realpathSync.native(p);
       if (path.dirname(target) !== residueDir) throw new Error('moved');
     } catch {
@@ -3034,9 +3046,11 @@ function findUnregisteredResidue(
     try {
       retryRenameSync(target, doomed);
     } catch {
-      // Only a candidate missing from a still-real `.claude/worktrees` was taken by
-      // another sweep; a moved parent took it nowhere this sweep can vouch for.
-      if (!(gone(target) && chainIsReal())) results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
+      // Only a candidate missing from the `.claude/worktrees` this sweep verified
+      // was taken by another sweep; a moved parent, even one recreated in place,
+      // took it nowhere this sweep can vouch for.
+      const sameParent = parentId !== null && chainIsReal() && identity(residueDir) === parentId;
+      if (!(gone(target) && sameParent)) results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
       continue;
     }
     let landed = false;

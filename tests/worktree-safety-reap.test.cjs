@@ -1697,25 +1697,31 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
 
   // Codex review of this round: a candidate missing because `.claude/worktrees`
   // itself moved was not taken by another sweep, so the failure is reported.
-  test('a failed rename to the reserved name after .claude/worktrees moved -> residue_remove_failed', () => {
-    const { repoDir, residue } = repoWithResidue('rename-race-parent');
-    const residueDir = path.dirname(residue);
-    const moved = path.join(tmpBase, 'rename-race-parent-moved');
-    const realRename = fs.renameSync;
-    let raced = false;
-    const results = withFaultyFs({
-      renameSync: (from, to) => {
-        if (!raced && path.basename(String(to)).startsWith('.gsd-reap-')) {
-          raced = true;
-          realRename(residueDir, moved);
-        }
-        return realRename(from, to);
-      },
-    }, () => reapOrphanWorktrees(repoDir, deadOwnerDeps()));
-    assert.ok(raced, 'the move ran');
-    assert.deepStrictEqual(rows(results), [[canonicalPath(residue), 'skipped', 'residue_remove_failed']]);
-    assert.ok(fs.existsSync(path.join(moved, path.basename(residue))), 'the residue moved with its parent');
-  });
+  // trek-e review 5608091528 (Minor 1): so is one whose parent was moved aside
+  // and a fresh directory made in its place — still a real directory, but not
+  // the one this sweep verified.
+  for (const [label, recreated] of [['moved', false], ['moved and was recreated in place', true]]) {
+    test(`a failed rename to the reserved name after .claude/worktrees ${label} -> residue_remove_failed`, () => {
+      const { repoDir, residue } = repoWithResidue(`rename-race-parent-${recreated}`);
+      const residueDir = path.dirname(residue);
+      const moved = path.join(tmpBase, `rename-race-parent-${recreated}-moved`);
+      const realRename = fs.renameSync;
+      let raced = false;
+      const results = withFaultyFs({
+        renameSync: (from, to) => {
+          if (!raced && path.basename(String(to)).startsWith('.gsd-reap-')) {
+            raced = true;
+            realRename(residueDir, moved);
+            if (recreated) fs.mkdirSync(residueDir);
+          }
+          return realRename(from, to);
+        },
+      }, () => reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+      assert.ok(raced, 'the move ran');
+      assert.deepStrictEqual(rows(results), [[canonicalPath(residue), 'skipped', 'residue_remove_failed']]);
+      assert.ok(fs.existsSync(path.join(moved, path.basename(residue))), 'the residue moved with its parent');
+    });
+  }
 
   // trek-e review 5593733152 (Nit 4): the reserved name is exactly
   // `.gsd-reap-` and 16 lower-case hex digits; one digit more or fewer, or any
@@ -1734,9 +1740,14 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     initRepo(repoDir);
     fc.assert(fc.property(name, ({ suffix, stranded }) => {
       const child = plainChild(repoDir, `.gsd-reap-${suffix}`);
-      const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
-      cleanup(child);
-      assert.deepStrictEqual([row.status, row.reason], stranded ? ['reaped', 'unregistered_residue'] : ['skipped', 'residue_not_harness_named']);
+      // trek-e review 5608091528 (Nit 4): a failing run removes its directory
+      // too, so the shrunk counterexample is not obscured by a leftover row.
+      try {
+        const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+        assert.deepStrictEqual([row.status, row.reason], stranded ? ['reaped', 'unregistered_residue'] : ['skipped', 'residue_not_harness_named']);
+      } finally {
+        cleanup(child);
+      }
     }), { numRuns: 40 });
   });
 
