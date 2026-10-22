@@ -687,6 +687,8 @@ const COVERED = {
     extraTests: [
       'cursor-subagent-isolation.unit.test.cjs',
       'gsd-agent-isolation-guard.unit.test.cjs',
+      // #5597 (merged into next): in-process rows for agedNoneGovernsDispatch.
+      'isolation-aged-none-sentinel.test.cjs',
       'isolation-sentinel.test.cjs',
       'isolation-sentinel.unit.test.cjs',
     ],
