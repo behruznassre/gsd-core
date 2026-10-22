@@ -1866,6 +1866,30 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.strictEqual(scan.residue_dir, 'unreadable');
   });
 
+  // Codex review of this round: a `.claude` the sweep cannot traverse hides
+  // whether `.claude/worktrees` exists, so it did not look: unreadable, not absent.
+  test('a .claude that cannot be traversed scans as unreadable, not absent', (t) => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX mode bits do not deny traversal on Windows');
+      return;
+    }
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      t.skip('root traverses a mode-000 directory');
+      return;
+    }
+    const { repoDir } = repoWithResidue('claude-untraversable');
+    const claude = path.join(repoDir, '.claude');
+    const mode = fs.statSync(claude).mode;
+    fs.chmodSync(claude, 0o000);
+    let scan;
+    try {
+      ({ scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps()));
+    } finally {
+      fs.chmodSync(claude, mode);
+    }
+    assert.strictEqual(scan.residue_dir, 'unreadable');
+  });
+
   test('run from a linked worktree, nothing of main\'s residue is touched and the scan says not_main_checkout', () => {
     const { repoDir, residue } = repoWithResidue('linked');
     const linked = path.join(tmpBase, 'linked-wt');

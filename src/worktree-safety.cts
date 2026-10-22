@@ -2910,8 +2910,9 @@ function findUnregisteredResidue(
 
   const listing = readDirSafe(residueDir);
   if (!listing) {
-    // Absent is a real answer; any other failure is "could not look".
-    const state = fs.existsSync(residueDir) ? 'unreadable' : 'absent';
+    // Absent is a real answer; any other failure is "could not look" — a
+    // `.claude` that cannot be traversed included (Codex review).
+    const state = gone(residueDir) ? 'absent' : 'unreadable';
     return { results, status: state };
   }
   if (!chainIsReal()) return { results, status: 'aliased' };
