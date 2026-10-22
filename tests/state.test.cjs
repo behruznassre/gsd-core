@@ -22912,6 +22912,16 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.match(readState(), /\nStopped at: new\n/);
   });
 
+  // Codex review of this round: a Stopped at that already holds the value needs
+  // no write, so the fence blocks nothing for it.
+  test('(review 5608265301) before an unclosed fence, a Stopped at already holding the value is not named', () => {
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
+      'Stopped at: same', '', '```md', 'example', ''].join('\n'));
+    const { json, stderr } = recordSession('--stopped-at', 'same');
+    assert.deepStrictEqual(json.skipped, [{ field: 'Last session', reason: 'unclosed_fence' }], JSON.stringify(json));
+    assert.doesNotMatch(stderr, /did not write Stopped at/);
+  });
+
   // trek-e review 5608265301 (Minor 3): a field already skipped as wrapped is
   // not named a second time as unclosed_fence; a passed --resume-file is.
   test('(review 5608265301) before an unclosed fence, a wrapped field is skipped once and only fields passed are named', () => {

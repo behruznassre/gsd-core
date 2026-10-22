@@ -2322,6 +2322,8 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
           if (options.stopped_at) requested.add('stopped at');
           if (options.resume_file !== undefined && options.resume_file !== null) requested.add('resume file');
           const settled = new Set([...updated, ...skippedFields.map((s) => s.field)].map(fieldKey));
+          // A Stopped at already holding the value needs no write (Codex review).
+          if (stoppedAtMatched) settled.add('stopped at');
           for (const [label] of scaffoldFields) {
             const key = fieldKey(label);
             if (requested.has(key) && !settled.has(key)) skippedFields.push({ field: label, reason: 'unclosed_fence' });
