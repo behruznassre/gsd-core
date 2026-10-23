@@ -1890,6 +1890,35 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.strictEqual(scan.residue_dir, 'unreadable');
   });
 
+  // #4941 review: the admin-dir mirror of the row above. A git dir behind a
+  // directory the sweep cannot traverse (a --separate-git-dir location chmod'ed
+  // after git resolved it) hides whether `worktrees/` exists: unreadable.
+  test('an admin dir behind an untraversable directory scans as unreadable, not absent', (t) => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX mode bits do not deny traversal on Windows');
+      return;
+    }
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      t.skip('root traverses a mode-000 directory');
+      return;
+    }
+    const { repoDir } = repoWithResidue('admin-untraversable');
+    const locked = path.join(tmpBase, 'locked-gitdir-parent');
+    fs.mkdirSync(path.join(locked, 'gitdir', 'worktrees'), { recursive: true });
+    const execGit = (args, opts) => (args[0] === 'rev-parse' && args[1] === '--git-dir'
+      ? okResult(`${path.join(locked, 'gitdir')}\n`)
+      : realExecGit(args, opts));
+    const mode = fs.statSync(locked).mode;
+    fs.chmodSync(locked, 0o000);
+    let scan;
+    try {
+      ({ scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps({ execGit })));
+    } finally {
+      fs.chmodSync(locked, mode);
+    }
+    assert.strictEqual(scan.admin_dir, 'unreadable');
+  });
+
   test('run from a linked worktree, nothing of main\'s residue is touched and the scan says not_main_checkout', () => {
     const { repoDir, residue } = repoWithResidue('linked');
     const linked = path.join(tmpBase, 'linked-wt');

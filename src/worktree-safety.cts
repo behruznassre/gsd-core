@@ -2596,7 +2596,7 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
   const entries = readDirSafe(worktreesAdminDir);
   // #4941: no admin dir is exactly what a fully pruned harness residue leaves
   // — the residue scan must still run, not return an all-clear.
-  if (!entries) return sweepResidue((deps.existsSync || fs.existsSync)(worktreesAdminDir) ? 'unreadable' : 'absent');
+  if (!entries) return sweepResidue(isAbsent(worktreesAdminDir) ? 'absent' : 'unreadable');
 
   // 2. Discover the default branch (main/master/etc) tip.
   const defaultBranchResult = execGit(
@@ -2886,17 +2886,6 @@ function findUnregisteredResidue(
     }
   };
   const chainIsReal = (): boolean => realDirectory(claudeDir) === true && realDirectory(residueDir) === true;
-  // A candidate gone when this sweep renames it was taken by a concurrent
-  // sweep, which reports it itself: this sweep has no failure to report
-  // (#4941 review).
-  const gone = (p: string): boolean => {
-    try {
-      fs.lstatSync(p);
-      return false;
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code === 'ENOENT';
-    }
-  };
   // Which directory a path is, so one moved aside and recreated in place is
   // told from the one this sweep verified (#4941 review).
   const identity = (p: string): string | null => {
@@ -2912,7 +2901,7 @@ function findUnregisteredResidue(
   if (!listing) {
     // Absent is a real answer; any other failure is "could not look" — a
     // `.claude` that cannot be traversed included (Codex review).
-    const state = gone(residueDir) ? 'absent' : 'unreadable';
+    const state = isAbsent(residueDir) ? 'absent' : 'unreadable';
     return { results, status: state };
   }
   if (!chainIsReal()) return { results, status: 'aliased' };
@@ -3051,7 +3040,10 @@ function findUnregisteredResidue(
       // was taken by another sweep; a moved parent, even one recreated in place,
       // took it nowhere this sweep can vouch for.
       const sameParent = parentId !== null && chainIsReal() && identity(residueDir) === parentId;
-      if (!(gone(target) && sameParent)) results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
+      // A candidate gone when this sweep renames it was taken by a concurrent
+      // sweep, which reports it itself: this sweep has no failure to report
+      // (#4941 review).
+      if (!(isAbsent(target) && sameParent)) results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
       continue;
     }
     let landed = false;
@@ -3213,6 +3205,19 @@ function defaultIsPidAlive(pid: number): boolean {
     return true;
   } catch (err) {
     return (err as NodeJS.ErrnoException | null | undefined)?.code !== 'ESRCH';
+  }
+}
+
+/**
+ * #4941: only ENOENT means a path is absent. `existsSync` also says false on
+ * EACCES/ENOTDIR, which is "could not look", not "nothing there".
+ */
+function isAbsent(p: string): boolean {
+  try {
+    fs.lstatSync(p);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT';
   }
 }
 
