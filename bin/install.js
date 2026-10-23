@@ -11073,8 +11073,9 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   const _isCoreProfileAlias = _activeProfileName === 'core';
   const _effectiveInstallMode = _isCoreProfileAlias ? 'minimal' : 'full';
   // Load the manifest and compute resolved profile for named profiles.
-  // For --minimal/core: use an empty manifest (core profile has no transitive
-  // deps) to produce a resolvedProfile with the core skill set.  For core/
+  // For --minimal/core: use an empty manifest for the SKILL closure (core profile has no
+  // transitive skill deps) to produce a resolvedProfile with the core skill set; agents
+  // come from the full manifest (#5503, see below).  For core/
   // standard profiles, resolveProfile's `registry` arg IS consulted (via
   // _capabilitySkillsForMode) so tier:core/tier:standard capability skills are
   // unioned in when registered. #2322 correction: for the DEFAULT `full`
@@ -11087,10 +11088,15 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // is passed so an INSTALLED third-party capability (not just a first-party
   // one) is honored on every profile, `full` included (#2322 blocker 2).
   const _commandsDir = path.join(src, 'commands', 'gsd');
-  const _skillsManifest = _isCoreProfileAlias ? new Map() : loadSkillsManifest(_commandsDir);
+  // #5503: the empty manifest only keeps core's SKILL set at the eight core skills (no
+  // `requires:` closure). The agents those skills spawn are still derived from the real
+  // manifest, so a core install can run /gsd-plan-phase and friends.
+  const _fullSkillsManifest = loadSkillsManifest(_commandsDir);
+  const _skillsManifest = _isCoreProfileAlias ? new Map() : _fullSkillsManifest;
   let _resolvedProfile = resolveProfile({
     modes: [_activeProfileName],
     manifest: _skillsManifest,
+    agentManifest: _fullSkillsManifest,
     registry: _installedCapabilityRegistry,
   });
   // Unified staging function: all profiles use stageSkillsForProfile with the
@@ -11099,9 +11105,13 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
     return stageSkillsForProfile(commandsGsdDir, _resolvedProfile);
   }
   function _stageAgents(agentsDir) {
-    if (_isCoreProfileAlias) return agentsDir;
+    // #5503: no core-alias shortcut — Codex gets the same profile-filtered agents as every runtime.
     return stageAgentsForProfile(agentsDir, _resolvedProfile);
   }
+  // #5503: Codex registers agent roles in config.toml. That used to be gated on "minimal mode"
+  // because minimal staged no agents; gate it on whether the resolved profile stages any.
+  const _codexAgentRolesEnabled = () =>
+    !isMinimalMode(_effectiveInstallMode) || (_resolvedProfile.agents instanceof Set && _resolvedProfile.agents.size > 0);
   const persistActiveProfileMarker = () => {
     try {
       writeActiveProfile(targetDir, _activeProfileName);
@@ -11476,7 +11486,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // The full restoreCodexSnapshot() (defined inside the config block) additionally
   // handles config.toml and the staged hooks/ tree, which are not yet touched
   // at this point in the pipeline.
-  const _codexPreConfigRollback = !hostBehaviorsFor(runtime).tomlConfigInstall || isMinimalMode(_effectiveInstallMode) ? null : () => {
+  const _codexPreConfigRollback = !hostBehaviorsFor(runtime).tomlConfigInstall || !_codexAgentRolesEnabled() ? null : () => {
     rollbackInstallerMigrations();
     // skills/gsd-* — pass 1: restore snapshot entries (may be absent if deleted mid-install).
     const _earlySkillsDir = _resolveSkillsRootDir(runtime, targetDir, _installScopeId);
@@ -12206,7 +12216,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // advertising the old full agent surface even though the descriptor-driven
   // write above already skipped writing the .md files for a minimal-tier
   // resolvedProfile. Reuse the same helper that powers `--uninstall`.
-  if (isMinimalMode(_effectiveInstallMode) && hostBehaviorsFor(runtime).tomlConfigInstall) {
+  if (!_codexAgentRolesEnabled() && hostBehaviorsFor(runtime).tomlConfigInstall) {
     const codexConfigPath = path.join(targetDir, 'config.toml');
     if (fs.existsSync(codexConfigPath)) {
       const existing = fs.readFileSync(codexConfigPath, 'utf8');
@@ -12820,9 +12830,10 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
   // #2695: this branch runs for BOTH `core` (minimal) and `full` profiles.
   // Hooks are lightweight infrastructure (update-check + context monitor), not the
   // "full agent surface" that `core` deliberately omits. The config.toml / agent
-  // generation below is still gated by its own inner `!isMinimalMode` guard, so
-  // `core` enters the branch to receive the hook-file copy + hooks.json wiring but
-  // does NOT get agent roles generated. Before #2695 the outer `!isMinimalMode`
+  // generation below is gated by its own inner `_codexAgentRolesEnabled()` guard (#5503:
+  // it used to be `!isMinimalMode`, which kept `core` from registering the agents its
+  // skills spawn), so `core` enters the branch to receive the hook-file copy + hooks.json
+  // wiring AND the agent roles its own skills spawn. Before #2695 the outer `!isMinimalMode`
   // here skipped the whole branch for `core`, so the registered parent hook pointed
   // at a worker/registry the same installer never delivered.
   if (plan.installSurface === 'codex-toml') {
@@ -12993,7 +13004,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
     };
 
     let agentCount = 0;
-    if (!isMinimalMode(_effectiveInstallMode)) {
+    if (_codexAgentRolesEnabled()) {
       // #2834: write ~/.gsd/defaults.json (resolve_model_ids + runtime) BEFORE generating
       // agent TOMLs — installCodexConfig reads defaults.json at generation time, so on a
       // clean first install the runtime-aware model resolver must already know the runtime.
@@ -13012,7 +13023,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
       // not include agents/gsd-*.toml because those files did not yet exist.
       writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, scope: _installScopeId });
     } else {
-      console.log(`  ${dim}↳${reset} Skipping Codex agent config generation (minimal install)`);
+      console.log(`  ${dim}↳${reset} Skipping Codex agent config generation (${_resolvedProfile.name} profile stages no agents)`);
     }
 
     // Copy only the hook files that Codex actually registers via its hook configuration (#2153).
