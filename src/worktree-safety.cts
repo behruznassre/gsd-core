@@ -2178,17 +2178,8 @@ interface WorktreeCreateResult {
 
 /** #4941: `p` is a directory with no `.git` entry (ENOENT) — present, but not a worktree. */
 function isPresentWithoutGitEntry(p: string): boolean {
-  try {
-    if (!fs.lstatSync(p).isDirectory()) return false;
-  } catch {
-    return false;
-  }
-  try {
-    fs.lstatSync(path.join(p, '.git'));
-    return false;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'ENOENT';
-  }
+  const st = lstatState(p);
+  return typeof st !== 'string' && st.isDirectory() && lstatState(path.join(p, '.git')) === 'absent';
 }
 
 /**
@@ -2525,6 +2516,8 @@ interface ReapResult {
   path: string;
   status: 'reaped' | 'skipped';
   reason: string;
+  /** #4941 review: a removed residue's top-level entry names, sorted — what was deleted. */
+  contents?: string[];
 }
 
 /**
@@ -2596,7 +2589,7 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
   const entries = readDirSafe(worktreesAdminDir);
   // #4941: no admin dir is exactly what a fully pruned harness residue leaves
   // — the residue scan must still run, not return an all-clear.
-  if (!entries) return sweepResidue(isAbsent(worktreesAdminDir) ? 'absent' : 'unreadable');
+  if (!entries) return sweepResidue(lstatState(worktreesAdminDir) === 'absent' ? 'absent' : 'unreadable');
 
   // 2. Discover the default branch (main/master/etc) tip.
   const defaultBranchResult = execGit(
@@ -2878,12 +2871,10 @@ function findUnregisteredResidue(
   const claudeDir = path.join(top, '.claude');
   const residueDir = path.join(claudeDir, 'worktrees');
   const realDirectory = (p: string): boolean | null => {
-    try {
-      const st = fs.lstatSync(p);
-      return st.isDirectory() && !st.isSymbolicLink();
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code === 'ENOENT' ? false : null;
-    }
+    const st = lstatState(p);
+    if (st === 'absent') return false;
+    if (st === 'unreadable') return null;
+    return st.isDirectory() && !st.isSymbolicLink();
   };
   const chainIsReal = (): boolean => realDirectory(claudeDir) === true && realDirectory(residueDir) === true;
   // Which directory a path is, so one moved aside and recreated in place is
@@ -2899,10 +2890,17 @@ function findUnregisteredResidue(
 
   const listing = readDirSafe(residueDir);
   if (!listing) {
-    // Absent is a real answer; any other failure is "could not look" — a
-    // `.claude` that cannot be traversed included (Codex review).
-    const state = isAbsent(residueDir) ? 'absent' : 'unreadable';
-    return { results, status: state };
+    // A link in the chain is `aliased` whether or not it resolves: a dangling
+    // `.claude`, or one leading to a directory with no `worktrees`, is a link,
+    // not "nothing there" (#4941 review). Then absent is a real answer; any
+    // other failure is "could not look" — a `.claude` that cannot be traversed
+    // included (Codex review).
+    const isLink = (p: string): boolean => {
+      const st = lstatState(p);
+      return typeof st !== 'string' && st.isSymbolicLink();
+    };
+    if (isLink(claudeDir) || isLink(residueDir)) return { results, status: 'aliased' };
+    return { results, status: lstatState(residueDir) === 'absent' ? 'absent' : 'unreadable' };
   }
   if (!chainIsReal()) return { results, status: 'aliased' };
   // Sorted so `entries` is the same on every filesystem.
@@ -2913,12 +2911,9 @@ function findUnregisteredResidue(
   const isBareDirectory = (p: string): boolean | null => {
     const real = realDirectory(p);
     if (real !== true) return real;
-    try {
-      fs.lstatSync(path.join(p, '.git'));
-      return false; // has a .git entry — a worktree, not residue
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code === 'ENOENT' ? true : null;
-    }
+    const gitEntry = lstatState(path.join(p, '.git'));
+    if (gitEntry === 'absent') return true;
+    return gitEntry === 'unreadable' ? null : false; // a .git entry: a worktree, not residue
   };
 
   const candidates: string[] = [];
@@ -3043,7 +3038,7 @@ function findUnregisteredResidue(
       // A candidate gone when this sweep renames it was taken by a concurrent
       // sweep, which reports it itself: this sweep has no failure to report
       // (#4941 review).
-      if (!(isAbsent(target) && sameParent)) results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
+      if (!(lstatState(target) === 'absent' && sameParent)) results.push({ path: p, status: 'skipped', reason: 'residue_remove_failed' });
       continue;
     }
     let landed = false;
@@ -3061,11 +3056,15 @@ function findUnregisteredResidue(
       results.push({ path: restore(), status: 'skipped', reason: 'residue_unreadable' });
       continue;
     }
+    // The row names what the directory held at the top level: the guards prove
+    // it is harness residue, not that nothing in it was wanted (#4941 review).
+    // A removal that throws may already have deleted part of it, so it is not
+    // reported as left in place.
     try {
       removeDir(doomed);
-      results.push({ path: p, status: 'reaped', reason: 'unregistered_residue' });
+      results.push({ path: p, status: 'reaped', reason: 'unregistered_residue', contents: [...children].sort() });
     } catch {
-      results.push({ path: restore(), status: 'skipped', reason: 'residue_remove_failed' });
+      results.push({ path: restore(), status: 'skipped', reason: 'residue_remove_incomplete' });
     }
   }
   return { results, status: 'scanned' };
@@ -3174,10 +3173,20 @@ const RESIDUE_NAMES_SHOWN = 5;
 const RESIDUE_NAME_MAX = 64;
 
 /** `"name", "name" and N more` — escaped, cut, capped (#4941 review). */
+function quotedNameList(names: readonly string[]): string {
+  const shown = names.slice(0, RESIDUE_NAMES_SHOWN).map((name) => {
+    const chars = [...name];
+    return formatDiagnosticToken(chars.length > RESIDUE_NAME_MAX ? `${chars.slice(0, RESIDUE_NAME_MAX).join('')}…` : chars.join(''));
+  });
+  const more = names.length - shown.length;
+  return more > 0 ? `${shown.join(', ')} and ${more} more` : shown.join(', ');
+}
+
+/** Removed directories as `quotedNameList` prints names, each followed by what it held: `"agent-x" (held "a", "b")`. */
 function residueNameList(rows: ReapResult[]): string {
   const shown = rows.slice(0, RESIDUE_NAMES_SHOWN).map((r) => {
-    const chars = [...path.basename(r.path)];
-    return formatDiagnosticToken(chars.length > RESIDUE_NAME_MAX ? `${chars.slice(0, RESIDUE_NAME_MAX).join('')}…` : chars.join(''));
+    const name = quotedNameList([path.basename(r.path)]);
+    return r.contents && r.contents.length > 0 ? `${name} (held ${quotedNameList(r.contents)})` : name;
   });
   const more = rows.length - shown.length;
   return more > 0 ? `${shown.join(', ')} and ${more} more` : shown.join(', ');
@@ -3209,15 +3218,15 @@ function defaultIsPidAlive(pid: number): boolean {
 }
 
 /**
- * #4941: only ENOENT means a path is absent. `existsSync` also says false on
+ * #4941: what an lstat of `p` says — its stats, `absent` (ENOENT only), or
+ * `unreadable` (any other failure). `existsSync` also says false on
  * EACCES/ENOTDIR, which is "could not look", not "nothing there".
  */
-function isAbsent(p: string): boolean {
+function lstatState(p: string): fs.Stats | 'absent' | 'unreadable' {
   try {
-    fs.lstatSync(p);
-    return false;
+    return fs.lstatSync(p);
   } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'ENOENT';
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : 'unreadable';
   }
 }
 
@@ -3259,12 +3268,22 @@ function cmdWorktreeReapOrphans(cwd: string, deps: RecordAgentCmdDeps & Worktree
   // RESIDUE_NAMES_SHOWN of them; it is gone, so it is never named again. A
   // directory LEFT in place is counted by the guard that kept it and never
   // named: it would repeat on every run. The JSON's `entries` carries every path.
+  // A removed directory's line also names what it held at the top level, under
+  // the same caps, so work a guard could not see is not deleted silently.
   const removed = result.filter((r) => r.status === 'reaped' && r.reason === 'unregistered_residue');
   if (removed.length > 0) {
     writeErr(
       `[gsd] worktree.reap-orphans: removed ${removed.length} leftover harness worktree ` +
       `${removed.length === 1 ? 'directory' : 'directories'} under .claude/worktrees that git no longer tracked: ` +
       `${residueNameList(removed)}\n`,
+    );
+  }
+  const incomplete = result.filter((r) => r.reason === 'residue_remove_incomplete');
+  if (incomplete.length > 0) {
+    writeErr(
+      `[gsd] worktree.reap-orphans: removing ${incomplete.length} ${incomplete.length === 1 ? 'directory' : 'directories'} ` +
+      `under .claude/worktrees failed partway, so part of what ${incomplete.length === 1 ? 'it' : 'they'} held may already be deleted; ` +
+      'the command\'s JSON "entries" lists each one\n',
     );
   }
   const kept = result.filter((r) => r.status === 'skipped' && RESIDUE_KEPT_REASONS.has(r.reason));
@@ -3283,7 +3302,8 @@ function cmdWorktreeReapOrphans(cwd: string, deps: RecordAgentCmdDeps & Worktree
   if (scan && scan.admin_dir !== 'git_dir_unresolved' && scan.residue_dir !== 'scanned' && scan.residue_dir !== 'absent') {
     writeErr(`[gsd] worktree.reap-orphans: .claude/worktrees was not swept — ${RESIDUE_NOT_SWEPT[scan.residue_dir]}\n`);
   }
-  const skippedCount = result.filter((r) => r.status === 'skipped' && !RESIDUE_KEPT_REASONS.has(r.reason)).length;
+  const skippedCount = result.filter((r) => r.status === 'skipped' && !RESIDUE_KEPT_REASONS.has(r.reason)
+    && r.reason !== 'residue_remove_incomplete').length;
   if (skippedCount > 0) {
     // Surface skipped entries so operators are aware of unresolved orphans.
     // #4941 review: there is no DEBUG path here — the rows ARE the details.

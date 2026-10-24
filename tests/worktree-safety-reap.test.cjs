@@ -1580,11 +1580,46 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(fs.existsSync(path.join(dir, 'file.txt')));
   });
 
-  test('a removal that fails is reported as residue_remove_failed', () => {
+  // trek-e review 5638711345 (Minor 2): a removal that throws may already have
+  // deleted part of the directory, so it is never reported as left in place.
+  test('a removal that throws is reported as residue_remove_incomplete', () => {
     const { repoDir, residue } = repoWithResidue('rmfail');
     const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ removeDir: () => { throw new Error('EBUSY: injected'); } })));
-    assert.deepStrictEqual({ status: row.status, reason: row.reason }, { status: 'skipped', reason: 'residue_remove_failed' });
+    assert.deepStrictEqual({ status: row.status, reason: row.reason }, { status: 'skipped', reason: 'residue_remove_incomplete' });
     assert.ok(fs.existsSync(residue));
+  });
+
+  test('a real removal that stops partway is residue_remove_incomplete, and stderr says part may be deleted', (t) => {
+    if (process.platform === 'win32') {
+      t.skip('POSIX mode bits do not deny unlinking on Windows');
+      return;
+    }
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      t.skip('root unlinks inside a mode-555 directory');
+      return;
+    }
+    const { repoDir, residue } = repoWithResidue('rm-partway');
+    fs.writeFileSync(path.join(residue, 'UNCOMMITTED_WORK.txt'), 'work\n');
+    const locked = path.join(residue, 'locked');
+    fs.mkdirSync(locked);
+    fs.writeFileSync(path.join(locked, 'kept.txt'), 'kept\n');
+    const mode = fs.statSync(locked).mode;
+    fs.chmodSync(locked, 0o555);
+    let json;
+    let err;
+    try {
+      ({ json, err } = runCli(repoDir));
+    } finally {
+      fs.chmodSync(locked, mode);
+    }
+    assert.deepStrictEqual(json.entries.map((e) => [canonicalPath(e.path), e.status, e.reason]),
+      [[canonicalPath(residue), 'skipped', 'residue_remove_incomplete']]);
+    assert.strictEqual(json.reaped, 0);
+    assert.ok(fs.existsSync(path.join(locked, 'kept.txt')), 'what could not be removed is back under the original name');
+    assert.deepStrictEqual(err, [
+      '[gsd] worktree.reap-orphans: removing 1 directory under .claude/worktrees failed partway, ' +
+      'so part of what it held may already be deleted; the command\'s JSON "entries" lists each one\n',
+    ]);
   });
 
   // Codex review: when the removal fails and the rename back fails too (here,
@@ -1602,7 +1637,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
       throw new Error('EBUSY: injected');
     };
     const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ removeDir })));
-    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_remove_failed']);
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_remove_incomplete']);
     assert.match(path.basename(row.path), /^\.gsd-reap-[0-9a-f]{16}$/u);
     assert.ok(fs.existsSync(path.join(row.path, 'node_modules')), 'the reported path holds the residue');
   });
@@ -1984,6 +2019,34 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.strictEqual(fs.readFileSync(path.join(target, 'keep.txt'), 'utf8'), 'keep\n');
   });
 
+  // trek-e review 5638711345 (Minor 1): a link in the chain is `aliased` even
+  // when the listing fails — it does not resolve, or resolves to no `worktrees`.
+  for (const [i, [label, build]] of [
+    ['.claude is a link to a directory with no worktrees', (repoDir) => {
+      const elsewhere = path.join(tmpBase, `elsewhere-${path.basename(repoDir)}`);
+      fs.mkdirSync(elsewhere);
+      fs.symlinkSync(elsewhere, path.join(repoDir, '.claude'), 'junction');
+    }],
+    ['.claude is a dangling link', (repoDir) => {
+      fs.symlinkSync(path.join(tmpBase, `missing-${path.basename(repoDir)}`), path.join(repoDir, '.claude'), 'junction');
+    }],
+    ['.claude/worktrees is a dangling link', (repoDir) => {
+      fs.mkdirSync(path.join(repoDir, '.claude'));
+      fs.symlinkSync(path.join(tmpBase, `missing-${path.basename(repoDir)}`), path.join(repoDir, '.claude', 'worktrees'), 'junction');
+    }],
+  ].entries()) {
+    test(`${label}: residue_dir is aliased, and stderr says it was not swept`, () => {
+      const repoDir = path.join(tmpBase, `repo-alias-shape-${i}`);
+      initRepo(repoDir);
+      build(repoDir);
+      const { json, err } = runCli(repoDir);
+      assert.deepStrictEqual([json.entries, json.scan.residue_dir], [[], 'aliased']);
+      assert.deepStrictEqual(err, [
+        '[gsd] worktree.reap-orphans: .claude/worktrees was not swept — it (or .claude) is a symlink or junction, not a directory of this checkout\n',
+      ]);
+    });
+  }
+
   test('a .claude/worktrees that is a link (here, outside the checkout) is not scanned, and nothing there is touched', () => {
     const repoDir = path.join(tmpBase, 'repo-alias');
     initRepo(repoDir);
@@ -2147,8 +2210,29 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.deepStrictEqual(json.entries.map((e) => [e.status, e.reason]), [['reaped', 'unregistered_residue']]);
     assert.deepStrictEqual(json.scan, { admin_dir: 'absent', residue_dir: 'scanned' });
     assert.deepStrictEqual(err, [
-      '[gsd] worktree.reap-orphans: removed 1 leftover harness worktree directory under .claude/worktrees that git no longer tracked: "agent-t1"\n',
+      '[gsd] worktree.reap-orphans: removed 1 leftover harness worktree directory under .claude/worktrees that git no longer tracked: ' +
+      '"agent-t1" (held "README.md", "node_modules")\n',
     ]);
+    assert.deepStrictEqual(json.entries[0].contents, ['README.md', 'node_modules']);
+  });
+
+  // trek-e review 5638711345 (Minor 3): the guards prove harness residue, not
+  // that nothing in it was wanted — an untracked file is deleted with it, and
+  // the row and stderr say what was there.
+  test('untracked work in a removed residue is named in the row and on stderr', () => {
+    const { repoDir, residue } = repoWithResidue('cli-untracked', 'agent-aaa');
+    fs.writeFileSync(path.join(residue, 'UNCOMMITTED_WORK.txt'), 'work\n');
+    const { json, err } = runCli(repoDir);
+    assert.deepStrictEqual(json.entries.map((e) => [e.status, e.reason, e.contents]),
+      [['reaped', 'unregistered_residue', ['README.md', 'UNCOMMITTED_WORK.txt', 'node_modules']]]);
+    assert.match(err.join(''), /"agent-aaa" \(held "README\.md", "UNCOMMITTED_WORK\.txt", "node_modules"\)\n$/u);
+  });
+
+  test('what a removed directory held is capped at 5 names, escaped like the directory name', () => {
+    const contents = ['a', 'b', 'c', 'd', 'e\u202e', 'f', 'g'];
+    const list = residueNameList([{ path: '/r/.claude/worktrees/agent-x', status: 'reaped', reason: 'unregistered_residue', contents }]);
+    assert.ok(!hasRawChar(list), JSON.stringify(list));
+    assert.match(list, /^"agent-x" \(held "a", "b", "c", "d", "e[^"]*" and 2 more\)$/u);
   });
 
   test('a directory left in place is counted by the guard that kept it, never named', () => {
