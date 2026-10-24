@@ -23146,6 +23146,27 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.strictEqual(JSON.parse(runTool('state-snapshot').stdout).session.resume_file, 'new.md');
   });
 
+  // Codex whole-PR review (this round): a section opening with a horizontal
+  // rule is not frontmatter to the writer, and an inserted field never splits
+  // an ambiguous wrapped tail.
+  test('(Codex) a session section that opens with a `---` rule: the live bold field is replaced, not duplicated', () => {
+    // The rule directly under the heading: the section body then starts with `---`.
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '', '## Session', '---',
+      '**Stopped at:** old handoff', '---', '**Last session:** 2026-01-01', '**Resume file:** None', ''].join('\n'));
+    const { json } = recordSession('--stopped-at', 'new handoff');
+    assert.ok(json.updated.includes('Stopped At'), JSON.stringify(json));
+    assert.strictEqual((session().match(/\*\*Stopped at:\*\*/g) || []).length, 1, session());
+    assert.strictEqual(frontmatterStoppedAt(), 'new handoff', readState());
+    const upd = JSON.parse(runTool('state', 'update', 'Resume File', 'x.md').stdout);
+    assert.strictEqual(upd.updated, true, JSON.stringify(upd));
+    assert.match(session(), /\*\*Resume file:\*\* x\.md/);
+  });
+  test('(Codex) a field inserted after one with an ambiguous tail goes below the tail, not inside it', () => {
+    seed([], ['Last session: 2026-01-01', 'Stopped at: finished migrating the old', 'records and verified: all good'], '## Session');
+    recordSession('--resume-file', 'plan.md');
+    assert.ok(session().includes('Stopped at: finished migrating the old\nrecords and verified: all good\nResume file: plan.md\n'), session());
+  });
+
   // Nit 7: the shipped template's `[...]` placeholders are not a displaced record.
   test('(Nit 7) the template placeholders are not reported in replacedRecord', () => {
     seed([], ['Last session: [YYYY-MM-DD HH:MM]', 'Stopped at: [Description of last completed action]',

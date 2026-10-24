@@ -572,9 +572,19 @@ export function writeOutsideFences(
   write: (masked: string) => string | null,
   scope: FenceScope = {},
 ): string | null {
+  // Outside a whole document a leading `---` is a horizontal rule
+  // (`FenceScope`), but the field writers parse what they are given as a
+  // document, where it opens frontmatter and hides the fields below it: a
+  // section starting with a rule got a duplicate field inserted (Codex
+  // review). They are handed the text after a line break, which is removed again.
+  const run = (text: string): string | null => {
+    if (scope.document) return write(text);
+    const out = write(`\n${text}`);
+    return out !== null && out.startsWith('\n') ? out.slice(1) : null;
+  };
   const masked = maskFencedLines(content, scope);
-  if (masked === content) return write(content);
-  const result = write(masked);
+  if (masked === content) return run(content);
+  const result = run(masked);
   if (result === null) return null;
   if (result === masked) return content;
   const limit = Math.min(masked.length, result.length);
@@ -700,7 +710,10 @@ export function insertMissingSessionFields(body: string, fields: readonly Sessio
     for (let j = k - 1; j >= 0; j--) {
       const anchor = lineOf(fields[j].label);
       if (anchor === -1) continue;
-      const tailEnd = anchor + 1 + continuationLineCount(lines.slice(anchor + 1).map((l) => l.replace(/\r$/, '')));
+      // An ambiguous `words: text` line is taken as the anchor's tail, as the
+      // wrap check takes it: inserting inside a wrapped value splits it
+      // (Codex review); inserting below a sibling only moves the new line.
+      const tailEnd = anchor + 1 + continuationLineCount(lines.slice(anchor + 1).map((l) => l.replace(/\r$/, '')), false);
       let at = anchor + 1;
       while (at < tailEnd && !fenced[at]) at++;
       return { at, anchor };
