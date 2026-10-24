@@ -60,7 +60,7 @@ const { planningDir, resolvePhaseIdConvention } = planningWorkspace;
 import { platformReadSync } from './shell-command-projection.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import frontmatterMod = require('./frontmatter.cjs');
-const { rawFrontmatterField } = frontmatterMod;
+const { rawFrontmatterMapping } = frontmatterMod;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import unusableInputMod = require('./unusable-input.cjs');
 const { UNUSABLE_REASON, warnUnusableInput } = unusableInputMod;
@@ -1023,11 +1023,18 @@ function classifyMilestoneScalar(raw: string | null | undefined): { explicitNull
  * The raw `^milestone:` line read captured the on-disk YAML text — quotes and
  * escapes included — and that text was re-serialized as the value, adding one
  * escape layer per `state.*` write. Falls back to the legacy line read only
- * when there is no parseable frontmatter carrying a string `milestone` key.
+ * when there is no parseable frontmatter, or its `milestone` is not text. One
+ * that parses without a `milestone` key names none: a `milestone:` line further
+ * down (a fenced example) is not one (#4998 review, Minor 5).
  */
 function readStateMilestoneScalar(stateRaw: string): string | null {
-  const field = rawFrontmatterField(stateRaw, 'milestone');
-  if (field && typeof field.value === 'string') return field.value;
+  const fm = rawFrontmatterMapping(stateRaw);
+  if (fm) {
+    if (!Object.prototype.hasOwnProperty.call(fm, 'milestone')) return null;
+    if (typeof fm['milestone'] === 'string') return fm['milestone'];
+    // A non-string value keeps the pre-#4998 line read, which finds this
+    // frontmatter line first.
+  }
   const m = stateRaw.match(/^milestone:\s*(.+)/m);
   return m ? m[1] : null;
 }

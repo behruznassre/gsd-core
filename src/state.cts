@@ -143,6 +143,8 @@ import {
   KNOWN_TEMPLATE_DEFAULTS,
   stateReplaceFieldIfTemplate,
   stateCurrentPositionSlice,
+  isSessionHeading,
+  isSessionContinuityHeading,
 } from './state-document.cjs';
 import { tokenizeHeadings, collectSection, collectSections, replaceSection, stripFencedCode } from './markdown-sectionizer.cjs';
 import type { HeadingToken } from './markdown-sectionizer.cjs';
@@ -2071,22 +2073,27 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     // Continuity` — matchSessionSection, state-snapshot, the frontmatter sync), so
     // it is written there too. A line outside that section is not the field: a
     // write that landed on it reported success while the synced value stayed
-    // stale. With no session section the readers read the whole body, and so
-    // does the writer. Located on the masked text (same offsets), as below.
+    // stale. With no session section only `Stopped At` is read from the whole
+    // body (sessionFieldScope); `state-snapshot` reads Last session and Resume
+    // file from a session section alone, so with none they are not written in
+    // place but in the section appended below, as `state update`/`patch` refuse
+    // them (#4998 review, Minor 3). Located on the masked text (same offsets).
+    const readBodyWide = (fieldName: string): boolean => fieldName.toLowerCase() === 'stopped at';
     const sessionSection = () => {
       const masked = maskFencedLines(content, { document: true });
-      return collectSection(masked, (h) => h.level === 2 && h.text.trim().toLowerCase() === 'session', { levelBounded: true })
-        ?? collectSection(masked, (h) => h.level === 2 && h.text.trim().toLowerCase() === 'session continuity', { levelBounded: true });
+      return collectSection(masked, isSessionHeading, { levelBounded: true })
+        ?? collectSection(masked, isSessionContinuityHeading, { levelBounded: true });
     };
-    const inSessionScope = (write: (visible: string) => string | null): string | null => {
+    const inSessionScope = (fieldName: string, write: (visible: string) => string | null): string | null => {
       const section = sessionSection();
-      if (!section) return writeOutsideFences(content, write, { document: true });
+      if (!section) return readBodyWide(fieldName) ? writeOutsideFences(content, write, { document: true }) : null;
       const body = writeOutsideFences(content.slice(section.bodyStart, section.bodyEnd), write);
       return body === null ? null : replaceSection(content, section, body);
     };
-    const sessionScopeText = (): string => {
+    const sessionScopeText = (fieldName: string): string => {
       const masked = maskFencedLines(content, { document: true });
       const section = sessionSection();
+      if (!section && !readBodyWide(fieldName)) return '';
       return readableBoldLabels(section ? masked.slice(section.bodyStart, section.bodyEnd) : masked);
     };
     // #4763 (1): read the pre-write session record. The capture mirrors the
@@ -2099,7 +2106,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     // the same unfenced text they write.
     // A `**Label**:` line the writer can replace is read too (readableBoldLabels).
     const capturePrior = (fieldName: string): string | undefined => {
-      const visible = sessionScopeText();
+      const visible = sessionScopeText(fieldName);
       const first = stateExtractField(visible, fieldName);
       if (first === null) return undefined;
       const cont = stateFieldContinuation(visible, fieldName);
@@ -2116,14 +2123,14 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     // #4998: every in-place write skips fenced blocks, as the insertion
     // below does — a fenced example line is never the occurrence replaced.
     const replaceField = (fieldName: string, value: string): string | null =>
-      inSessionScope((visible) => stateReplaceField(visible, fieldName, value));
+      inSessionScope(fieldName, (visible) => stateReplaceField(visible, fieldName, value));
     // The template check reads the field the way the writer finds it: an
     // authored `**Resume file**: plan.md` read as absent and was reset to None.
     const replaceFieldIfTemplate = (fieldName: string, defaults: string[], value: string): string => {
-      const current = stateExtractField(sessionScopeText(), fieldName);
+      const current = stateExtractField(sessionScopeText(fieldName), fieldName);
       if (current !== null && current.trim() !== ''
           && !defaults.some((d) => d.toLowerCase() === current.trim().toLowerCase())) return content;
-      return inSessionScope((visible) => stateReplaceFieldIfTemplate(visible, fieldName, defaults, value)) ?? content;
+      return inSessionScope(fieldName, (visible) => stateReplaceFieldIfTemplate(visible, fieldName, defaults, value)) ?? content;
     };
 
     // Update Last session / Last Date
@@ -2216,20 +2223,23 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // (workstream.cts, gsd2-import.cts, templates/state.md) instead emit
       // `## Session Continuity`. Treat each separately so we never append a
       // duplicate section alongside an existing one.
-      // #4998: a heading inside a fenced example is not a section.
+      // #4998: a heading inside a fenced example is not a section. Detected
+      // with the locator the writers below and the readers use (#4998 review).
       const headingScan = maskFencedLines(content, { document: true });
-      const existingCanonicalSession = /^## Session[ \t]*$/im.test(headingScan);
-      const existingSessionContinuity = /^## Session Continuity[ \t]*$/im.test(headingScan);
+      const existingCanonicalSession = collectSection(headingScan, isSessionHeading, { levelBounded: true }) !== null;
+      const existingSessionContinuity = collectSection(headingScan, isSessionContinuityHeading, { levelBounded: true }) !== null;
 
       // Track whether the chosen branch's rewrite actually matched. The detector
-      // regexes (existingCanonicalSession/existingSessionContinuity) are CRLF-
-      // tolerant ($ under /m treats \r as a line terminator); the writer regexes
-      // below must be too. If a writer regex silently fails to match (line-ending
+      // and the writer share one locator (CRLF-tolerant: the tokenizer strips
+      // a trailing \r). If the writer still fails to match (line-ending
       // mismatch, unexpected heading shape, ...), do NOT report success — the
       // caller would believe fields were persisted that were silently dropped
       // (#2450). The append branch always sets rewriteMatched=true (it always
       // mutates content).
       let rewriteMatched = false;
+      // `created` means a session section was added, as in record-metric and
+      // add-decision — not a field inserted into an existing one (#4998 review).
+      let sectionAppended = false;
 
       // #4998: insert each missing field into `region`,
       // in the section's own spelling and in template order (Last session →
@@ -2262,7 +2272,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // #4998: insert the missing fields in place. This used to replace the
         // whole section with three canonical lines, which deleted any wrapped
         // value or note in it — and reset an authored Resume file to None.
-        insertIntoSection((h) => h.level === 2 && h.text.trim().toLowerCase() === 'session');
+        insertIntoSection(isSessionHeading);
       } else if (existingSessionContinuity) {
         // #1101: a `## Session Continuity` section already exists (bootstrap
         // shape). Previously this fell through to the append branch and created
@@ -2277,7 +2287,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         // `existingSessionContinuity` detection above (#1101 review F3, #2450):
         // a detected heading the writer then misses would report fields as
         // updated that were never written (`rewriteMatched` stays false).
-        insertIntoSection((h) => h.level === 2 && h.text.trim().toLowerCase() === 'session continuity');
+        insertIntoSection(isSessionContinuityHeading);
       } else {
         // No session heading exists at all — append a new canonical section.
         // #4998: the appended section becomes the one the sync reads, so a
@@ -2340,6 +2350,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
           const scaffold = ['', '## Session', '', ...scaffoldLines, ''].join('\n');
           content = content.trimEnd() + '\n' + scaffold;
           rewriteMatched = true;
+          sectionAppended = true;
         }
       }
 
@@ -2357,7 +2368,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       // same-line replace (CRLF-agnostic seam), so unconditional push is
       // correct. The class-defect防御 here is for the INSERT path only.
       if (rewriteMatched) {
-        sessionCreated = true;
+        sessionCreated = sectionAppended;
         if (needsLastSession) updated.push('Last session');
         if (needsStoppedAt) updated.push('Stopped At');
         if (needsResumeFile) updated.push('Resume File');
@@ -2401,14 +2412,15 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     // no frontmatter `stopped_at`), and the #944 template-default DWIM
     // (defaults match case-insensitively, so a case-variant 'none' → 'None'
     // rewrite is normalization, not displacement) are excluded.
-    const isResumeTemplateDefault = priorRecord.resumeFile !== undefined
-      && KNOWN_TEMPLATE_DEFAULTS['Resume File'].some(
-        (d) => d.toLowerCase() === priorRecord.resumeFile?.toLowerCase());
     // #4998: `None` is the same placeholder for Stopped At (the bootstrap
-    // writes it there too, body or frontmatter) — no record was displaced.
-    const isStoppedAtPlaceholder = priorRecord.stoppedAt !== undefined
-      && KNOWN_TEMPLATE_DEFAULTS['Resume File'].some(
-        (d) => d.toLowerCase() === priorRecord.stoppedAt?.toLowerCase());
+    // writes it there too, body or frontmatter) — no record was displaced. Nor
+    // is the shipped template's whole-value `[...]` placeholder
+    // (`[Description of last completed action]`; #4998 review, Nit 7).
+    const isPlaceholder = (value: string | undefined): boolean => value !== undefined
+      && (KNOWN_TEMPLATE_DEFAULTS['Resume File'].some((d) => d.toLowerCase() === value.toLowerCase())
+        || /^\[[^\]\n]*\]$/u.test(value.trim()));
+    const isResumeTemplateDefault = isPlaceholder(priorRecord.resumeFile);
+    const isStoppedAtPlaceholder = isPlaceholder(priorRecord.stoppedAt);
     const replacedRecord: Record<string, string> = {};
     if (reconciledUpdated.includes('Stopped At') && priorRecord.stoppedAt
         && !isStoppedAtPlaceholder
@@ -2474,12 +2486,11 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
  * Returns the section body, or null.
  */
 function matchSessionSection(body: string): string | null {
-  const isSession = (h: HeadingToken): boolean => h.level === 2 && h.text.trim().toLowerCase() === 'session';
-  const isSessionContinuity = (h: HeadingToken): boolean => h.level === 2 && h.text.trim().toLowerCase() === 'session continuity';
-  const section = collectSection(body, isSession, { levelBounded: true })
-    ?? collectSection(body, isSessionContinuity, { levelBounded: true });
+  const section = collectSection(body, isSessionHeading, { levelBounded: true })
+    ?? collectSection(body, isSessionContinuityHeading, { levelBounded: true });
   return section ? section.body : null;
 }
+
 
 /**
  * #4998: where the session fields (Stopped At, Paused At) are read from — the

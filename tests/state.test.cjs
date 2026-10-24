@@ -22620,24 +22620,24 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     assert.strictEqual(frontmatterStoppedAt(), 'new', readState());
   });
 
-  // Major 2: with no session heading, a skipped wrapped Last session is
-  // carried, never re-added with the new timestamp.
-  test('(Major 2) no session heading: a wrapped Last session is carried into the appended section, not overwritten', () => {
-    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
-      'Last session: started', 'then continued here.', ''].join('\n'));
-    const { json } = recordSession('--stopped-at', 'X');
-    assert.deepStrictEqual(json.skipped.map((s) => s.field), ['Last session']);
-    assert.ok(readState().includes('Last session: started\nthen continued here.\n'), 'the wrapped field is whole');
-    assert.match(session(), /\*\*Last session:\*\* started\n\*\*Stopped at:\*\* X\n/);
-  });
-
-  test('(Major 2) no session heading: a wrapped Last Date is carried too', () => {
-    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
-      'Last Date: 2026-01-01 and', 'a wrapped tail', ''].join('\n'));
-    const { json } = recordSession('--stopped-at', 'X');
-    assert.deepStrictEqual(json.skipped.map((s) => s.field), ['Last Date']);
-    assert.match(session(), /\*\*Last session:\*\* 2026-01-01 and\n/);
-  });
+  // trek-e review 5638530738 (Minor 3): with no session heading, Last session
+  // and Last Date are read by no reader (state-snapshot reads them from a
+  // session section only), so a body line carrying one is not written in place
+  // — as `state update`/`patch` refuse it — and a wrapped one is left whole.
+  // The appended section carries the new timestamp.
+  for (const [label, lines] of [
+    ['Last session', ['Last session: started', 'then continued here.']],
+    ['Last Date', ['Last Date: 2026-01-01 and', 'a wrapped tail']],
+  ]) {
+    test(`(Minor 3) no session heading: a wrapped ${label} body line is left whole, and the new section carries the new timestamp`, () => {
+      fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '', ...lines, ''].join('\n'));
+      const { json } = recordSession('--stopped-at', 'X');
+      assert.strictEqual(json.skipped, undefined, JSON.stringify(json));
+      assert.ok(readState().includes(`${lines.join('\n')}\n`), 'the body line is untouched');
+      assert.match(session(), /^## Session\n\n\*\*Last session:\*\* \d{4}-\d{2}-\d{2}T\S+\n\*\*Stopped at:\*\* X\n/);
+      assert.strictEqual(JSON.parse(runTool('state-snapshot').stdout).session.stopped_at, 'X');
+    });
+  }
 
   test('(Major 1) no session heading: a carried table cell holding U+2028 is left out and named, never written as a line', () => {
     fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
@@ -22883,12 +22883,13 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
     });
   }
 
-  test('(Codex r2) no session heading: `**Label**:` values are carried, a skipped wrapped one included', () => {
+  test('(Codex r2) no session heading: a `**Label**:` Resume file is carried; Last session takes the new timestamp', () => {
     fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', '',
       '**Last session**: started', 'continued here', '**Resume file**: plan.md', ''].join('\n'));
     const { json } = recordSession('--stopped-at', 'X');
-    assert.deepStrictEqual(json.skipped.map((s) => s.field), ['Last session']);
-    assert.match(session(), /\*\*Last session:\*\* started\n\*\*Stopped at:\*\* X\n\*\*Resume file:\*\* plan\.md\n/);
+    assert.strictEqual(json.skipped, undefined, JSON.stringify(json));
+    assert.ok(readState().includes('**Last session**: started\ncontinued here\n'), 'the body line is untouched');
+    assert.match(session(), /\*\*Last session:\*\* \d{4}-\S+\n\*\*Stopped at:\*\* X\n\*\*Resume file:\*\* plan\.md\n/);
   });
 
   test('(Codex r2) no session heading and an unclosed fence: nothing is appended into it, and the call says why', () => {
@@ -23083,6 +23084,80 @@ describe('#4998 regression: record-session leaves a wrapped field whole and inse
       assert.strictEqual(json.replacedRecord, undefined, JSON.stringify(json));
     });
   }
+
+  // ── trek-e review 5638530738 ──
+
+  // Major 1: the section detector shares the tokenizer the writers and readers
+  // use, so a heading they accept is never answered with a second section.
+  for (const heading of ['##  Session', '##\tSession', '## Session ##', ' ## Session']) {
+    test(`(Major 1) "${heading.replace('\t', '\\t')}" is the session section: no second one is appended`, () => {
+      fs.writeFileSync(statePath(), ['---', 'status: planning', '---', '', '# S', '', heading, '',
+        'Last session: 2026-01-01', 'Resume file: None', ''].join('\n'));
+      const { json } = recordSession('--stopped-at', 'z');
+      assert.strictEqual(json.recorded, true, JSON.stringify(json));
+      assert.strictEqual(json.created, undefined, 'nothing was created (Nit 6)');
+      assert.deepStrictEqual(json.updated.filter((f) => f !== 'gsd_state_version'), ['Last session', 'Stopped At']);
+      assert.strictEqual((readState().match(/^ ?##\s+Session\b/gm) || []).length, 1, readState());
+      assert.strictEqual(JSON.parse(runTool('state-snapshot').stdout).session.stopped_at, 'z');
+    });
+  }
+
+  // Nit 6: `created` means a section was added, as for record-metric.
+  test('(Nit 6) a field inserted into an existing section is not reported as created; an appended section is', () => {
+    seed([], ['Last session: 2026-01-01'], '## Session');
+    assert.strictEqual(recordSession('--stopped-at', 'a').json.created, undefined);
+    fs.writeFileSync(statePath(), ['---', 'status: executing', '---', '', '# Project State', ''].join('\n'));
+    assert.strictEqual(recordSession('--stopped-at', 'b').json.created, true);
+  });
+
+  // Minor 2: a prose tail shaped `words: text` may be a wrapped value, so the
+  // writer leaves the field whole; a label STATE.md defines, or a bold one, is
+  // a sibling.
+  test('(Minor 2) a wrapped tail shaped like a label is a continuation: the field is left whole', () => {
+    seed([], ['Stopped at: finished the migration of the old', 'records and verified: all good', 'Resume file: None'], '## Session');
+    const { json } = recordSession('--stopped-at', 'new');
+    assert.deepStrictEqual(json.skipped, [{ field: 'Stopped At', reason: 'wrapped_value', continuation: 'records and verified: all good' }]);
+    assert.ok(session().includes('Stopped at: finished the migration of the old\nrecords and verified: all good\n'), session());
+    assert.strictEqual(json.replacedRecord, undefined, JSON.stringify(json));
+  });
+  for (const sibling of ['Resume file: None', 'Status: Executing', '**Phase 3.1 status:** ok']) {
+    test(`(Minor 2) "${sibling}" directly below Stopped at is a sibling: the field is written`, () => {
+      seed([], ['Last session: 2026-01-01', 'Stopped at: old', sibling], '## Session');
+      const { json } = recordSession('--stopped-at', 'new');
+      assert.strictEqual(json.skipped, undefined, JSON.stringify(json));
+      assert.ok(session().includes(`Stopped at: new\n${sibling}\n`), session());
+    });
+  }
+
+  // Minor 3: with no session section, all three writers agree — Resume file and
+  // Last session are written only where state-snapshot reads them.
+  test('(Minor 3) no session section: update and patch refuse Resume File; record-session writes it into a new section the snapshot reads', () => {
+    const doc = ['---', 'status: executing', '---', '', '# Project State', '', 'Resume file: old.md', ''].join('\n');
+    fs.writeFileSync(statePath(), doc);
+    const upd = JSON.parse(runTool('state', 'update', 'Resume File', 'new.md').stdout);
+    assert.strictEqual(upd.updated, false, JSON.stringify(upd));
+    const patch = JSON.parse(runTool('state', 'patch', '--Resume File', 'new.md').stdout);
+    assert.ok(!(patch.updated || []).includes('Resume File'), JSON.stringify(patch));
+    assert.strictEqual(readState(), doc, 'neither wrote');
+    const { json } = recordSession('--stopped-at', 'X', '--resume-file', 'new.md');
+    assert.ok(json.updated.includes('Resume File'), JSON.stringify(json));
+    assert.strictEqual(json.created, true);
+    assert.ok(readState().includes('\nResume file: old.md\n'), 'the body line outside any section is left alone');
+    assert.strictEqual(JSON.parse(runTool('state-snapshot').stdout).session.resume_file, 'new.md');
+  });
+
+  // Nit 7: the shipped template's `[...]` placeholders are not a displaced record.
+  test('(Nit 7) the template placeholders are not reported in replacedRecord', () => {
+    seed([], ['Last session: [YYYY-MM-DD HH:MM]', 'Stopped at: [Description of last completed action]',
+      'Resume file: [Path to .continue-here*.md if exists, otherwise "None"]'], '## Session');
+    const { json } = recordSession('--stopped-at', 'Z', '--resume-file', 'x.md');
+    assert.ok(json.updated.includes('Stopped At') && json.updated.includes('Resume File'), JSON.stringify(json));
+    assert.strictEqual(json.replacedRecord, undefined, JSON.stringify(json));
+  });
+  test('(Nit 7) a real value that only starts with a bracket is still a displaced record', () => {
+    seed([], ['Last session: 2026-01-01', 'Stopped at: [WIP] plan 2 half done', 'Resume file: None'], '## Session');
+    assert.deepStrictEqual(recordSession('--stopped-at', 'Z').json.replacedRecord, { 'Stopped At': '[WIP] plan 2 half done' });
+  });
 });
 
 // ---------------------------------------------------------------------------

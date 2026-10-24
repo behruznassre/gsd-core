@@ -2801,8 +2801,9 @@ describe('#4998 review round: single-line writes, colon-outside reads, continuat
   // First-diff index around a line start: limit-1 (the newline ending the
   // previous line), limit (the line's first byte), limit+1.
   test('editedLineContinuation attributes the edit to the right line at a line boundary', () => {
-    const before = 'A: 1\nmore a\n\nB: 2\nmore b';
-    const bStart = before.indexOf('B: 2');
+    // Labels STATE.md defines: a plain unknown label may be a wrapped tail to this writer (Minor 2 below).
+    const before = 'Status: 1\nmore a\n\nPhase: 2\nmore b';
+    const bStart = before.indexOf('Phase: 2');
     const editAt = (i) => before.slice(0, i) + 'X' + before.slice(i);
     assert.equal(editedLineContinuation(before, editAt(0)), 'more a', 'index 0 is line A');
     assert.equal(editedLineContinuation(before, editAt(bStart - 1)), null, 'limit-1 is the blank line above B');
@@ -2819,19 +2820,36 @@ describe('#4998 review round: single-line writes, colon-outside reads, continuat
   // single-line values sharing any prefix or suffix, it is the line written —
   // its continuation is that field's, and an identical write changes nothing
   // (so nothing can be orphaned and there is nothing to skip).
+  // trek-e review 5638530738 (Minor 2): the oracle is written out per line
+  // kind, not computed by the shared scan under test — a label shape that
+  // could be a wrapped tail (`A: 1`) continues the value for this writer; a
+  // bold label, one STATE.md defines, a blank line or structure ends it.
   test('property: editedLineContinuation names the continuation of exactly the line written', () => {
-    const LINE = fc.constantFrom('', 'prose', 'more prose', 'A: 1', '**B:** 2', '| C | 3 |', '```', '- item', 'Zf');
+    const ENDS = ['', '**B:** 2', 'Status: ok', '| C | 3 |', '```', '- item'];
+    const CONTINUES = ['prose', 'more prose', 'A: 1', 'records and verified: all good', 'Zf'];
+    const LINE = fc.constantFrom(...ENDS, ...CONTINUES);
     const VALUE = fc.stringMatching(/^[a-z ]{0,6}$/);
     fc.assert(fc.property(fc.array(LINE, { maxLength: 6 }), fc.array(LINE, { maxLength: 6 }), VALUE, VALUE, fc.boolean(),
       (above, below, oldValue, newValue, crlf) => {
         const eol = crlf ? '\r\n' : '\n';
         const doc = (v) => [...above, `Zfield: ${v}`, ...below].join(eol);
-        const before = doc(oldValue);
-        const after = doc(newValue);
-        const expected = oldValue === newValue ? null : stateFieldContinuation(before, 'Zfield');
-        assert.equal(editedLineContinuation(before, after), expected);
+        const end = below.findIndex((line) => ENDS.includes(line));
+        const run = below.slice(0, end === -1 ? below.length : end);
+        const expected = oldValue === newValue || run.length === 0 ? null : run.join(' ');
+        assert.equal(editedLineContinuation(doc(oldValue), doc(newValue)), expected);
       },
     ));
+  });
+
+  test('a wrapped tail shaped like a label continues the value for the writer, and ends it for the validator', () => {
+    const doc = 'Stopped at: finished the migration of the old\nrecords and verified: all good\nResume file: None';
+    assert.equal(editedLineContinuation(doc, stateReplaceField(doc, 'Stopped at', 'new')), 'records and verified: all good');
+    assert.equal(stateFieldContinuation(doc, 'Stopped at'), null, 'the validator never reports a sibling as dropped text');
+    // A label STATE.md defines, and any bold label, are siblings for both.
+    for (const sibling of ['Resume file: None', 'last session: x', '**Phase 3.1 status:** ok', '**Note**: x']) {
+      const d = `Stopped at: old\n${sibling}`;
+      assert.equal(editedLineContinuation(d, stateReplaceField(d, 'Stopped at', 'new')), null, sibling);
+    }
   });
 });
 

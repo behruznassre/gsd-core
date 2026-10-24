@@ -4109,6 +4109,16 @@ describe('#4998 regression: readStateMilestoneScalar', () => {
     assert.strictEqual(readStateMilestoneScalar('---\nmilestone: { v: 1 }\n---\n'), '{ v: 1 }');
   });
 
+  // trek-e review 5638530738 (Minor 5): a frontmatter that parses and names no
+  // milestone names none — a `milestone:` line in the body (here, a fenced
+  // example) is not read in its place.
+  test('a parsed frontmatter with no milestone key names none, whatever the body holds', () => {
+    const state = '---\nstatus: executing\n---\n# State\n\n```yaml\nmilestone: v9.9\n```\n';
+    assert.strictEqual(readStateMilestoneScalar(state), null);
+    assert.strictEqual(readStateMilestoneScalar('---\nmilestone: v1.0\n---\n```\nmilestone: v9.9\n```\n'), 'v1.0');
+    assert.strictEqual(readStateMilestoneScalar('---\nstatus: [oops\n---\nmilestone: v2.0\n'), 'v2.0', 'unparseable: the legacy read');
+  });
+
   test('a trailing YAML comment is not part of the value', () => {
     assert.strictEqual(readStateMilestoneScalar('---\nmilestone: v1.0 # note\n---\n'), 'v1.0');
     assert.strictEqual(readStateMilestoneScalar('---\nmilestone: "v1.0" # note\n---\n'), 'v1.0');
@@ -4160,4 +4170,13 @@ describe('#4998 regression: milestone call sites read the decoded scalar', () =>
       assert.ok(primary.includes('Phase 2: New work') && !primary.includes('Phase 1: Old work'));
     });
   }
+
+  // trek-e review 5638530738 (Minor 5): `init milestone-op` returned v9.9 here.
+  test('a fenced milestone example below a frontmatter with no milestone key is never selected', () => {
+    writeRoadmap(tmpDir, `${ROADMAP}\n## v9.9 — Example\n\n- [ ] **Phase 9: Example**\n`);
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'),
+      '---\nstatus: executing\n---\n# State\n\n```yaml\nmilestone: v9.9\n```\n');
+    const info = getMilestoneInfo(tmpDir).value;
+    assert.notStrictEqual(info && info.version, 'v9.9');
+  });
 });

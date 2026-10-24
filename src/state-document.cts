@@ -14,6 +14,7 @@ import type { HeadingToken } from './markdown-sectionizer.cjs';
 import { escapeRegex } from './pattern.cjs';
 import { parsePlanningDoc, FIELD_LINE_BREAK_RE } from './planning-document.cjs';
 import { locateFrontmatterFence } from './frontmatter-fence.cjs';
+import { STATE_FIELD_SCHEMA } from './state-md-schema.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- planning-scope.cjs is an export= CommonJS module
 import planningScopeMod = require('./planning-scope.cjs');
 const { SCOPE } = planningScopeMod;
@@ -357,6 +358,31 @@ const SETEXT_UNDERLINE_RE = /^(?:=+|-+)\s*$/;
 // refuse a field that does not wrap.
 const STATE_SIBLING_FIELD_LINE_RE = /^ {0,3}\*{0,2}[A-Za-z][A-Za-z0-9 _.()/-]*\*{0,2}:{1,2}\*{0,2}(?:\s|$)/;
 
+/**
+ * #4998 review (trek-e 5638530738, Minor 2): the labels STATE.md defines —
+ * every body source the frontmatter sync reads, plus the session and position
+ * fields the template writes. Lower-cased.
+ */
+const STATE_FIELD_LABELS: ReadonlySet<string> = new Set([
+  ...Object.values(STATE_FIELD_SCHEMA).flatMap((row) => row.bodySource ?? []),
+  'Last session', 'Last Date', 'Resume file', 'Phase', 'Plan', 'Progress', 'Current focus',
+].map((label) => label.toLowerCase()));
+
+/**
+ * A plain `words: text` line below a field is a sibling field or a wrapped
+ * tail (`records and verified: all good`); its shape cannot tell which. A
+ * line is a sibling beyond doubt only when its label is bold or one STATE.md
+ * defines. Each caller resolves the ambiguous rest toward its own safe side:
+ * the record-session wrap check (`editedLineContinuation`) reads it as a
+ * continuation and leaves the field whole; the validator and the writer that
+ * removes a continuation (`fieldContinuationEnd`) end the value there, so a
+ * sibling is never deleted.
+ */
+function isUnambiguousSiblingLine(line: string): boolean {
+  const m = /^ {0,3}(\*\*)?([A-Za-z][A-Za-z0-9 _.()/-]*?)(?:\*\*)?:{1,2}(?:\*\*)?(?:\s|$)/.exec(line);
+  return m !== null && (m[1] !== undefined || STATE_FIELD_LABELS.has(m[2].trim().toLowerCase()));
+}
+
 // #4998: defined at the ADR-4910 seam (`planning-document.cts`) so its writers
 // and this module's refuse one line-break set; re-exported for existing callers.
 export { FIELD_LINE_BREAK_RE };
@@ -441,7 +467,7 @@ export function editedLineContinuation(before: string, after: string): string | 
   // it is a continuation, exactly as a following LF line is (Codex review round 3).
   const inner = line.search(FIELD_LINE_BREAK_RE);
   if (inner !== -1) return line.slice(inner + 1).split(FIELD_LINE_BREAK_RE).map((part) => part.trim()).join(' ').trim();
-  return lineEnd === -1 ? null : continuationAfter(before, lineEnd);
+  return lineEnd === -1 ? null : continuationAfter(before, lineEnd, false);
 }
 
 /**
@@ -579,7 +605,7 @@ export function readableBoldLabels(content: string): string {
 }
 
 /** The continuation lines following the line that ends at `afterValue`. */
-function continuationAfter(content: string, afterValue: number): string | null {
+function continuationAfter(content: string, afterValue: number, ambiguousLabelEnds = true): string | null {
   // JS `.` excludes \r as well as \n, so on a CRLF document the \r sits just
   // AFTER a `(.+)` match rather than inside it — hence the strip below before
   // testing for the newline.
@@ -589,7 +615,7 @@ function continuationAfter(content: string, afterValue: number): string | null {
   if (!/^[\n\u2028\u2029]/.test(rest)) return null; // end of file: nothing follows
 
   const lines = rest.slice(1).split(LINE_SEPARATOR_RE).map((line) => line.replace(/\r$/, ''));
-  const continuation = lines.slice(0, continuationLineCount(lines)).map((line) => line.trim());
+  const continuation = lines.slice(0, continuationLineCount(lines, ambiguousLabelEnds)).map((line) => line.trim());
   return continuation.length ? continuation.join(' ') : null;
 }
 
@@ -598,13 +624,15 @@ function continuationAfter(content: string, afterValue: number): string | null {
  * `stateFieldContinuation` reports on, shared so a writer that replaces the value removes exactly
  * the lines a validator would call its continuation (#4945). `lines` are CR-free.
  */
-function continuationLineCount(lines: readonly string[]): number {
+function continuationLineCount(lines: readonly string[], ambiguousLabelEnds = true): number {
   let count = 0;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!line.trim()) break;
     if (MD_STRUCTURE_LINE_RE.test(line)) break;
-    if (STATE_SIBLING_FIELD_LINE_RE.test(line)) break;
+    // A label line the shape cannot place is a sibling only where the caller
+    // fails safe that way (`isUnambiguousSiblingLine`).
+    if (STATE_SIBLING_FIELD_LINE_RE.test(line) && (ambiguousLabelEnds || isUnambiguousSiblingLine(line))) break;
     // Look ahead one line: a setext underline below makes THIS line a heading
     // title, so stop before consuming it rather than after.
     if (i + 1 < lines.length && SETEXT_UNDERLINE_RE.test(lines[i + 1])) break;
@@ -999,14 +1027,26 @@ export function stateReplaceFieldWithFallback(content: string, primary: string, 
  * are never the occurrence replaced (#4998, `writeOutsideFences`).
  */
 export function stateReplaceFieldInSession(content: string, primary: string, fallback: string | null | undefined, value: string): string {
-  const isSession = (h: HeadingToken): boolean => h.level === 2 && h.text.trim().toLowerCase() === 'session';
-  const isSessionContinuity = (h: HeadingToken): boolean => h.level === 2 && h.text.trim().toLowerCase() === 'session continuity';
-  const hasCanonicalSession = collectSection(content, isSession, { levelBounded: true }) !== null;
-  const target = hasCanonicalSession ? isSession : isSessionContinuity;
+  const hasCanonicalSession = collectSection(content, isSessionHeading, { levelBounded: true }) !== null;
+  const target = hasCanonicalSession ? isSessionHeading : isSessionContinuityHeading;
   // #4998: a fenced example line is never the field written, as the session
   // readers (state.cts sessionFieldScope) never read one.
   return withSection(content, target, (sectionBody) =>
     writeOutsideFences(sectionBody, (visible) => stateReplaceFieldWithFallback(visible, primary, fallback, value)) ?? sectionBody);
+}
+
+/**
+ * The two session headings, as every session reader and writer recognises
+ * them: one grammar (the `collectSection` tokenizer), so a heading the readers
+ * take is never one a writer misses. #4998 review: `state record-session`
+ * detected the section with its own regex, which rejected `##  Session`, and
+ * appended a duplicate section.
+ */
+export function isSessionHeading(h: HeadingToken): boolean {
+  return h.level === 2 && h.text.trim().toLowerCase() === 'session';
+}
+export function isSessionContinuityHeading(h: HeadingToken): boolean {
+  return h.level === 2 && h.text.trim().toLowerCase() === 'session continuity';
 }
 
 /**
