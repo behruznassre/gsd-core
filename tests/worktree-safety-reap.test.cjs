@@ -1604,7 +1604,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     fs.mkdirSync(locked);
     fs.writeFileSync(path.join(locked, 'kept.txt'), 'kept\n');
     const mode = fs.statSync(locked).mode;
-    fs.chmodSync(locked, 0o555);
+    fs.chmodSync(locked, mode & ~0o222); // no write bits: its entries cannot be unlinked
     let json;
     let err;
     try {
