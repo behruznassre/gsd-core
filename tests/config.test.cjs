@@ -4120,3 +4120,33 @@ describe('#5681 regression: config-save-defaults merges into the global defaults
     assert.ok(!fs.existsSync(defaultsPath));
   });
 });
+
+describe('#5681 regression: a saved setting replaces its legacy flat or nested twin', () => {
+  // Merging kept both spellings of a setting, and the stale one won: the loader
+  // reads a flat key first, and new-project creation keeps a nested value over a
+  // flat one. Each row follows the save through config-new-project and loadConfig.
+  const { loadConfig } = require('../gsd-core/bin/lib/config-loader.cjs');
+  function newProjectAfterSave(t, defaults, settings) {
+    const gsdHome = createTempDir('gsd-5681-home-');
+    const projectDir = createTempDir('gsd-5681-proj-');
+    t.after(() => { cleanup(gsdHome); cleanup(projectDir); });
+    fs.mkdirSync(path.join(gsdHome, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(gsdHome, '.gsd', 'defaults.json'), JSON.stringify(defaults));
+    const env = { GSD_HOME: gsdHome };
+    const saved = runGsdTools(['config-save-defaults', JSON.stringify(settings)], projectDir, env);
+    assert.ok(saved.success, saved.error);
+    const created = runGsdTools(['config-new-project', '{}'], projectDir, env);
+    assert.ok(created.success, created.error);
+    return loadConfig(projectDir);
+  }
+
+  test('turning research off wins over a stale flat research: true', (t) => {
+    const config = newProjectAfterSave(t, { research: true }, { workflow: { research: false } });
+    assert.strictEqual(config.research, false);
+  });
+
+  test('a flat branching_strategy wins over a stale nested git.branching_strategy', (t) => {
+    const config = newProjectAfterSave(t, { git: { branching_strategy: 'phase' } }, { branching_strategy: 'none' });
+    assert.strictEqual(config.branching_strategy, 'none');
+  });
+});

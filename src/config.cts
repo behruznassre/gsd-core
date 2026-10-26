@@ -752,6 +752,53 @@ const MACHINE_DETECTED_KEYS: readonly string[] = [
   'brave_search', 'firecrawl', 'exa_search', 'tavily_search', 'ref_search', 'perplexity', 'jina',
 ];
 
+/**
+ * The legacy flat spellings the config loader still reads, each with the nested
+ * key it falls back to (`get(flat, { section, field })` in config-loader). A
+ * saved setting must drop its other spelling from the store, or the stale one
+ * keeps winning: the loader reads flat first, and new-project creation keeps a
+ * nested value over a flat one. Keep it in step with those get() calls.
+ */
+const LEGACY_FLAT_KEYS: Readonly<Record<string, string>> = {
+  _auto_chain_active: 'workflow._auto_chain_active',
+  auto_advance: 'workflow.auto_advance',
+  base_branch: 'git.base_branch',
+  branching_strategy: 'git.branching_strategy',
+  commit_docs: 'planning.commit_docs',
+  max_prompt_tokens: 'review.max_prompt_tokens',
+  milestone_branch_template: 'git.milestone_branch_template',
+  mvp_mode: 'workflow.mvp_mode',
+  nyquist_validation: 'workflow.nyquist_validation',
+  phase_branch_template: 'git.phase_branch_template',
+  plan_checker: 'workflow.plan_check',
+  post_planning_gaps: 'workflow.post_planning_gaps',
+  pr_strict: 'planning.pr_strict',
+  quick_branch_template: 'git.quick_branch_template',
+  research: 'workflow.research',
+  search_gitignored: 'planning.search_gitignored',
+  sub_repos: 'planning.sub_repos',
+  subagent_timeout: 'workflow.subagent_timeout',
+  text_mode: 'workflow.text_mode',
+  verifier: 'workflow.verifier',
+};
+
+/** Remove from `store` the other spelling of every legacy-aliased key `patch` sets. */
+function dropShadowedSpellings(store: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...store };
+  for (const [flat, nested] of Object.entries(LEGACY_FLAT_KEYS)) {
+    const [section, field] = nested.split('.');
+    const patchSection = patch[section];
+    if (isPlainObject(patchSection) && patchSection[field] !== undefined) delete result[flat];
+    const storeSection = result[section];
+    if (patch[flat] !== undefined && isPlainObject(storeSection) && field in storeSection) {
+      const rest = { ...storeSection };
+      delete rest[field];
+      result[section] = rest;
+    }
+  }
+  return result;
+}
+
 /** Deep-merge `patch` into `base`: objects merge key by key, anything else replaces. */
 function mergeDefaults(base: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
   const merged: Record<string, unknown> = { ...base };
@@ -767,7 +814,8 @@ function mergeDefaults(base: Record<string, unknown>, patch: Record<string, unkn
  * Save settings as global defaults (#5681): merge them into
  * `$GSD_HOME/.gsd/defaults.json` instead of replacing the file, so keys the
  * settings flow does not manage (`model_overrides`, `effort`, `runtime`,
- * `resolve_model_ids`, unlisted `workflow` keys …) survive. A missing file is
+ * `resolve_model_ids`, unlisted `workflow` keys …) survive. A saved setting
+ * replaces its legacy flat or nested twin (LEGACY_FLAT_KEYS). A missing file is
  * created; an unreadable or non-object one is refused rather than overwritten.
  */
 function cmdConfigSaveDefaults(settingsJson: string | undefined, raw: boolean): void {
@@ -800,7 +848,7 @@ function cmdConfigSaveDefaults(settingsJson: string | undefined, raw: boolean): 
   }
 
   try {
-    platformWriteSync(defaultsPath, JSON.stringify(mergeDefaults(existing, patch), null, 2) + '\n');
+    platformWriteSync(defaultsPath, JSON.stringify(mergeDefaults(dropShadowedSpellings(existing, patch), patch), null, 2) + '\n');
   } catch (err) {
     error('Failed to write defaults.json: ' + (err as Error).message);
   }

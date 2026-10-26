@@ -660,7 +660,9 @@ it is not reported when the config already exists.
 It merges one JSON object into `$GSD_HOME/.gsd/defaults.json` (`~/.gsd/defaults.json` unless
 `GSD_HOME` is set): sections merge key by key and any other value replaces, so keys the settings
 flow does not manage (`model_overrides`, `effort`, `runtime`, `resolve_model_ids`, unlisted
-`workflow` keys) survive a save. A missing file is created. The search flags that new projects
+`workflow` keys) survive a save. A saved setting also removes its other spelling, so a legacy
+flat key (`research`, `branching_strategy`, …) and its nested key (`workflow.research`,
+`git.branching_strategy`) cannot disagree and leave the old value winning. A missing file is created. The search flags that new projects
 detect from this machine (`brave_search`, `firecrawl`, `exa_search`, `tavily_search`,
 `ref_search`, `perplexity`, `jina`) are never copied. A store that is not valid JSON, or not a
 JSON object, is refused and left as it was.
