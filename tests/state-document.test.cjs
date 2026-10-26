@@ -2783,6 +2783,18 @@ describe('#4998 review round: single-line writes, colon-outside reads, continuat
       assert.equal(stateFieldContinuation(`F: a\n${pad}G: b`, 'F'), null);
     });
   }
+  // A heading opens with up to three leading spaces too (Codex whole-PR review): an
+  // indented ` ## Notes` directly below a field is the next construct, not a wrapped tail.
+  for (const indent of [0, 1, 3, 4]) {
+    const pad = ' '.repeat(indent);
+    test(`a heading indented ${indent} is not a continuation`, () => {
+      assert.equal(stateFieldContinuation(`F: a\n${pad}## Notes\nx`, 'F'), null);
+      assert.equal(editedLineContinuation('F: a\n' + pad + '## Notes', 'F: b\n' + pad + '## Notes'), null);
+    });
+  }
+  test('an indented line that only starts with a hash is still a continuation', () => {
+    assert.equal(stateFieldContinuation('F: a\n  #hashtag tail', 'F'), '#hashtag tail');
+  });
   test('an indented bullet below a field stays its continuation', () => {
     assert.equal(stateFieldContinuation('F: a\n  - note', 'F'), '- note');
   });

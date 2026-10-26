@@ -23803,3 +23803,28 @@ describe('begin-phase respects fences and U+2028 line breaks (#5460)', () => {
     assert.match(after, /^Phase: 2 \(Two\) — EXECUTING$/m);
   });
 });
+
+describe('#4998 record-session: an indented heading below a session field is the next construct, not its continuation', () => {
+  let tmpDir;
+  beforeEach(() => { tmpDir = createTempProject(); });
+  afterEach(() => { cleanup(tmpDir); });
+
+  for (const indent of [0, 1, 3]) {
+    test(`a heading indented ${indent} does not make record-session skip the field above it`, () => {
+      const pad = ' '.repeat(indent);
+      const statePath = path.join(tmpDir, '.planning', 'STATE.md');
+      fs.writeFileSync(statePath, [
+        '# Project State', '', '## Session', '',
+        'Stopped at: before', `${pad}## Notes`, 'Resume file: None', '',
+      ].join('\n'));
+      const r = runGsdTools(['state', 'record-session', '--stopped-at', 'after'], tmpDir);
+      assert.strictEqual(r.success, true, r.error);
+      const out = JSON.parse(r.output);
+      assert.ok(out.updated.includes('Stopped At'), `Stopped At must be written; got ${r.output}`);
+      assert.strictEqual(out.skipped, undefined, `nothing may be skipped; got ${r.output}`);
+      const after = fs.readFileSync(statePath, 'utf-8');
+      assert.match(after, /^Stopped at: after$/m);
+      assert.ok(after.includes(`\n${pad}## Notes\n`), 'the heading is left in place');
+    });
+  }
+});
