@@ -19,6 +19,7 @@ const { ExitError } = cliExitMod;
 import configLoader = require('./config-loader.cjs');
 const { CONFIG_DEFAULTS, resolvePlannerStallDetectionEnabled } = configLoader;
 import { platformWriteSync, platformEnsureDir } from './shell-command-projection.cjs';
+import { resolveGsdHome } from './runtime-homes.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import planningWorkspace = require('./planning-workspace.cjs');
 const { planningDir, planningRoot, resolveEnvWorkstream, withPlanningLock } = planningWorkspace;
@@ -740,6 +741,70 @@ function cmdConfigNewProject(cwd: string, choicesJson: string | undefined, raw: 
   // creation that fails before here leaves the defaults file as it was.
   persistDefaultsRewrite(plan);
   output({ created: true, path: '.planning/config.json' }, raw, 'created');
+}
+
+/**
+ * Search-integration flags `planNewProjectConfig` detects from this machine's
+ * API keys. A saved default would override that detection in every new
+ * project, so `config-save-defaults` never copies them to the global store.
+ */
+const MACHINE_DETECTED_KEYS: readonly string[] = [
+  'brave_search', 'firecrawl', 'exa_search', 'tavily_search', 'ref_search', 'perplexity', 'jina',
+];
+
+/** Deep-merge `patch` into `base`: objects merge key by key, anything else replaces. */
+function mergeDefaults(base: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(patch)) {
+    merged[key] = isPlainObject(value) && isPlainObject(merged[key])
+      ? mergeDefaults(merged[key], value)
+      : value;
+  }
+  return merged;
+}
+
+/**
+ * Save settings as global defaults (#5681): merge them into
+ * `$GSD_HOME/.gsd/defaults.json` instead of replacing the file, so keys the
+ * settings flow does not manage (`model_overrides`, `effort`, `runtime`,
+ * `resolve_model_ids`, unlisted `workflow` keys …) survive. A missing file is
+ * created; an unreadable or non-object one is refused rather than overwritten.
+ */
+function cmdConfigSaveDefaults(settingsJson: string | undefined, raw: boolean): void {
+  let settings: unknown;
+  try {
+    settings = JSON.parse(settingsJson ?? '');
+  } catch (err) {
+    error('Invalid JSON for config-save-defaults: ' + (err as Error).message, ERROR_REASON.USAGE);
+  }
+  if (!isPlainObject(settings)) {
+    error('Invalid settings for config-save-defaults: expected a JSON object of config keys.', ERROR_REASON.USAGE);
+  }
+  const patch: Record<string, unknown> = { ...(settings as Record<string, unknown>) };
+  for (const key of MACHINE_DETECTED_KEYS) delete patch[key];
+
+  const defaultsPath = path.join(resolveGsdHome(), '.gsd', 'defaults.json');
+  let existing: Record<string, unknown> = {};
+  const created = !fs.existsSync(defaultsPath);
+  if (!created) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(defaultsPath, 'utf-8'));
+    } catch (err) {
+      error(`Refusing to overwrite ${defaultsPath}: it is not valid JSON (${(err as Error).message}). Fix or remove it, then save again.`);
+    }
+    if (!isPlainObject(parsed)) {
+      error(`Refusing to overwrite ${defaultsPath}: it does not hold a JSON object. Fix or remove it, then save again.`);
+    }
+    existing = parsed as Record<string, unknown>;
+  }
+
+  try {
+    platformWriteSync(defaultsPath, JSON.stringify(mergeDefaults(existing, patch), null, 2) + '\n');
+  } catch (err) {
+    error('Failed to write defaults.json: ' + (err as Error).message);
+  }
+  output({ saved: true, created, path: defaultsPath }, raw, 'saved');
 }
 
 /**
@@ -1736,6 +1801,7 @@ export = {
   cmdConfigGet,
   cmdConfigSetModelProfile,
   cmdConfigNewProject,
+  cmdConfigSaveDefaults,
   cmdConfigPath,
   cmdMigrateConfig,
   // Exported for programmatic use by capability-writer and tests

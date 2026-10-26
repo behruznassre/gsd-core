@@ -373,10 +373,13 @@ describe('loadConfig ~/.gsd/defaults.json fallback (#1683)', () => {
     const read = (name) => fs.readFileSync(path.join(ROOT, 'gsd-core', 'workflows', name), 'utf-8');
     const STORE = '${GSD_HOME:-$HOME}/.gsd/defaults.json';
 
-    test('settings.md writes the saved defaults to the GSD_HOME store, not a literal ~/.gsd path, in its shell steps', () => {
+    // #5681: the save goes through config-save-defaults, which resolves the
+    // store with resolveGsdHome; the workflow no longer writes the file itself.
+    test('settings.md saves the defaults through config-save-defaults and names the GSD_HOME store', () => {
       const text = read('settings.md');
-      assert.ok(text.includes('mkdir -p "${GSD_HOME:-$HOME}/.gsd"'), 'the mkdir must target the resolved store root');
-      assert.ok(text.includes(STORE), 'the write instruction must name the resolved store path');
+      assert.ok(text.includes('gsd_run query config-save-defaults "$DEFAULTS_JSON"'), 'the save must go through the merging command');
+      assert.ok(!text.includes(`Write \`${STORE}\` with`), 'the workflow must not hand-write the store, which replaced it');
+      assert.ok(text.includes(STORE), 'the step must still name the resolved store path');
     });
 
     test('new-project.md reads the saved defaults from the GSD_HOME store', () => {

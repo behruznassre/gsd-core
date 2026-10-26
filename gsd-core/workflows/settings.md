@@ -568,13 +568,13 @@ AskUserQuestion([
 ])
 ```
 
-If "Yes": write the same config object (minus project-specific fields like `brave_search`) to the global defaults store, `${GSD_HOME:-$HOME}/.gsd/defaults.json` (`~/.gsd/defaults.json` unless `GSD_HOME` is set):
+If "Yes": merge these settings into the global defaults store, `${GSD_HOME:-$HOME}/.gsd/defaults.json` (`~/.gsd/defaults.json` unless `GSD_HOME` is set). Do not write the file yourself: `config-save-defaults` merges, so keys this flow does not manage (`model_overrides`, `effort`, `runtime`, `resolve_model_ids`, `workflow` keys not listed below) survive, and it never copies machine-detected fields like `brave_search` (#5681).
 
 ```bash
-mkdir -p "${GSD_HOME:-$HOME}/.gsd"
+gsd_run query config-save-defaults "$DEFAULTS_JSON"
 ```
 
-Write `${GSD_HOME:-$HOME}/.gsd/defaults.json` with:
+where `$DEFAULTS_JSON` is this object, with the current values:
 ```json
 {
   "mode": <current>,

@@ -4048,3 +4048,75 @@ describe('config-new-project: choices are held to config-set leaf by leaf (#5268
     );
   });
 });
+
+describe('#5681 regression: config-save-defaults merges into the global defaults store', () => {
+  // The settings workflow's "save as global defaults" step wrote a fixed object,
+  // so every key only the defaults file carried was deleted, and the next install
+  // re-baked the agents without those overrides.
+  function store(t, contents) {
+    const gsdHome = createTempDir('gsd-5681-home-');
+    t.after(() => cleanup(gsdHome));
+    const defaultsPath = path.join(gsdHome, '.gsd', 'defaults.json');
+    if (contents !== undefined) {
+      fs.mkdirSync(path.dirname(defaultsPath), { recursive: true });
+      fs.writeFileSync(defaultsPath, contents);
+    }
+    const save = (settings) => runGsdTools(['config-save-defaults', JSON.stringify(settings)], gsdHome, { GSD_HOME: gsdHome });
+    const read = () => JSON.parse(fs.readFileSync(defaultsPath, 'utf-8'));
+    return { defaultsPath, save, read };
+  }
+
+  test('keys the settings flow does not manage survive a save; the chosen settings are updated', (t) => {
+    const { save, read } = store(t, JSON.stringify({
+      model_profile: 'quality',
+      model_overrides: { 'gsd-codebase-mapper': 'opus' },
+      effort: { agent_overrides: { 'gsd-codebase-mapper': 'high' } },
+      runtime: 'codex',
+      resolve_model_ids: 'omit',
+      workflow: { research: true, unlisted_toggle: true },
+    }));
+    const result = save({ model_profile: 'balanced', workflow: { research: false, plan_check: true } });
+    assert.ok(result.success, result.error);
+    assert.deepStrictEqual(read(), {
+      model_profile: 'balanced',
+      model_overrides: { 'gsd-codebase-mapper': 'opus' },
+      effort: { agent_overrides: { 'gsd-codebase-mapper': 'high' } },
+      runtime: 'codex',
+      resolve_model_ids: 'omit',
+      workflow: { research: false, unlisted_toggle: true, plan_check: true },
+    });
+  });
+
+  test('a missing store is created with the saved settings', (t) => {
+    const { save, read } = store(t);
+    const result = save({ mode: 'yolo', workflow: { verifier: true } });
+    assert.ok(result.success, result.error);
+    assert.strictEqual(JSON.parse(result.output).created, true);
+    assert.deepStrictEqual(read(), { mode: 'yolo', workflow: { verifier: true } });
+  });
+
+  test('machine-detected search flags are not copied to the global store', (t) => {
+    const { save, read } = store(t, JSON.stringify({ mode: 'yolo' }));
+    const result = save({ model_profile: 'quality', brave_search: true, firecrawl: true, exa_search: true, tavily_search: true, ref_search: true, perplexity: true, jina: true });
+    assert.ok(result.success, result.error);
+    assert.deepStrictEqual(read(), { mode: 'yolo', model_profile: 'quality' });
+  });
+
+  for (const [label, contents] of [['not valid JSON', '{"model_profile": "quality",'], ['not a JSON object', '["quality"]']]) {
+    test(`a store that is ${label} is refused and left byte-identical`, (t) => {
+      const { defaultsPath, save } = store(t, contents);
+      const result = save({ model_profile: 'balanced' });
+      assert.strictEqual(result.success, false);
+      assert.match(result.error, /Refusing to overwrite/);
+      assert.strictEqual(fs.readFileSync(defaultsPath, 'utf-8'), contents);
+    });
+  }
+
+  test('settings that are not a JSON object are refused before the store is touched', (t) => {
+    const { defaultsPath, save } = store(t);
+    const result = save(['model_profile']);
+    assert.strictEqual(result.success, false);
+    assert.match(result.error, /expected a JSON object/);
+    assert.ok(!fs.existsSync(defaultsPath));
+  });
+});
