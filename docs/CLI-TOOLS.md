@@ -1208,10 +1208,13 @@ if [[ "$INIT" == @file:* ]]; then INIT=$(cat "${INIT#@file:}"); fi
 
 ```bash
 # Archive milestone
-node gsd-tools.cjs milestone complete <version> (--confirm | --dry-run) [--name <name>] [--no-archive-phases] [--force] [--archive-quick]
+node gsd-tools.cjs milestone complete <version> (--confirm | --dry-run) [--name <name>] [--no-archive-phases] [--force] [--archive-quick] [--release-map <file>]
 
 # Archive .planning/quick/* into milestones/<version>-quick/ WITHOUT the milestone complete close-out (#2142)
 node gsd-tools.cjs milestone archive-quick <version> [--dry-run]
+
+# Preflight, then create annotated release tags per sub-repo (#5705)
+node gsd-tools.cjs milestone release-tags --map <file.json> [--dry-run]
 
 # Mark requirements as complete
 node gsd-tools.cjs requirements mark-complete <ids>
@@ -1227,8 +1230,9 @@ node gsd-tools.cjs requirements mark-complete <ids>
 | `--name <name>` | Display name for the MILESTONES.md entry. Defaults to `<version>`. |
 | `--no-archive-phases` | Leave phase directories in place instead of moving them into `.planning/milestones/<version>-phases/`. |
 | `--archive-quick` | Opt-in (default OFF, #2142): also move every directory under `.planning/quick/` into `.planning/milestones/<version>-quick/`, (re)write that archive directory's `README.md` index, and clear STATE.md's `### Quick Tasks Completed` table rows. See "`milestone archive-quick`" below for the narrower standalone form and the full behavior. |
+| `--release-map <file>` | Opt-in (#5706): archive a per-repository release map. `<file>` is a JSON array of `{ repo, release, reference, environment, status, tag }` entries (fields and limits in [Per-repository release mapping](CONFIGURATION.md#per-repository-release-mapping)). The map is validated before anything is written; any problem fails the command with every error listed and changes nothing. On success the map is written to `.planning/milestones/<version>-RELEASE-MAP.json`, a `**Release mapping:**` table is added to the MILESTONES.md entry, and the JSON result carries `release_map: { path, entries }`. The file must be a regular file of at most 1 MiB. A later run for the same version never overwrites an archived map that differs. Without the flag, output and files are unchanged. |
 | `--force` | Override the unstarted-phase guard (see below). |
-| `--dry-run` | Print the archive plan (roadmap, requirements, phases, and — when `--archive-quick` is also passed — quick-task dirs to move) without mutating anything. |
+| `--dry-run` | Print the archive plan (roadmap, requirements, phases, and — when `--archive-quick` is also passed — quick-task dirs to move) without mutating anything. With `--release-map`, the map is validated and reported under `would_archive.release_map`. |
 
 **Unstarted-phase guard.** Before archiving, the command scans the ROADMAP scoped for `<version>` and refuses if any `### Phase N:` heading in that slice has no matching phase directory on disk (`disk_status: no_directory`). Phase 0 (pre-milestone) and Phase 999 (backlog) sentinels are excluded. The guard runs whenever `--force` is absent, independent of `STATE.md`'s `milestone:` field — if that field is present but does not match `<version>`, a WARNING naming both values is emitted to stderr and the scan still runs (#2946). Pass `--force --confirm` to override (`--confirm` is required for any mutating run — #3726; `--force` alone does not imply it).
 
@@ -1246,6 +1250,16 @@ A narrower sibling of `milestone complete --archive-quick`, for callers that nee
 It moves every directory under `.planning/quick/` into `.planning/milestones/<version>-quick/`, (re)writes that archive directory's `README.md` index, and clears STATE.md's `### Quick Tasks Completed` table rows — the same move/index/reset logic `milestone complete --archive-quick` uses. Unlike `milestone complete`, it never archives `ROADMAP.md`/`REQUIREMENTS.md`, never writes a `MILESTONES.md` entry, and runs neither the unstarted-phase guard nor the milestone-window refusal — so, unlike `milestone complete --archive-quick`, it can be safely re-run against an already-completed milestone. JSON result: `{ version, archived, entries, archive_dir, state_updated, warnings }`.
 
 `milestone archive-quick` is a second subcommand of `milestone` (alongside `complete`) — it is not a separate top-level command.
+
+**`milestone release-tags` (#5705)**
+
+Creates one annotated git tag per repository listed in `sub_repos`. `--map` points at a JSON file (at most 1 MiB) holding an array of at most 256 entries (`skip` entries count toward the limit): `{ "repo": "api", "tag": "v1.2.0", "ref": "HEAD", "message": "...", "skip": false }`. `repo` must be listed in `sub_repos` (a leading `./` and trailing `/` are ignored; absolute paths, `..` segments and backslash variants are rejected). `ref` defaults to `HEAD`; `message` defaults to the tag name; `skip: true` reports the repo as skipped without touching it.
+
+Every entry is validated before the first tag is written, so a predictable failure creates nothing anywhere. A tag that already exists at the requested commit is reported `already_tagged` (re-running the same map is safe); a tag at a different commit is a `tag_conflict` and is never overwritten. `--dry-run` runs the validation only and reports `would_create`. Nothing is pushed.
+
+Tag creation is not transactional across repositories. If a write fails after earlier ones succeeded, the remaining repositories are still attempted, `created` lists every `repo:tag` already written, and the command exits non-zero; re-run the same map to retry only the failed ones.
+
+JSON result: `{ ok, phase, repos, created, errors }`. `phase` is `preflight` (validation failed), `dry_run` or `apply`. `repos` is keyed by repo path (`repo:tag` when one repo receives two tags); each value has `status` (`created`, `already_tagged`, `skipped`, `would_create`, `failed`, `error`) plus `tag`, `commit`, and on failure `reason`, `error`, `existing_commit`, `requested_commit`. Reason codes: `no_sub_repos`, `invalid_request`, `too_many_entries`, `repo_not_configured`, `repo_path_invalid`, `repo_missing`, `not_a_git_repo`, `tag_invalid`, `ref_unresolved`, `tag_conflict`, `duplicate_entry`, `git_timeout`, `tag_create_failed`.
 
 ---
 
