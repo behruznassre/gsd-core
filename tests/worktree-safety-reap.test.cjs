@@ -1217,34 +1217,42 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   // Codex review round 2: git told about ANOTHER repository (inherited
   // GIT_DIR / GIT_WORK_TREE, or core.worktree) while the filesystem sweep
   // stayed on this checkout, so the other repository's empty index and its
-  // branch removed this checkout's tracked work. The sweep now refuses unless
-  // the top's own `.git` leads to the git dir git is using.
-  test('an inherited GIT_DIR naming another repository sweeps nothing (git_mismatch)', () => {
-    const repoDir = path.join(tmpBase, 'repo-gitdir');
-    const notes = trackedNotes(repoDir);
-    const donor = path.join(tmpBase, 'donor');
-    initRepo(donor);
-    git(['branch', 'worktree-agent-notes'], donor);
-    const { results, scan } = withEnv({ GIT_DIR: path.join(donor, '.git'), GIT_WORK_TREE: undefined },
+  // branch removed this checkout's tracked work. Since #5548 every execGit
+  // spawn drops the inherited variables, so git answers about this checkout
+  // and its own index keeps the notes. A core.worktree is config, not env, so
+  // the sweep still refuses unless the top's own `.git` leads to the git dir
+  // git is using.
+  for (const [label, redirect] of [
+    ['an inherited GIT_DIR naming another repository', (repoDir, donor) => ({ GIT_DIR: path.join(donor, '.git'), GIT_WORK_TREE: undefined })],
+    ['an inherited GIT_WORK_TREE naming a nested directory', (repoDir) => ({ GIT_DIR: undefined, GIT_WORK_TREE: path.join(repoDir, 'nested') })],
+  ]) {
+    test(`${label} is dropped, so this checkout's own index keeps its tracked work`, () => {
+      const repoDir = path.join(tmpBase, `repo-env-${label.split(' ')[2]}`);
+      const notes = trackedNotes(repoDir);
+      fs.mkdirSync(path.join(repoDir, 'nested'));
+      const donor = path.join(tmpBase, `donor-${label.split(' ')[2]}`);
+      initRepo(donor);
+      git(['branch', 'worktree-agent-notes'], donor);
+      const { results, scan } = withEnv(redirect(repoDir, donor),
+        () => reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps()));
+      assert.strictEqual(scan.residue_dir, 'scanned');
+      const row = onlyRow(results);
+      assert.deepStrictEqual({ status: row.status, reason: row.reason }, { status: 'skipped', reason: 'residue_tracked' });
+      assert.strictEqual(fs.readFileSync(path.join(notes, 'notes'), 'utf8'), 'uncommitted edit\n');
+    });
+  }
+
+  test('core.worktree naming a nested directory sweeps nothing (git_mismatch)', () => {
+    const repoDir = path.join(tmpBase, 'repo-wt-config');
+    const notes = trackedNotes(repoDir, 'nested');
+    const nested = path.join(repoDir, 'nested');
+    git(['config', 'core.worktree', nested], repoDir);
+    const { results, scan } = withEnv({ GIT_DIR: undefined, GIT_WORK_TREE: undefined },
       () => reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps()));
     assert.ok(!results.some((r) => r.status === 'reaped'), JSON.stringify(results));
     assert.strictEqual(scan.residue_dir, 'git_mismatch');
     assert.strictEqual(fs.readFileSync(path.join(notes, 'notes'), 'utf8'), 'uncommitted edit\n');
   });
-
-  for (const [label, how] of [['an inherited GIT_WORK_TREE', 'env'], ['core.worktree', 'config']]) {
-    test(`${label} naming a nested directory sweeps nothing (git_mismatch)`, () => {
-      const repoDir = path.join(tmpBase, `repo-wt-${how}`);
-      const notes = trackedNotes(repoDir, 'nested');
-      const nested = path.join(repoDir, 'nested');
-      if (how === 'config') git(['config', 'core.worktree', nested], repoDir);
-      const { results, scan } = withEnv({ GIT_DIR: undefined, GIT_WORK_TREE: how === 'env' ? nested : undefined },
-        () => reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps()));
-      assert.ok(!results.some((r) => r.status === 'reaped'), JSON.stringify(results));
-      assert.strictEqual(scan.residue_dir, 'git_mismatch');
-      assert.strictEqual(fs.readFileSync(path.join(notes, 'notes'), 'utf8'), 'uncommitted edit\n');
-    });
-  }
 
   test('when git cannot say what it tracks, nothing is removed (fail closed)', () => {
     const { repoDir, residue } = repoWithResidue('lsfail');
