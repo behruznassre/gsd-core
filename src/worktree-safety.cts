@@ -3168,10 +3168,13 @@ function findUnregisteredResidue(
  * #4941 review: whether a residue holds work git does not have, by the standard
  * `git worktree remove` applies without `--force`: compared with a harness
  * branch's tip, a modified, deleted or untracked (not ignored) file is work,
- * and so is any untracked `.gitignore`, which decides what counts as ignored. `false` when the directory matches at least one branch tip —
- * everything in it is then committed or ignored, so removing it loses nothing
- * git cannot restore; `true` when it matches none; `null` when git could not
- * answer for any branch. Each comparison reads the tip into a throwaway index,
+ * and so is any untracked `.gitignore`, which decides what counts as ignored,
+ * and any content at a submodule (gitlink) path, which git does not look
+ * into without the submodule's `.git`. `false` when the directory matches at
+ * least one branch tip — everything in it is then committed, or ignored and
+ * so disposable by git's own standard (git cannot restore ignored files);
+ * `true` when it matches none; `null` when git could not answer for any
+ * branch. Each comparison reads the tip into a throwaway index,
  * so neither the checkout's index nor the directory is touched.
  */
 function residueHoldsWork(
@@ -3198,14 +3201,28 @@ function residueHoldsWork(
       // An untracked `.gitignore` decides what the line above calls ignored —
       // one holding `*` would hide everything, itself included — so any is work.
       const ignoreFiles = execGit([...repo, 'ls-files', '-z', '--others', '--', ':(glob,icase)**/.gitignore'], { cwd: dir, env });
-      if (!gitResultOk(changed) || !gitResultOk(untracked) || !gitResultOk(ignoreFiles)) continue;
+      // A gitlink's directory is skipped by both listings above, so files at
+      // one — a submodule whose `.git` was lost with the worktree's — are
+      // invisible to them: anything there is work (Codex review).
+      const staged = execGit([...repo, 'ls-files', '-s', '-z'], { cwd: dir, env });
+      if (!gitResultOk(changed) || !gitResultOk(untracked) || !gitResultOk(ignoreFiles) || !gitResultOk(staged)) continue;
+      const atGitlink = String(staged.stdout).split('\0').some((entry) => {
+        const m = /^160000 [0-9a-f]+ \d+\t(.+)$/su.exec(entry);
+        if (!m) return false;
+        const held = lstatState(path.join(dir, m[1]));
+        return held === 'unreadable' || (held !== 'absent' && (!held.isDirectory() || (readDirOrNull(path.join(dir, m[1]))?.length ?? 1) > 0));
+      });
       answered = true;
       if (String(changed.stdout).length === 0 && String(untracked.stdout).length === 0
-          && String(ignoreFiles.stdout).length === 0) return false;
+          && String(ignoreFiles.stdout).length === 0 && !atGitlink) return false;
     } catch {
       // No scratch index: this branch cannot be compared.
     } finally {
-      if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
+      // A scratch index left behind must not abort the sweep and lose the
+      // report of what it already removed (Codex review).
+      if (scratch) {
+        try { fs.rmSync(scratch, { recursive: true, force: true }); } catch { /* left in the temp dir */ }
+      }
     }
   }
   return answered ? true : null;
@@ -3258,6 +3275,10 @@ function repositoryInside(
     }
   }
   return { verdict: 'none', newestMs };
+}
+
+function readDirOrNull(p: string): string[] | null {
+  try { return fs.readdirSync(p); } catch { return null; }
 }
 
 function defaultEntryMtimeSafe(p: string): Date | null {

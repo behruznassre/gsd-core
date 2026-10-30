@@ -2416,6 +2416,23 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(fs.existsSync(path.join(residue, 'sub', 'notes.txt')));
   });
 
+  // Codex review: git does not look inside a gitlink's directory without the
+  // submodule's `.git`, so neither listing saw files there and they were removed.
+  test('content at a submodule (gitlink) path is work: the residue is kept', () => {
+    const repoDir = path.join(tmpBase, 'repo-gitlink');
+    initRepo(repoDir);
+    const head = git(['rev-parse', 'HEAD'], repoDir).trim();
+    git(['update-index', '--add', '--cacheinfo', `160000,${head},vendor/lib`], repoDir);
+    git(['commit', '-m', 'add a gitlink'], repoDir);
+    const residue = makeResidue(repoDir, 'agent-a00000c1');
+    git(['worktree', 'prune'], repoDir);
+    fs.mkdirSync(path.join(residue, 'vendor', 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(residue, 'vendor', 'lib', 'precious.txt'), 'unique\n');
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_has_work']);
+    assert.strictEqual(fs.readFileSync(path.join(residue, 'vendor', 'lib', 'precious.txt'), 'utf8'), 'unique\n');
+  });
+
   test('an ignored file does not count as work: the residue is removed', () => {
     const repoDir = path.join(tmpBase, 'repo-ignored');
     initRepo(repoDir);
