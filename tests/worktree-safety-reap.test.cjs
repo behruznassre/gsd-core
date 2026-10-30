@@ -171,7 +171,7 @@ function makeFixture(tmpBase, name, options = {}) {
 
 /** Deps every "owner is dead, lock is stale" test shares. */
 function deadOwnerDeps(extra = {}) {
-  return { isPidAlive: () => false, mtimeSafe: () => STALE_MTIME, ctimeSafe: () => STALE_MTIME, ...extra };
+  return { isPidAlive: () => false, mtimeSafe: () => STALE_MTIME, ctimeSafe: () => STALE_MTIME, entryMtimeSafe: () => STALE_MTIME, ...extra };
 }
 
 /** Assert exactly one result row, and return it. */
@@ -1032,12 +1032,21 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     return dir;
   }
 
-  function repoWithResidue(name, residueName = 'agent-t1') {
+  function repoWithResidue(name, residueName = 'agent-a0000001') {
     const repoDir = path.join(tmpBase, `repo-${name}`);
     initRepo(repoDir);
     const residue = makeResidue(repoDir, residueName);
     git(['worktree', 'prune'], repoDir);
     return { repoDir, residue };
+  }
+
+  /**
+   * Ignore `patterns` in the checkout's `.git/info/exclude`: the residue
+   * content check (#4941 review) counts only untracked files git does not
+   * ignore as work, so a fixture that must be removable ignores its extras.
+   */
+  function excludeLocally(repoDir, ...patterns) {
+    fs.appendFileSync(path.join(repoDir, '.git', 'info', 'exclude'), patterns.map((p) => `${p}\n`).join(''));
   }
 
   /** A plain directory under .claude/worktrees: no `.git`, never registered. */
@@ -1150,10 +1159,10 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('a child holding a file git tracks is kept — committed content is never residue', () => {
     const repoDir = path.join(tmpBase, 'repo-tracked');
     initRepo(repoDir);
-    const committed = plainChild(repoDir, 'agent-committed');
+    const committed = plainChild(repoDir, 'agent-a0000c0d');
     git(['add', '-A'], repoDir);
     git(['commit', '-m', 'commit a directory under .claude/worktrees'], repoDir);
-    git(['branch', 'agent-committed'], repoDir); // a harness branch, so only the tracked guard keeps it
+    git(['branch', 'agent-a0000c0d'], repoDir); // a harness branch, so only the tracked guard keeps it
     const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
     assert.deepStrictEqual({ status: row.status, reason: row.reason }, { status: 'skipped', reason: 'residue_tracked' });
     assert.ok(fs.existsSync(path.join(committed, 'file.txt')));
@@ -1165,10 +1174,10 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('an inherited GIT_INDEX_FILE naming an empty index cannot hide tracked content', () => {
     const repoDir = path.join(tmpBase, 'repo-altindex');
     initRepo(repoDir);
-    const committed = plainChild(repoDir, 'agent-notes');
+    const committed = plainChild(repoDir, 'agent-a0000a07');
     git(['add', '-A'], repoDir);
     git(['commit', '-m', 'commit a directory under .claude/worktrees'], repoDir);
-    git(['branch', 'worktree-agent-notes'], repoDir);
+    git(['branch', 'worktree-agent-a0000a07'], repoDir);
     fs.writeFileSync(path.join(committed, 'file.txt'), 'uncommitted edit\n');
     const altIndex = path.join(tmpBase, 'alt-index');
     const saved = process.env.GIT_INDEX_FILE;
@@ -1201,15 +1210,15 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     }
   }
 
-  /** A checkout tracking `<sub>.claude/worktrees/agent-notes/notes`, edited and uncommitted, with a harness branch. */
+  /** A checkout tracking `<sub>.claude/worktrees/agent-a0000a07/notes`, edited and uncommitted, with a harness branch. */
   function trackedNotes(repoDir, sub = '') {
     initRepo(repoDir);
-    const dir = path.join(repoDir, sub, '.claude', 'worktrees', 'agent-notes');
+    const dir = path.join(repoDir, sub, '.claude', 'worktrees', 'agent-a0000a07');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'notes'), 'committed\n');
     git(['add', '-A'], repoDir);
     git(['commit', '-m', 'track notes under .claude/worktrees'], repoDir);
-    git(['branch', 'worktree-agent-notes'], repoDir);
+    git(['branch', 'worktree-agent-a0000a07'], repoDir);
     fs.writeFileSync(path.join(dir, 'notes'), 'uncommitted edit\n');
     return dir;
   }
@@ -1232,7 +1241,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
       fs.mkdirSync(path.join(repoDir, 'nested'));
       const donor = path.join(tmpBase, `donor-${label.split(' ')[2]}`);
       initRepo(donor);
-      git(['branch', 'worktree-agent-notes'], donor);
+      git(['branch', 'worktree-agent-a0000a07'], donor);
       const { results, scan } = withEnv(redirect(repoDir, donor),
         () => reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps()));
       assert.strictEqual(scan.residue_dir, 'scanned');
@@ -1267,7 +1276,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('an empty agent-* directory is left alone and not reported', () => {
     const repoDir = path.join(tmpBase, 'repo-empty');
     initRepo(repoDir);
-    const empty = path.join(repoDir, '.claude', 'worktrees', 'agent-empty');
+    const empty = path.join(repoDir, '.claude', 'worktrees', 'agent-a0000e00');
     fs.mkdirSync(empty, { recursive: true });
     assert.deepStrictEqual(reapOrphanWorktrees(repoDir, deadOwnerDeps()), []);
     assert.ok(fs.existsSync(empty));
@@ -1278,17 +1287,19 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('an agent-* directory with no harness branch (agent-<id> / worktree-agent-<id>) is kept', () => {
     const repoDir = path.join(tmpBase, 'repo-nobranch');
     initRepo(repoDir);
-    const dir = plainChild(repoDir, 'agent-mine');
+    const dir = plainChild(repoDir, 'agent-a0000e11');
     const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
     assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_no_harness_branch']);
     assert.ok(fs.existsSync(path.join(dir, 'file.txt')));
   });
 
   test('either harness branch spelling is the marker: agent-<id> and worktree-agent-<id>', () => {
-    for (const branch of ['agent-b1', 'worktree-agent-b1']) {
+    for (const branch of ['agent-a00000b1', 'worktree-agent-a00000b1']) {
       const repoDir = path.join(tmpBase, `repo-branch-${branch}`);
       initRepo(repoDir);
-      const dir = plainChild(repoDir, 'agent-b1');
+      const dir = plainChild(repoDir, 'agent-a00000b1');
+      fs.writeFileSync(path.join(dir, 'README.md'), '# Test\n'); // the branch tip's one file, unchanged
+      excludeLocally(repoDir, 'file.txt');
       git(['branch', branch], repoDir);
       const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
       assert.deepStrictEqual([row.status, row.reason], ['reaped', 'unregistered_residue'], branch);
@@ -1299,12 +1310,12 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('a .claude/worktrees that is a link to a directory INSIDE the checkout is not scanned; tracked content there survives', () => {
     const repoDir = path.join(tmpBase, 'repo-inner-alias');
     initRepo(repoDir);
-    const saved = path.join(repoDir, 'saved', 'agent-project');
+    const saved = path.join(repoDir, 'saved', 'agent-a0000e91');
     fs.mkdirSync(saved, { recursive: true });
     fs.writeFileSync(path.join(saved, 'precious.txt'), 'keep\n');
     git(['add', '-A'], repoDir);
     git(['commit', '-m', 'saved'], repoDir);
-    git(['branch', 'agent-project'], repoDir);
+    git(['branch', 'agent-a0000e91'], repoDir);
     fs.mkdirSync(path.join(repoDir, '.claude'));
     fs.symlinkSync(path.join(repoDir, 'saved'), path.join(repoDir, '.claude', 'worktrees'), 'junction');
     const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
@@ -1315,7 +1326,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('.claude/worktrees swapped for an outside link mid-sweep: the outside directory is never removed', () => {
     const { repoDir, residue } = repoWithResidue('swap');
     const outside = path.join(tmpBase, 'outside');
-    fs.mkdirSync(path.join(outside, 'agent-t1', 'keep'), { recursive: true });
+    fs.mkdirSync(path.join(outside, 'agent-a0000001', 'keep'), { recursive: true });
     const residueDir = path.join(repoDir, '.claude', 'worktrees');
     const moved = path.join(tmpBase, 'moved-worktrees');
     let swapped = false;
@@ -1332,7 +1343,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
       },
     }));
     assert.ok(!results.some((r) => r.status === 'reaped'), JSON.stringify(results));
-    assert.ok(fs.existsSync(path.join(outside, 'agent-t1', 'keep')), 'the outside directory survives');
+    assert.ok(fs.existsSync(path.join(outside, 'agent-a0000001', 'keep')), 'the outside directory survives');
     assert.ok(fs.existsSync(path.join(moved, path.basename(residue))), 'and so does the moved residue');
   });
 
@@ -1340,10 +1351,10 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('a swap of .claude/worktrees for an outside link AFTER the final checks is refused, not followed', () => {
     const { repoDir, residue } = repoWithResidue('lateswap');
     const outside = path.join(tmpBase, 'late-outside');
-    fs.mkdirSync(path.join(outside, 'agent-t1', 'keep'), { recursive: true });
+    fs.mkdirSync(path.join(outside, 'agent-a0000001', 'keep'), { recursive: true });
     const residueDir = path.join(repoDir, '.claude', 'worktrees');
     const moved = path.join(tmpBase, 'late-moved');
-    const gitProbe = path.join(canonicalPath(residueDir), 'agent-t1', '.git');
+    const gitProbe = path.join(canonicalPath(residueDir), 'agent-a0000001', '.git');
     let probes = 0;
     const realLstat = fs.lstatSync;
     const results = withFaultyFs({
@@ -1359,7 +1370,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     }, () => reapOrphanWorktrees(repoDir, deadOwnerDeps()));
     assert.strictEqual(probes >= 2, true, 'the final check ran');
     assert.ok(!results.some((r) => r.status === 'reaped'), JSON.stringify(results));
-    assert.ok(fs.existsSync(path.join(outside, 'agent-t1', 'keep')), 'the outside directory survives');
+    assert.ok(fs.existsSync(path.join(outside, 'agent-a0000001', 'keep')), 'the outside directory survives');
     assert.ok(fs.existsSync(path.join(moved, path.basename(residue))), 'and so does the moved residue');
   });
 
@@ -1414,7 +1425,11 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
 
     const at = repoWithResidue('walk-clean-at');
     layoutResidue(at.residue, false);
-    const removed = onlyRow(reapOrphanWorktrees(at.repoDir, deadOwnerDeps({ residueWalkLimit: WALK_ENTRIES })));
+    // Removable only with nothing git lacks: the branch tip's README.md back
+    // (one more entry for the walk to count) and the layout ignored.
+    fs.writeFileSync(path.join(at.residue, 'README.md'), '# Test\n');
+    excludeLocally(at.repoDir, '/a', '/b', '/deep/');
+    const removed = onlyRow(reapOrphanWorktrees(at.repoDir, deadOwnerDeps({ residueWalkLimit: WALK_ENTRIES + 1 })));
     assert.deepStrictEqual([removed.status, removed.reason], ['reaped', 'unregistered_residue']);
     assert.ok(!fs.existsSync(at.residue));
   });
@@ -1462,7 +1477,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     const sibling = path.join(tmpBase, 'checkout');
     initRepo(spaced);
     initRepo(sibling);
-    const victim = makeResidue(sibling, 'agent-demo');
+    const victim = makeResidue(sibling, 'agent-a0000de0');
     fs.writeFileSync(path.join(victim, 'work.txt'), 'sibling work\n');
     const { results, scan } = reapOrphanWorktreesWithScan(spaced, deadOwnerDeps());
     assert.deepStrictEqual([results, scan.residue_dir], [[], 'absent']);
@@ -1473,7 +1488,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('a swap of .claude/worktrees at the moment of removal moves nothing outside and deletes nothing', () => {
     const { repoDir, residue } = repoWithResidue('renameswap');
     const outside = path.join(tmpBase, 'rs-outside');
-    fs.mkdirSync(path.join(outside, 'agent-t1', 'keep'), { recursive: true });
+    fs.mkdirSync(path.join(outside, 'agent-a0000001', 'keep'), { recursive: true });
     const residueDir = path.join(repoDir, '.claude', 'worktrees');
     const moved = path.join(tmpBase, 'rs-moved');
     const realRename = fs.renameSync;
@@ -1491,7 +1506,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     }, () => reapOrphanWorktrees(repoDir, deadOwnerDeps()));
     assert.ok(swapped, 'the swap ran');
     assert.ok(!results.some((r) => r.status === 'reaped'), JSON.stringify(results));
-    assert.ok(fs.existsSync(path.join(outside, 'agent-t1', 'keep')), 'the outside directory is back under its own name');
+    assert.ok(fs.existsSync(path.join(outside, 'agent-a0000001', 'keep')), 'the outside directory is back under its own name');
     assert.ok(fs.existsSync(path.join(moved, path.basename(residue))), 'the residue survives');
   });
 
@@ -1521,7 +1536,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.ok(fs.existsSync(path.join(live, 'work.txt')));
   });
 
-  test('a tracked directory renamed to another Unicode normalization form is still tracked', () => {
+  test('a tracked directory renamed to another Unicode normalization form is kept', () => {
     const repoDir = path.join(tmpBase, 'repo-nfd');
     initRepo(repoDir);
     git(['config', 'core.precomposeunicode', 'false'], repoDir);
@@ -1531,10 +1546,12 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     git(['add', '-A'], repoDir);
     git(['commit', '-m', 'track'], repoDir);
     const wt = path.join(repoDir, '.claude', 'worktrees');
-    fs.renameSync(path.join(wt, nfc), path.join(wt, 'agent-tmp'));
-    fs.renameSync(path.join(wt, 'agent-tmp'), path.join(wt, nfd));
+    fs.renameSync(path.join(wt, nfc), path.join(wt, 'agent-a0000f00'));
+    fs.renameSync(path.join(wt, 'agent-a0000f00'), path.join(wt, nfd));
     const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ execGit: branchExists(() => true) })));
-    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_tracked']);
+    // #4941 review: a harness id is `a` + hex, so a non-ASCII name is now kept
+    // by the name check, before the tracked check is reached.
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_not_harness_named']);
     assert.ok(fs.readdirSync(wt).length === 1 && fs.existsSync(path.join(wt, fs.readdirSync(wt)[0], 'file.txt')));
   });
 
@@ -1550,10 +1567,10 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     test(`an agent-* directory that is or holds ${label} is kept`, () => {
       const repoDir = path.join(tmpBase, `repo-${label.split(' ').pop()}`);
       initRepo(repoDir);
-      const dir = path.join(repoDir, '.claude', 'worktrees', 'agent-repo');
+      const dir = path.join(repoDir, '.claude', 'worktrees', 'agent-a0000e90');
       fs.mkdirSync(dir, { recursive: true });
       plant(dir);
-      git(['branch', 'agent-repo'], repoDir);
+      git(['branch', 'agent-a0000e90'], repoDir);
       const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
       assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_contains_repository']);
       assert.ok(fs.readdirSync(dir).length > 0);
@@ -1563,17 +1580,17 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('a tracked directory renamed by case only is still tracked (case-insensitive pathspec)', () => {
     const repoDir = path.join(tmpBase, 'repo-case');
     initRepo(repoDir);
-    plainChild(repoDir, 'agent-case');
+    plainChild(repoDir, 'agent-A00000CA');
     git(['add', '-A'], repoDir);
     git(['commit', '-m', 'track'], repoDir);
-    fs.renameSync(path.join(repoDir, '.claude', 'worktrees', 'agent-case'), path.join(repoDir, '.claude', 'worktrees', 'agent-tmp'));
-    fs.renameSync(path.join(repoDir, '.claude', 'worktrees', 'agent-tmp'), path.join(repoDir, '.claude', 'worktrees', 'agent-Case'));
+    fs.renameSync(path.join(repoDir, '.claude', 'worktrees', 'agent-A00000CA'), path.join(repoDir, '.claude', 'worktrees', 'agent-a0000f00'));
+    fs.renameSync(path.join(repoDir, '.claude', 'worktrees', 'agent-a0000f00'), path.join(repoDir, '.claude', 'worktrees', 'agent-a00000ca'));
     const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ execGit: branchExists(() => true) })));
     assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_tracked']);
-    assert.ok(fs.existsSync(path.join(repoDir, '.claude', 'worktrees', 'agent-Case', 'file.txt')));
+    assert.ok(fs.existsSync(path.join(repoDir, '.claude', 'worktrees', 'agent-a00000ca', 'file.txt')));
   });
 
-  test('a tracked directory whose POSIX name holds a backslash is still tracked (literal pathspec)', (t) => {
+  test('a tracked directory whose POSIX name holds a backslash is kept', (t) => {
     if (process.platform === 'win32') {
       t.skip('a backslash is a path separator on Windows');
       return;
@@ -1584,7 +1601,8 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     git(['add', '-A'], repoDir);
     git(['commit', '-m', 'track'], repoDir);
     const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ execGit: branchExists(() => true) })));
-    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_tracked']);
+    // #4941 review: kept by the name check (a harness id is `a` + hex).
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_not_harness_named']);
     assert.ok(fs.existsSync(path.join(dir, 'file.txt')));
   });
 
@@ -1607,7 +1625,8 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
       return;
     }
     const { repoDir, residue } = repoWithResidue('rm-partway');
-    fs.writeFileSync(path.join(residue, 'UNCOMMITTED_WORK.txt'), 'work\n');
+    excludeLocally(repoDir, '/build.log', '/locked/');
+    fs.writeFileSync(path.join(residue, 'build.log'), 'log\n');
     const locked = path.join(residue, 'locked');
     fs.mkdirSync(locked);
     fs.writeFileSync(path.join(locked, 'kept.txt'), 'kept\n');
@@ -1694,7 +1713,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     const guardMs = 60_000;
     const repoDir = path.join(tmpBase, 'repo-inflight-real');
     initRepo(repoDir);
-    const residue = plainChild(repoDir, 'agent-inflight');
+    const residue = plainChild(repoDir, 'agent-a0000f11');
     const createdMs = Math.floor(fs.statSync(residue).ctimeMs);
     const probe = path.join(tmpBase, 'ctime-probe');
     let stamped = createdMs;
@@ -1868,6 +1887,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
 
   test('a symlink or junction INSIDE the residue is unlinked, never followed: its target survives', () => {
     const { repoDir, residue } = repoWithResidue('innerlink');
+    excludeLocally(repoDir, '/node_modules/');
     const target = path.join(tmpBase, 'outside-target');
     fs.mkdirSync(target);
     fs.writeFileSync(path.join(target, 'keep.txt'), 'keep\n');
@@ -2000,7 +2020,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('a directory git still lists is never touched', () => {
     const repoDir = path.join(tmpBase, 'repo-registered');
     initRepo(repoDir);
-    const residue = makeResidue(repoDir, 'agent-t1'); // .git file gone, NOT pruned
+    const residue = makeResidue(repoDir, 'agent-a0000001'); // .git file gone, NOT pruned
     // The reaper's own step-5 `worktree prune` would drop the stale entry
     // before the residue scan runs; fail it so the registration survives and
     // the scan must rely on its own `worktree list` check.
@@ -2019,7 +2039,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     fs.mkdirSync(target);
     fs.writeFileSync(path.join(target, 'keep.txt'), 'keep\n');
     fs.mkdirSync(path.join(repoDir, '.claude', 'worktrees'), { recursive: true });
-    fs.symlinkSync(target, path.join(repoDir, '.claude', 'worktrees', 'agent-link'), 'junction');
+    fs.symlinkSync(target, path.join(repoDir, '.claude', 'worktrees', 'agent-a00001ec'), 'junction');
 
     const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
     assert.deepStrictEqual(results, []);
@@ -2059,14 +2079,14 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     const repoDir = path.join(tmpBase, 'repo-alias');
     initRepo(repoDir);
     const elsewhere = path.join(tmpBase, 'other-repo');
-    fs.mkdirSync(path.join(elsewhere, 'agent-x'), { recursive: true });
+    fs.mkdirSync(path.join(elsewhere, 'agent-a00000e1'), { recursive: true });
     fs.mkdirSync(path.join(repoDir, '.claude'));
     fs.symlinkSync(elsewhere, path.join(repoDir, '.claude', 'worktrees'), 'junction');
 
     const { results, scan } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
     assert.deepStrictEqual(results, []);
     assert.strictEqual(scan.residue_dir, 'aliased');
-    assert.ok(fs.existsSync(path.join(elsewhere, 'agent-x')));
+    assert.ok(fs.existsSync(path.join(elsewhere, 'agent-a00000e1')));
   });
 
   test('a failed worktree listing reports the candidates as worktree_list_failed and removes nothing', () => {
@@ -2119,7 +2139,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     fs.writeFileSync(path.join(repoDir, 'README.md'), '# Test\n');
     git(['add', '-A'], repoDir);
     git(['commit', '-m', 'initial commit'], repoDir);
-    const residue = makeResidue(repoDir, 'agent-t1');
+    const residue = makeResidue(repoDir, 'agent-a0000001');
     git(['worktree', 'prune'], repoDir);
     return { repoDir, residue };
   }
@@ -2156,10 +2176,10 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     fs.writeFileSync(path.join(repoDir, 'README.md'), '# Test\n');
     git(['add', '-A'], repoDir);
     git(['commit', '-m', 'initial commit'], repoDir);
-    const residue = makeResidue(repoDir, 'agent-t1');
+    const residue = makeResidue(repoDir, 'agent-a0000001');
     git(['worktree', 'prune'], repoDir);
     // A decoy beside the metadata must never be touched.
-    const decoy = path.join(meta, '.claude', 'worktrees', 'agent-decoy');
+    const decoy = path.join(meta, '.claude', 'worktrees', 'agent-a0000dec');
     fs.mkdirSync(decoy, { recursive: true });
     const residueKey = canonicalPath(residue);
 
@@ -2181,9 +2201,9 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     fs.writeFileSync(path.join(checkout, 'README.md'), '# Test\n');
     git(['add', '-A'], checkout);
     git(['commit', '-m', 'initial commit'], checkout);
-    const residue = makeResidue(checkout, 'agent-t1');
+    const residue = makeResidue(checkout, 'agent-a0000001');
     git(['worktree', 'prune'], checkout);
-    const decoy = path.join(project, '.claude', 'worktrees', 'agent-decoy');
+    const decoy = path.join(project, '.claude', 'worktrees', 'agent-a0000dec');
     fs.mkdirSync(decoy, { recursive: true });
     const residueKey = canonicalPath(residue);
 
@@ -2198,15 +2218,15 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   test('residue rows come back in name order, whatever order the filesystem lists them', () => {
     const repoDir = path.join(tmpBase, 'repo-order');
     initRepo(repoDir);
-    for (const n of ['agent-c', 'agent-a', 'agent-b']) makeResidue(repoDir, n);
+    for (const n of ['agent-a000000c', 'agent-a000000a', 'agent-a000000b']) makeResidue(repoDir, n);
     git(['worktree', 'prune'], repoDir);
     const residueDir = canonicalPath(path.join(repoDir, '.claude', 'worktrees'));
     const results = reapOrphanWorktrees(repoDir, deadOwnerDeps({
-      readDirSafe: (dir) => (canonicalPath(dir) === residueDir ? ['agent-c', 'agent-a', 'agent-b'] : (() => {
+      readDirSafe: (dir) => (canonicalPath(dir) === residueDir ? ['agent-a000000c', 'agent-a000000a', 'agent-a000000b'] : (() => {
         try { return fs.readdirSync(dir); } catch { return null; }
       })()),
     }));
-    assert.deepStrictEqual(results.map((r) => path.basename(r.path)), ['agent-a', 'agent-b', 'agent-c']);
+    assert.deepStrictEqual(results.map((r) => path.basename(r.path)), ['agent-a000000a', 'agent-a000000b', 'agent-a000000c']);
   });
 
   // ── CLI output: stderr is read by an agent (the callers discard the JSON) ──
@@ -2219,7 +2239,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.deepStrictEqual(json.scan, { admin_dir: 'absent', residue_dir: 'scanned' });
     assert.deepStrictEqual(err, [
       '[gsd] worktree.reap-orphans: removed 1 leftover harness worktree directory under .claude/worktrees that git no longer tracked: ' +
-      '"agent-t1" (held "README.md", "node_modules")\n',
+      '"agent-a0000001" (held "README.md", "node_modules")\n',
     ]);
     assert.deepStrictEqual(json.entries[0].contents, ['README.md', 'node_modules']);
   });
@@ -2227,20 +2247,21 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
   // trek-e review 5638711345 (Minor 3): the guards prove harness residue, not
   // that nothing in it was wanted — an untracked file is deleted with it, and
   // the row and stderr say what was there.
-  test('untracked work in a removed residue is named in the row and on stderr', () => {
-    const { repoDir, residue } = repoWithResidue('cli-untracked', 'agent-aaa');
-    fs.writeFileSync(path.join(residue, 'UNCOMMITTED_WORK.txt'), 'work\n');
+  test('ignored content in a removed residue is named in the row and on stderr', () => {
+    const { repoDir, residue } = repoWithResidue('cli-ignored', 'agent-a0000aaa');
+    excludeLocally(repoDir, '/build.log');
+    fs.writeFileSync(path.join(residue, 'build.log'), 'log\n');
     const { json, err } = runCli(repoDir);
     assert.deepStrictEqual(json.entries.map((e) => [e.status, e.reason, e.contents]),
-      [['reaped', 'unregistered_residue', ['README.md', 'UNCOMMITTED_WORK.txt', 'node_modules']]]);
-    assert.match(err.join(''), /"agent-aaa" \(held "README\.md", "UNCOMMITTED_WORK\.txt", "node_modules"\)\n$/u);
+      [['reaped', 'unregistered_residue', ['README.md', 'build.log', 'node_modules']]]);
+    assert.match(err.join(''), /"agent-a0000aaa" \(held "README\.md", "build\.log", "node_modules"\)\n$/u);
   });
 
   test('what a removed directory held is capped at 5 names, escaped like the directory name', () => {
     const contents = ['a', 'b', 'c', 'd', 'e\u202e', 'f', 'g'];
-    const list = residueNameList([{ path: '/r/.claude/worktrees/agent-x', status: 'reaped', reason: 'unregistered_residue', contents }]);
+    const list = residueNameList([{ path: '/r/.claude/worktrees/agent-a00000e1', status: 'reaped', reason: 'unregistered_residue', contents }]);
     assert.ok(!hasRawChar(list), JSON.stringify(list));
-    assert.match(list, /^"agent-x" \(held "a", "b", "c", "d", "e[^"]*" and 2 more\)$/u);
+    assert.match(list, /^"agent-a00000e1" \(held "a", "b", "c", "d", "e[^"]*" and 2 more\)$/u);
   });
 
   test('a directory left in place is counted by the guard that kept it, never named', () => {
@@ -2266,7 +2287,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     }
     const repoDir = path.join(tmpBase, 'repo-ctrl');
     initRepo(repoDir);
-    const name = 'agent-x\n[gsd] forged \u001b[2J\u009b31m\u007f\u202e\u2066\u200b\u2028\u2029\ufeff';
+    const name = 'agent-a00000e1\n[gsd] forged \u001b[2J\u009b31m\u007f\u202e\u2066\u200b\u2028\u2029\ufeff';
     plainChild(repoDir, name);
     // No git branch can carry these bytes; stub the harness-branch check so
     // the escaping of a REMOVED name is what this row exercises.
@@ -2344,31 +2365,186 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     assert.deepStrictEqual(err, ['[gsd] worktree.reap-orphans failed: "boom\\n[gsd] forged \\u001b[2J"\n']);
   });
 
-  // Nit 3: run each shipped call line, not just grep it: with a stub gsd_run
-  // writing to both streams, stderr must reach the caller and stdout must not.
-  test('the three workflow callers\' shipped line passes stderr through and discards stdout', (t) => {
-    const { spawnSync } = require('node:child_process');
-    const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
-    const bash = spawnSync('bash', ['-c', 'exit 0'], { timeout: PROBE_TIMEOUT_MS });
-    if (bash.error) {
-      t.skip('bash is not available');
-      return;
-    }
-    const callers = [
-      'gsd-core/workflows/quick.md',
-      'gsd-core/workflows/quick-batch.md',
-      'gsd-core/workflows/execute-phase/steps/executor-isolation-dispatch.md',
-    ];
-    for (const rel of callers) {
-      const lines = fs.readFileSync(path.join(__dirname, '..', rel), 'utf8').split(/\r?\n/)
-        .filter((l) => l.includes('gsd_run query worktree.reap-orphans'));
-      assert.strictEqual(lines.length, 1, `${rel}: exactly one reap-orphans call`);
-      const script = `gsd_run() { echo JSON-ON-STDOUT; echo RESIDUE-ON-STDERR >&2; return 3; }\n${lines[0].trim()}\necho exit=$?`;
-      const r = spawnSync('bash', ['-c', script], { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS });
-      assert.strictEqual(r.stdout.trim(), 'exit=0', `${rel}: stdout discarded and a failure tolerated`);
-      assert.strictEqual(r.stderr.trim(), 'RESIDUE-ON-STDERR', `${rel}: stderr reaches the caller`);
-    }
+  // ─── trek-e review 5691418415 ──────────────────────────────────────────────
+
+  // Blocker 1: the sweep pruned before it read `git worktree list`, so a
+  // worktree git still listed (admin entry present, `.git` file gone) read as
+  // unregistered and was removed with its uncommitted files.
+  test('a worktree whose .git file was removed keeps its uncommitted work across sweeps and prunes', () => {
+    const repoDir = path.join(tmpBase, 'repo-registered-nogit');
+    initRepo(repoDir);
+    const wt = path.join(repoDir, '.claude', 'worktrees', 'agent-a00000f1');
+    git(['worktree', 'add', '-b', 'worktree-agent-a00000f1', wt, 'HEAD'], repoDir);
+    fs.unlinkSync(path.join(wt, '.git'));
+    fs.writeFileSync(path.join(wt, 'dirty.txt'), 'uncommitted\n');
+    assert.match(git(['worktree', 'list', '--porcelain'], repoDir), /prunable/, 'fixture premise: git still lists it, as prunable');
+
+    // The first sweep reads git's list before its own prune, so the worktree is
+    // still registered there; the prune then ends the registration (as
+    // `/gsd-progress`, wave cleanup or git gc would), and the second sweep sees
+    // a candidate — kept, because it holds work git does not have.
+    const first = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+    assert.deepStrictEqual(rows(first.results), []);
+    assert.deepStrictEqual(first.scan, { admin_dir: 'scanned', residue_dir: 'scanned' });
+    assert.doesNotMatch(git(['worktree', 'list', '--porcelain'], repoDir), /agent-a00000f1/, 'premise: the prune ended the registration');
+    const second = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+    assert.deepStrictEqual(rows(second.results), [[canonicalPath(wt), 'skipped', 'residue_has_work']]);
+    assert.strictEqual(fs.readFileSync(path.join(wt, 'dirty.txt'), 'utf8'), 'uncommitted\n');
   });
+
+  for (const [label, change] of [
+    ['an edited tracked file', (wt) => fs.writeFileSync(path.join(wt, 'README.md'), 'edited\n')],
+    ['a deleted tracked file', (wt) => fs.unlinkSync(path.join(wt, 'README.md'))],
+    ['an untracked file', (wt) => fs.writeFileSync(path.join(wt, 'new.txt'), 'new\n')],
+  ]) {
+    test(`a residue with ${label} against its harness branch is kept as residue_has_work`, () => {
+      const { repoDir, residue } = repoWithResidue(`work-${label.split(' ').pop()}`);
+      change(residue);
+      const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+      assert.deepStrictEqual([canonicalPath(row.path), row.status, row.reason], [canonicalPath(residue), 'skipped', 'residue_has_work']);
+      assert.ok(fs.existsSync(residue));
+    });
+  }
+
+  test('an ignored file does not count as work: the residue is removed', () => {
+    const repoDir = path.join(tmpBase, 'repo-ignored');
+    initRepo(repoDir);
+    fs.writeFileSync(path.join(repoDir, '.gitignore'), 'build/\n');
+    git(['add', '.gitignore'], repoDir);
+    git(['commit', '-m', 'ignore build'], repoDir);
+    const residue = makeResidue(repoDir, 'agent-a0000b1d');
+    git(['worktree', 'prune'], repoDir);
+    fs.mkdirSync(path.join(residue, 'build'));
+    fs.writeFileSync(path.join(residue, 'build', 'out.js'), 'generated\n');
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.deepStrictEqual([row.status, row.reason], ['reaped', 'unregistered_residue']);
+  });
+
+  test('work matching the OTHER harness branch spelling still counts as committed', () => {
+    const { repoDir, residue } = repoWithResidue('other-branch');
+    // The residue's files match worktree-agent-<id>; an agent-<id> branch at
+    // another commit must not make it look like work.
+    fs.writeFileSync(path.join(repoDir, 'later.txt'), 'later\n');
+    git(['add', 'later.txt'], repoDir);
+    git(['commit', '-m', 'later'], repoDir);
+    git(['branch', 'agent-a0000001'], repoDir);
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.deepStrictEqual([row.status, row.reason], ['reaped', 'unregistered_residue']);
+    assert.ok(!fs.existsSync(residue));
+  });
+
+  test('when git cannot compare the residue with any harness branch it is kept as residue_unverified', () => {
+    const { repoDir, residue } = repoWithResidue('status-fails');
+    const faultyGit = makeFaultyGit({
+      faults: [{ kind: 'exit', exitCode: 128, when: (args) => args.includes('read-tree') }],
+      passthrough: realExecGit,
+    });
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ execGit: faultyGit })));
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_unverified']);
+    assert.ok(fs.existsSync(residue));
+  });
+
+  test('a worktree whose directory is gone is still pruned', () => {
+    const repoDir = path.join(tmpBase, 'repo-prune-gone');
+    initRepo(repoDir);
+    const wt = path.join(tmpBase, 'gone-wt');
+    git(['worktree', 'add', '-b', 'gone-branch', wt, 'HEAD'], repoDir);
+    cleanup(wt);
+    const { results } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps());
+    assert.deepStrictEqual(results, []);
+    assert.doesNotMatch(git(['worktree', 'list', '--porcelain'], repoDir), /gone-wt/);
+  });
+
+  // Minor 3: run from inside a candidate, the sweep removed the directory it ran from.
+  for (const [label, sub] of [['the candidate itself', ''], ['a directory inside it', 'sub']]) {
+    test(`a residue holding the directory the sweep runs from (${label}) is kept as residue_contains_cwd`, () => {
+      const { repoDir, residue } = repoWithResidue(`cwd-${sub || 'self'}`);
+      const from = path.join(residue, sub);
+      fs.mkdirSync(from, { recursive: true });
+      const row = onlyRow(reapOrphanWorktrees(from, deadOwnerDeps()));
+      assert.deepStrictEqual([canonicalPath(row.path), row.status, row.reason], [canonicalPath(residue), 'skipped', 'residue_contains_cwd']);
+      assert.ok(fs.existsSync(path.join(residue, 'node_modules', 'pkg-a')));
+      assert.ok(fs.existsSync(repoDir));
+    });
+  }
+
+  test('a residue holding the process cwd is kept as residue_contains_cwd', (t) => {
+    const { repoDir, residue } = repoWithResidue('proc-cwd');
+    const saved = process.cwd();
+    process.chdir(residue);
+    t.after(() => process.chdir(saved));
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    process.chdir(saved);
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_contains_cwd']);
+    assert.ok(fs.existsSync(residue));
+  });
+
+  // Minor 4: two admin-dir outcomes were silent on stderr.
+  test('an admin dir not swept because the default branch is unresolved is said on stderr', () => {
+    const f = makeFixture(tmpBase, 'cli-nodefault');
+    const originSrc = path.join(tmpBase, 'origin-src-cli');
+    initRepo(originSrc);
+    git(['remote', 'add', 'origin', originSrc], f.repoDir);
+    const { json, err } = runCli(f.repoDir);
+    assert.strictEqual(json.scan.admin_dir, 'default_branch_unresolved');
+    assert.ok(err.includes('[gsd] worktree.reap-orphans: .git/worktrees was not swept — the default branch could not be resolved (origin/HEAD unset or unresolvable), so no branch can be proven merged\n'), JSON.stringify(err));
+  });
+
+  test('an admin dir that cannot be listed is said on stderr', () => {
+    const repoDir = path.join(tmpBase, 'repo-admin-unreadable-cli');
+    initRepo(repoDir);
+    fs.writeFileSync(path.join(repoDir, '.git', 'worktrees'), 'not a directory\n'); // readdir → ENOTDIR
+    const { json, err } = runCli(repoDir);
+    assert.strictEqual(json.scan.admin_dir, 'unreadable');
+    assert.deepStrictEqual(err, ['[gsd] worktree.reap-orphans: .git/worktrees was not swept — it could not be read\n']);
+  });
+
+  // Minor 5: a candidate another sweep removed mid-check is not "left in place".
+  test('a candidate removed by another sweep while this one checks it gets no row', () => {
+    const { repoDir, residue } = repoWithResidue('vanished');
+    const realRead = (dir) => { try { return fs.readdirSync(dir); } catch { return null; } };
+    const readDirSafe = (dir) => {
+      if (canonicalPath(dir) !== canonicalPath(residue)) return realRead(dir);
+      cleanup(dir); // the other sweep wins the race
+      return null;
+    };
+    const { json, err } = runCli(repoDir, { readDirSafe });
+    assert.deepStrictEqual(json.entries, []);
+    assert.deepStrictEqual(err, []);
+  });
+
+  // Minor 6: the guard read only the candidate's own mtime.
+  test('a residue with an entry written inside the guard window, deep in the tree, is not removed', () => {
+    const { repoDir, residue } = repoWithResidue('deep-young');
+    const deep = path.join(residue, 'a', 'b', 'c');
+    fs.mkdirSync(deep, { recursive: true });
+    fs.writeFileSync(path.join(deep, 'live.txt'), 'being written\n');
+    // The candidate's own mtime is stale; every entry inside keeps its real one.
+    const { results } = reapOrphanWorktreesWithScan(repoDir, deadOwnerDeps({ entryMtimeSafe: undefined }));
+    assert.deepStrictEqual(rows(results), []);
+    assert.ok(fs.existsSync(path.join(deep, 'live.txt')));
+  });
+
+  test('a residue with an entry whose mtime cannot be read is kept as residue_age_unknown', () => {
+    const { repoDir, residue } = repoWithResidue('deep-unknown');
+    const entryMtimeSafe = (p) => (path.basename(p) === 'pkg-a' ? null : STALE_MTIME);
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps({ entryMtimeSafe })));
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_age_unknown']);
+    assert.ok(fs.existsSync(residue));
+  });
+
+  // Minor 7: `agent-<anything>` plus a same-named branch was enough.
+  for (const name of ['agent-notes', 'agent-a123456', 'agent-A0000001', 'agent-a0000001x', 'agent-b0000001']) {
+    test(`a child named ${name} with a matching branch is not harness-named and is kept`, () => {
+      const repoDir = path.join(tmpBase, 'repo-name-shape');
+      initRepo(repoDir);
+      const dir = plainChild(repoDir, name);
+      git(['branch', name], repoDir);
+      const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+      assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_not_harness_named']);
+      assert.ok(fs.existsSync(path.join(dir, 'file.txt')));
+    });
+  }
 
   // Minor 5: the issue's second symptom — wave cleanup read the ENCLOSING
   // repository's branch through a directory with no `.git`, and blocked as
@@ -2381,7 +2557,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     const head = git(['rev-parse', 'HEAD'], repoDir).trim();
     const result = executeWorktreeWaveCleanupPlan({
       ok: true, repoRoot: repoDir, action: 'cleanup_wave', discovery: 'manifest',
-      entries: [{ agent_id: 't1', worktree_path: path.join('.claude', 'worktrees', 'agent-t1'), branch: 'worktree-agent-t1', expected_base: head }],
+      entries: [{ agent_id: 't1', worktree_path: path.join('.claude', 'worktrees', 'agent-a0000001'), branch: 'worktree-agent-a0000001', expected_base: head }],
     }, {});
     const blocked = result.entries.find((r) => r.status === 'blocked');
     assert.strictEqual(blocked && blocked.reason, 'worktree_unregistered', JSON.stringify(result));
@@ -2396,7 +2572,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
       repoRoot: repoDir,
       action: 'cleanup_wave',
       discovery: 'manifest',
-      entries: [{ agent_id: 't1', worktree_path: residue, branch: 'worktree-agent-t1', expected_base: head }],
+      entries: [{ agent_id: 't1', worktree_path: residue, branch: 'worktree-agent-a0000001', expected_base: head }],
     }, {});
     const blocked = result.entries.find((r) => r.status === 'blocked');
     assert.ok(blocked, JSON.stringify(result));
@@ -2409,7 +2585,7 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
 
   // Minor 8: on Windows, one directory spelled two ways compares equal.
   test('pathCompareKey folds case and a \\\\?\\ prefix on win32 only', () => {
-    assert.strictEqual(pathCompareKey('\\\\?\\C:\\Repo\\.claude\\worktrees\\agent-a', 'win32'), 'c:\\repo\\.claude\\worktrees\\agent-a');
+    assert.strictEqual(pathCompareKey('\\\\?\\C:\\Repo\\.claude\\worktrees\\agent-a000000a', 'win32'), 'c:\\repo\\.claude\\worktrees\\agent-a000000a');
     assert.strictEqual(pathCompareKey('C:\\Repo\\X', 'win32'), pathCompareKey('c:\\repo\\x', 'win32'));
     assert.strictEqual(pathCompareKey('/Repo/X', 'linux'), '/Repo/X', 'case is significant elsewhere');
   });

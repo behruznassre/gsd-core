@@ -10,6 +10,7 @@
 
 import fs from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import { execGit as execGitSeam, posixNormalize, retryRenameSync, type SpawnResultOutput } from './shell-command-projection.cjs';
 import { isContainedIn } from './security.cjs';
@@ -154,6 +155,8 @@ interface WorktreeDeps {
   removeDir?: (p: string) => void;
   /** #4941: entries the residue repository walk reads before `residue_unverified`; defaults to RESIDUE_WALK_LIMIT. */
   residueWalkLimit?: number;
+  /** #4941 review: an entry's own mtime inside a residue (not following links); defaults to `fs.lstatSync(p).mtime`. */
+  entryMtimeSafe?: (p: string) => Date | null;
 }
 
 function readWorktreeList(repoRoot: string, deps: WorktreeDeps = {}): WorktreeListResult {
@@ -2564,8 +2567,14 @@ interface ReapScan {
   residue_dir: ResidueDirStatus;
 }
 
-/** Claude Code names its harness worktrees `agent-<id>`; only those are ever removed as residue (#4941). A bare `agent-` has no id. */
-const HARNESS_WORKTREE_NAME_RE = /^agent-./su;
+/**
+ * Claude Code names its harness worktrees `agent-<id>`, the id an `a` and lower-
+ * case hex (`agent-a78683ac`, `agent-a29ecaf07c8ddbe07` observed); only those are
+ * ever removed as residue (#4941). A user directory such as `agent-notes` does
+ * not match (#4941 review). A harness that changes its id shape fails closed:
+ * its residue is kept as `residue_not_harness_named`.
+ */
+const HARNESS_WORKTREE_NAME_RE = /^agent-a[0-9a-f]{7,}$/u;
 
 /**
  * The name the residue sweep renames a child to just before removing it
@@ -2599,10 +2608,23 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
   const gitDir = execGit(['rev-parse', '--git-dir'], { cwd: repoRoot });
   if (!gitResultOk(gitDir)) return { results, scan: { admin_dir: 'git_dir_unresolved', residue_dir: 'not_scanned' } };
   const gitDirPath = path.resolve(repoRoot, gitDir.stdout.trim());
+  // What git lists is read BEFORE step 5 prunes: a worktree whose `.git` file is
+  // gone is still listed (`prunable`) until then, and the prune would make it
+  // look unregistered to the residue scan (#4941 review). Read at most once —
+  // on demand from an exit that never prunes, and always just before the prune.
+  // `-z`: NUL-terminated fields, so a worktree path holding a newline is read
+  // whole — a newline-split listing truncated it and a registered, live
+  // worktree read as unregistered (Codex review). An older git without `-z`
+  // fails the call, which keeps every candidate.
+  let listedBeforePrune: GitResult | null = null;
+  const readListing = (): GitResult => {
+    listedBeforePrune ??= execGit(['worktree', 'list', '--porcelain', '-z'], { cwd: repoRoot });
+    return listedBeforePrune;
+  };
   // An unresolvable default branch fails the admin-dir REAP closed, but the
   // residue scan does not depend on it, so every later exit still runs it.
   const sweepResidue = (admin_dir: AdminDirStatus): { results: ReapResult[]; scan: ReapScan } => {
-    const residue = findUnregisteredResidue(repoRoot, gitDirPath, deps, nowMs, reapMtimeGuardMs);
+    const residue = findUnregisteredResidue(repoRoot, gitDirPath, readListing, deps, nowMs, reapMtimeGuardMs);
     results.push(...residue.results);
     return { results, scan: { admin_dir, residue_dir: residue.status } };
   };
@@ -2801,7 +2823,11 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
     results.push({ path: gitKnownPath, status: 'reaped', reason: 'pid_dead_and_merged' });
   }
 
-  // 5. Always prune stale metadata (handles missing-on-disk entries).
+  // 5. Always prune stale metadata (handles missing-on-disk entries). The
+  // residue scan below uses the listing read before this. Registration is not
+  // what protects a worktree's work from the scan — any prune (this one,
+  // `/gsd-progress`, wave cleanup, git gc) ends it — the content check is.
+  readListing();
   execGit(['worktree', 'prune'], { cwd: repoRoot });
 
   return sweepResidue('scanned');
@@ -2824,11 +2850,16 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
  * one) is left without a row. The checks, in order:
  *   - `.claude` and `.claude/worktrees` are real directories under the
  *     checkout's canonical top, never symlinks or junctions (`aliased`
- *     otherwise — nothing is read); re-checked right before every removal,
- *     and every path used is built from that verified chain;
+ *     otherwise — the listing is not swept); re-checked right before every
+ *     removal, and every path used is built from that verified chain;
  *   - the child is a real directory (lstat) with no `.git` entry (ENOENT);
- *   - git does not list it (`git worktree list`, read once per sweep);
- *   - it is older than the lock path's mtime guard (it may be mid-creation);
+ *   - git does not list it (`git worktree list`, read once per sweep, before
+ *     the sweep's own prune — a `prunable` entry is still registered). This
+ *     is not what protects work: any prune ends a registration;
+ *   - it holds neither the sweep's `repoRoot` nor the process cwd
+ *     (`residue_contains_cwd`);
+ *   - it is older than the lock path's mtime guard (it may be mid-creation),
+ *     and so is every entry inside it (checked during the repository walk);
  *   - it is named `agent-<id>` (`residue_not_harness_named`) and a harness
  *     branch for it exists — `agent-<id>` or `worktree-agent-<id>`
  *     (`residue_no_harness_branch`); or it carries the `.gsd-reap-<16 hex>`
@@ -2842,13 +2873,19 @@ function reapOrphanWorktreesWithScan(repoRoot: string, deps: WorktreeDeps = {}):
  *   - no repository lies inside it — no `.git` entry at any depth and no bare
  *     repository layout (`residue_contains_repository`), walked without
  *     following links, `node_modules` included, and bounded
- *     (`residue_unverified` past the bound).
+ *     (`residue_unverified` past the bound);
+ *   - it holds no work git lacks (`residue_has_work`; `residue_unverified` when
+ *     git cannot compare): it matches a harness branch's tip, with no
+ *     modified, deleted or untracked-and-unignored file — the standard `git
+ *     worktree remove` applies without `--force` (`residueHoldsWork`). A
+ *     stranded `.gsd-reap-*` passed it in the sweep that renamed it.
  * Removal is `fs.rmSync(p, { recursive: true })`, which unlinks a symlink or
  * junction found inside rather than following it (pinned by a junction test).
  */
 function findUnregisteredResidue(
   repoRoot: string,
   gitDirPath: string,
+  readListing: () => GitResult,
   deps: WorktreeDeps,
   nowMs: number,
   guardMs: number,
@@ -2859,6 +2896,7 @@ function findUnregisteredResidue(
   const readDirSafe = deps.readDirSafe || defaultReadDirSafe;
   const removeDir = deps.removeDir || ((p: string) => fs.rmSync(p, { recursive: true, maxRetries: 2 }));
   const walkLimit = deps.residueWalkLimit ?? RESIDUE_WALK_LIMIT;
+  const entryMtimeSafe = deps.entryMtimeSafe || defaultEntryMtimeSafe;
   const results: ReapResult[] = [];
 
   // Only a main checkout scans: its git dir IS the common dir, while a linked
@@ -2925,6 +2963,7 @@ function findUnregisteredResidue(
     return { results, status: lstatState(residueDir) === 'absent' ? 'absent' : 'unreadable' };
   }
   if (!chainIsReal()) return { results, status: 'aliased' };
+  const verifiedParent = identity(residueDir);
   // Sorted so `entries` is the same on every filesystem.
   const names = [...listing].sort();
 
@@ -2947,11 +2986,7 @@ function findUnregisteredResidue(
   }
   if (candidates.length === 0) return { results, status: 'scanned' };
 
-  // `-z`: NUL-terminated fields, so a worktree path holding a newline is read
-  // whole — a newline-split listing truncated it and a registered, live
-  // worktree read as unregistered (Codex review). An older git without `-z`
-  // fails the call, which keeps every candidate.
-  const listed = execGit(['worktree', 'list', '--porcelain', '-z'], { cwd: repoRoot });
+  const listed = readListing();
   if (!gitResultOk(listed)) {
     for (const p of candidates) results.push({ path: p, status: 'skipped', reason: 'worktree_list_failed' });
     return { results, status: 'scanned' };
@@ -2964,11 +2999,11 @@ function findUnregisteredResidue(
   // normalized and case-folded: a directory renamed to another normalization
   // form (NFC/NFD) or case is the same directory to the filesystem (Codex
   // review). Index paths use `/` only. A failed listing keeps everything.
-  // The checkout's OWN index decides what is tracked: an inherited
-  // GIT_INDEX_FILE (set inside a git hook or a partial commit) would point
-  // `ls-files` at another index and hide tracked work (Codex review). Node
-  // drops an `undefined` env value, so the variable is unset for these calls.
-  const ownIndex = { cwd: top, env: { GIT_INDEX_FILE: undefined } as unknown as Record<string, string> };
+  // The checkout's OWN index decides what is tracked: execGit drops an
+  // inherited GIT_INDEX_FILE (set inside a git hook or a partial commit),
+  // which would point `ls-files` at another index and hide tracked work
+  // (Codex review; #5548).
+  const ownIndex = { cwd: top };
   const trackedList = execGit(['ls-files', '-z', '--', '.claude/worktrees'], ownIndex);
   const trackedNames = new Set<string>();
   for (const file of gitResultOk(trackedList) ? String(trackedList.stdout).split('\0') : []) {
@@ -2978,18 +3013,36 @@ function findUnregisteredResidue(
   const hasBranch = (branch: string): boolean =>
     gitResultOk(execGit(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: top }));
 
+  // The directories the sweep runs from: one that holds either is in use,
+  // whatever git says about it (#4941 review).
+  const inUse = [comparablePath(repoRoot), comparablePath(process.cwd())];
+  const holds = (dir: string, inner: string): boolean => inner === dir || inner.startsWith(dir.endsWith(path.sep) ? dir : dir + path.sep);
+
   for (const p of candidates) {
     const name = path.basename(p);
-    if (registered.has(comparablePath(p))) continue; // git still tracks it; the admin-dir path owns it
+    const key = comparablePath(p);
+    // A candidate another sweep removed while this one was checking it is not
+    // "left in place": it gets no row (#4941 review).
+    const keep = (reason: string): void => {
+      // Gone from the `.claude/worktrees` this sweep verified, not from one
+      // moved aside (and perhaps recreated) since: only then was it taken.
+      const taken = lstatState(p) === 'absent' && verifiedParent !== null && chainIsReal() && identity(residueDir) === verifiedParent;
+      if (!taken) results.push({ path: p, status: 'skipped', reason });
+    };
+    if (registered.has(key)) continue; // git still tracks it; the admin-dir path owns it
+    if (inUse.some((dir) => holds(key, dir))) {
+      keep('residue_contains_cwd');
+      continue;
+    }
     const mtime = mtimeSafe(p);
     if (!mtime) {
-      results.push({ path: p, status: 'skipped', reason: 'residue_age_unknown' });
+      keep('residue_age_unknown');
       continue;
     }
     if (nowMs - mtime.getTime() < guardMs) continue; // may be mid-creation
     const children = readDirSafe(p);
     if (children === null) {
-      results.push({ path: p, status: 'skipped', reason: 'residue_unreadable' });
+      keep('residue_unreadable');
       continue;
     }
     if (children.length === 0) continue; // nothing to reclaim; a possible `worktree add` target
@@ -3003,29 +3056,48 @@ function findUnregisteredResidue(
     if (stranded) {
       const ctime = ctimeSafe(p);
       if (!ctime) {
-        results.push({ path: p, status: 'skipped', reason: 'residue_age_unknown' });
+        keep('residue_age_unknown');
         continue;
       }
       if (nowMs - ctime.getTime() < guardMs) continue;
     }
     if (!stranded && !HARNESS_WORKTREE_NAME_RE.test(name)) {
-      results.push({ path: p, status: 'skipped', reason: 'residue_not_harness_named' });
+      keep('residue_not_harness_named');
       continue;
     }
-    if (!stranded && !hasBranch(name) && !hasBranch(`worktree-${name}`)) {
-      results.push({ path: p, status: 'skipped', reason: 'residue_no_harness_branch' });
+    const harnessBranches = stranded ? [] : [name, `worktree-${name}`].filter(hasBranch);
+    if (!stranded && harnessBranches.length === 0) {
+      keep('residue_no_harness_branch');
       continue;
     }
     const tracked = execGit(['ls-files', '-z', '--', `:(icase,literal).claude/worktrees/${name}`], ownIndex);
     if (!gitResultOk(trackedList) || !gitResultOk(tracked) || tracked.stdout.length > 0
         || trackedNames.has(name.normalize('NFC').toLowerCase())) {
-      results.push({ path: p, status: 'skipped', reason: 'residue_tracked' });
+      keep('residue_tracked');
       continue;
     }
-    const inner = repositoryInside(p, walkLimit);
-    if (inner !== 'none') {
-      results.push({ path: p, status: 'skipped', reason: inner === 'found' ? 'residue_contains_repository' : 'residue_unverified' });
+    const inner = repositoryInside(p, walkLimit, entryMtimeSafe);
+    if (inner.verdict !== 'none') {
+      keep(inner.verdict === 'found' ? 'residue_contains_repository' : 'residue_unverified');
       continue;
+    }
+    // A file written deep inside leaves the directory's own mtime unchanged:
+    // the newest entry anywhere in it must be past the guard too (#4941 review).
+    if (inner.newestMs === Infinity) {
+      keep('residue_age_unknown');
+      continue;
+    }
+    if (nowMs - inner.newestMs < guardMs) continue;
+    // Work git does not have keeps it, whatever git's registrations say: any
+    // prune ends a registration, so it cannot be what protects a worktree that
+    // lost its `.git` file with uncommitted work in it (#4941 review). A stranded
+    // `.gsd-reap-*` passed this check in the sweep that renamed it.
+    if (!stranded) {
+      const work = residueHoldsWork(p, gitDirPath, harnessBranches, execGit);
+      if (work !== false) {
+        keep(work === null ? 'residue_unverified' : 'residue_has_work');
+        continue;
+      }
     }
     // Right before removing: the chain is still real directories, the child is
     // still one with no `.git`, and — resolved NOW, after those checks — it is
@@ -3042,7 +3114,7 @@ function findUnregisteredResidue(
       target = fs.realpathSync.native(p);
       if (path.dirname(target) !== residueDir) throw new Error('moved');
     } catch {
-      results.push({ path: p, status: 'skipped', reason: 'residue_unreadable' });
+      keep('residue_unreadable');
       continue;
     }
     // Rename to an unguessable name inside the verified directory, re-verify
@@ -3093,6 +3165,48 @@ function findUnregisteredResidue(
 }
 
 /**
+ * #4941 review: whether a residue holds work git does not have, by the standard
+ * `git worktree remove` applies without `--force`: compared with a harness
+ * branch's tip, a modified, deleted or untracked (not ignored) file is work. `false` when the directory matches at least one branch tip —
+ * everything in it is then committed or ignored, so removing it loses nothing
+ * git cannot restore; `true` when it matches none; `null` when git could not
+ * answer for any branch. Each comparison reads the tip into a throwaway index,
+ * so neither the checkout's index nor the directory is touched.
+ */
+function residueHoldsWork(
+  dir: string,
+  gitDirPath: string,
+  branches: readonly string[],
+  execGit: (args: string[], opts?: { cwd?: string; env?: Record<string, string>; timeout?: number }) => GitResult,
+): boolean | null {
+  let answered = false;
+  for (const branch of branches) {
+    let scratch: string | null = null;
+    try {
+      scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-reap-index-'));
+      const env = { GIT_INDEX_FILE: path.join(scratch, 'index') };
+      const repo = ['--git-dir', gitDirPath, '--work-tree', dir];
+      if (!gitResultOk(execGit([...repo, 'read-tree', `refs/heads/${branch}`], { cwd: dir, env }))) continue;
+      // Plumbing, not `status`: status also compares the index with the
+      // checkout's HEAD, which is not this branch. The refresh exits 1 when a
+      // file differs, which diff-files then names; only a timeout is a failure.
+      const refresh = execGit([...repo, 'update-index', '-q', '--refresh'], { cwd: dir, env });
+      if (refresh.timedOut) continue;
+      const changed = execGit([...repo, 'diff-files', '--name-only', '-z'], { cwd: dir, env });
+      const untracked = execGit([...repo, 'ls-files', '-z', '--others', '--exclude-standard'], { cwd: dir, env });
+      if (!gitResultOk(changed) || !gitResultOk(untracked)) continue;
+      answered = true;
+      if (String(changed.stdout).length === 0 && String(untracked.stdout).length === 0) return false;
+    } catch {
+      // No scratch index: this branch cannot be compared.
+    } finally {
+      if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  }
+  return answered ? true : null;
+}
+
+/**
  * At most this many entries are walked looking for a repository inside a
  * residue. Large enough for a full `node_modules`, which is walked too (a
  * package installed from a local repository keeps its `.git`).
@@ -3103,33 +3217,46 @@ const RESIDUE_WALK_LIMIT = 1_000_000;
  * #4941: whether a repository lies inside `dir` — a `.git` entry at any depth,
  * or a bare repository layout (`HEAD` file beside `objects/` and `refs/`), the
  * directory itself included. Links are never followed. `unknown` when a
- * directory cannot be read or the walk passes `limit` entries.
+ * directory cannot be read or the walk passes `limit` entries. `newestMs` is the
+ * newest mtime of any entry walked (`Infinity` when one could not be read), so
+ * a file written deep inside is seen (#4941 review).
  */
-function repositoryInside(dir: string, limit: number): 'none' | 'found' | 'unknown' {
+function repositoryInside(
+  dir: string,
+  limit: number,
+  entryMtime: (p: string) => Date | null,
+): { verdict: 'none' | 'found' | 'unknown'; newestMs: number } {
   const pending = [dir];
   let seen = 0;
+  let newestMs = -Infinity;
   while (pending.length > 0) {
     const current = pending.pop() as string;
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(current, { withFileTypes: true });
     } catch {
-      return 'unknown';
+      return { verdict: 'unknown', newestMs };
     }
     seen += entries.length;
-    if (seen > limit) return 'unknown';
+    if (seen > limit) return { verdict: 'unknown', newestMs };
     // Case-folded: on a case-insensitive filesystem `.GIT` is still the
     // repository's pointer to git (Codex review).
     const names = new Set(entries.map((e) => e.name.toLowerCase()));
-    if (names.has('.git')) return 'found';
-    if (names.has('head') && names.has('objects') && names.has('refs')) return 'found';
+    if (names.has('.git')) return { verdict: 'found', newestMs };
+    if (names.has('head') && names.has('objects') && names.has('refs')) return { verdict: 'found', newestMs };
     for (const entry of entries) {
+      const entryPath = path.join(current, entry.name);
+      newestMs = Math.max(newestMs, entryMtime(entryPath)?.getTime() ?? Infinity);
       if (entry.isDirectory() && !entry.isSymbolicLink()) {
-        pending.push(path.join(current, entry.name));
+        pending.push(entryPath);
       }
     }
   }
-  return 'none';
+  return { verdict: 'none', newestMs };
+}
+
+function defaultEntryMtimeSafe(p: string): Date | null {
+  try { return fs.lstatSync(p).mtime; } catch { return null; }
 }
 
 /**
@@ -3175,7 +3302,8 @@ function pathCompareKey(canonical: string, platform: NodeJS.Platform): string {
 /** Reasons a residue directory was reported and left in place (#4941). */
 const RESIDUE_KEPT_REASONS: ReadonlySet<string> = new Set([
   'residue_not_harness_named', 'residue_no_harness_branch', 'residue_tracked', 'residue_remove_failed',
-  'residue_contains_repository', 'residue_unverified', 'residue_unreadable', 'residue_age_unknown',
+  'residue_contains_repository', 'residue_unverified', 'residue_unreadable', 'residue_age_unknown', 'residue_contains_cwd',
+  'residue_has_work',
   'worktree_list_failed',
 ]);
 
@@ -3187,6 +3315,12 @@ const RESIDUE_NOT_SWEPT: Readonly<Record<Exclude<ResidueDirStatus, 'scanned' | '
   top_unresolved: 'git could not name this checkout\'s top directory',
   git_mismatch: 'git is pointed at another work tree (core.worktree)',
   not_scanned: 'git could not resolve this checkout\'s git directory',
+};
+
+/** Why `.git/worktrees` was not swept, for the stderr line (#4941 review). */
+const ADMIN_NOT_SWEPT: Readonly<Record<'default_branch_unresolved' | 'unreadable', string>> = {
+  default_branch_unresolved: 'the default branch could not be resolved (origin/HEAD unset or unresolvable), so no branch can be proven merged',
+  unreadable: 'it could not be read',
 };
 
 /** At most this many removed names are printed; the rest are counted (#4941 review). */
@@ -3282,9 +3416,9 @@ function cmdWorktreeReapOrphans(cwd: string, deps: RecordAgentCmdDeps & Worktree
     result = [];
     scan = null;
   }
-  // #4941: the three workflow callers send the JSON to /dev/null and show
-  // stderr in the agent transcript, so stderr is written for a reader that a
-  // directory name must not be able to address. A REMOVED directory is named —
+  // #4941: stderr can reach an agent transcript (a direct run, or a caller that
+  // keeps it), so it is written for a reader that a directory name must not be
+  // able to address. A REMOVED directory is named —
   // the record of what was deleted — escaped by formatDiagnosticToken (control,
   // invisible and bidi characters as \uXXXX), cut to RESIDUE_NAME_MAX, at most
   // RESIDUE_NAMES_SHOWN of them; it is gone, so it is never named again. A
@@ -3323,6 +3457,11 @@ function cmdWorktreeReapOrphans(cwd: string, deps: RecordAgentCmdDeps & Worktree
   // git repository there is nothing to sweep, and nothing is said.
   if (scan && scan.admin_dir !== 'git_dir_unresolved' && scan.residue_dir !== 'scanned' && scan.residue_dir !== 'absent') {
     writeErr(`[gsd] worktree.reap-orphans: .claude/worktrees was not swept — ${RESIDUE_NOT_SWEPT[scan.residue_dir]}\n`);
+  }
+  // The same for the admin directory: `reaped: 0` there is not "nothing to
+  // reap" either (#4941 review).
+  if (scan && (scan.admin_dir === 'default_branch_unresolved' || scan.admin_dir === 'unreadable')) {
+    writeErr(`[gsd] worktree.reap-orphans: .git/worktrees was not swept — ${ADMIN_NOT_SWEPT[scan.admin_dir]}\n`);
   }
   const skippedCount = result.filter((r) => r.status === 'skipped' && !RESIDUE_KEPT_REASONS.has(r.reason)
     && r.reason !== 'residue_remove_incomplete').length;
