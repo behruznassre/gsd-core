@@ -3167,7 +3167,8 @@ function findUnregisteredResidue(
 /**
  * #4941 review: whether a residue holds work git does not have, by the standard
  * `git worktree remove` applies without `--force`: compared with a harness
- * branch's tip, a modified, deleted or untracked (not ignored) file is work. `false` when the directory matches at least one branch tip —
+ * branch's tip, a modified, deleted or untracked (not ignored) file is work,
+ * and so is any untracked `.gitignore`, which decides what counts as ignored. `false` when the directory matches at least one branch tip —
  * everything in it is then committed or ignored, so removing it loses nothing
  * git cannot restore; `true` when it matches none; `null` when git could not
  * answer for any branch. Each comparison reads the tip into a throwaway index,
@@ -3194,9 +3195,13 @@ function residueHoldsWork(
       if (refresh.timedOut) continue;
       const changed = execGit([...repo, 'diff-files', '--name-only', '-z'], { cwd: dir, env });
       const untracked = execGit([...repo, 'ls-files', '-z', '--others', '--exclude-standard'], { cwd: dir, env });
-      if (!gitResultOk(changed) || !gitResultOk(untracked)) continue;
+      // An untracked `.gitignore` decides what the line above calls ignored —
+      // one holding `*` would hide everything, itself included — so any is work.
+      const ignoreFiles = execGit([...repo, 'ls-files', '-z', '--others', '--', ':(glob,icase)**/.gitignore'], { cwd: dir, env });
+      if (!gitResultOk(changed) || !gitResultOk(untracked) || !gitResultOk(ignoreFiles)) continue;
       answered = true;
-      if (String(changed.stdout).length === 0 && String(untracked.stdout).length === 0) return false;
+      if (String(changed.stdout).length === 0 && String(untracked.stdout).length === 0
+          && String(ignoreFiles.stdout).length === 0) return false;
     } catch {
       // No scratch index: this branch cannot be compared.
     } finally {

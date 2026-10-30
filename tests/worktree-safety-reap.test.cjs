@@ -2406,6 +2406,16 @@ describe('#4941 regression: reap-orphans removes unregistered .claude/worktrees 
     });
   }
 
+  test('an untracked .gitignore inside the residue is work, even one that ignores itself', () => {
+    const { repoDir, residue } = repoWithResidue('self-ignoring');
+    fs.mkdirSync(path.join(residue, 'sub'));
+    fs.writeFileSync(path.join(residue, 'sub', '.gitignore'), '*\n');
+    fs.writeFileSync(path.join(residue, 'sub', 'notes.txt'), 'work\n');
+    const row = onlyRow(reapOrphanWorktrees(repoDir, deadOwnerDeps()));
+    assert.deepStrictEqual([row.status, row.reason], ['skipped', 'residue_has_work']);
+    assert.ok(fs.existsSync(path.join(residue, 'sub', 'notes.txt')));
+  });
+
   test('an ignored file does not count as work: the residue is removed', () => {
     const repoDir = path.join(tmpBase, 'repo-ignored');
     initRepo(repoDir);
