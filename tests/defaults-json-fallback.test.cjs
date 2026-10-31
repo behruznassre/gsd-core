@@ -378,6 +378,10 @@ describe('loadConfig ~/.gsd/defaults.json fallback (#1683)', () => {
     test('settings.md saves the defaults through config-save-defaults and names the GSD_HOME store', () => {
       const text = read('settings.md');
       assert.ok(text.includes('gsd_run query config-save-defaults "$DEFAULTS_JSON"'), 'the save must go through the merging command');
+      // The step assigns the variable it passes, through a quoted heredoc so a
+      // quote or $ in a saved value reaches the command unchanged.
+      assert.ok(text.includes("DEFAULTS_JSON=$(cat <<'JSON'"), 'the step must assign $DEFAULTS_JSON with a quoted heredoc');
+      assert.ok(text.indexOf("DEFAULTS_JSON=$(cat <<'JSON'") < text.indexOf('gsd_run query config-save-defaults'), 'the assignment must come before the call');
       assert.ok(!text.includes(`Write \`${STORE}\` with`), 'the workflow must not hand-write the store, which replaced it');
       assert.ok(text.includes(STORE), 'the step must still name the resolved store path');
     });

@@ -734,14 +734,16 @@ it is not reported when the config already exists.
 
 `config-save-defaults` is the write behind `/gsd-settings` "save as global defaults" (#5681).
 It merges one JSON object into `$GSD_HOME/.gsd/defaults.json` (`~/.gsd/defaults.json` unless
-`GSD_HOME` is set): sections merge key by key and any other value replaces, so keys the settings
-flow does not manage (`model_overrides`, `effort`, `runtime`, `resolve_model_ids`, unlisted
-`workflow` keys) survive a save. A saved setting also removes its other spelling, so a legacy
-flat key (`research`, `branching_strategy`, …) and its nested key (`workflow.research`,
-`git.branching_strategy`) cannot disagree and leave the old value winning. A missing file is created. The search flags that new projects
-detect from this machine (`brave_search`, `firecrawl`, `exa_search`, `tavily_search`,
-`ref_search`, `perplexity`, `jina`) are never copied. A store that is not valid JSON, or not a
-JSON object, is refused and left as it was.
+`GSD_HOME` is set): sections merge key by key, a `null` removes its key, and any other value
+replaces. Keys the settings flow does not manage (`model_overrides`, `effort`, `runtime`,
+`resolve_model_ids`, unlisted `workflow` keys) survive a save. The object is held to the
+`config-set` key and value rules first, as `config-new-project` choices are, so only canonical
+spellings are accepted (`git.branching_strategy`, not `branching_strategy`). A saved setting
+removes its legacy spelling from the store (`research` for `workflow.research`, `depth` for
+`granularity`), so a stale value cannot keep winning. A missing file is created. The search
+flags that new projects detect from this machine (`brave_search`, `firecrawl`, `exa_search`,
+`tavily_search`, `ref_search`, `perplexity`, `jina`) are never copied. A store that is not
+valid JSON, or not a JSON object, is refused and left as it was.
 
 ---
 

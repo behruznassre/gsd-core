@@ -886,12 +886,12 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
 
   // #5681: merge the chosen settings into the global defaults store. One JSON
   // positional, no flags — the settings workflow is the only caller.
-  function routeConfigSaveDefaults({ args, raw }) {
+  function routeConfigSaveDefaults({ args, cwd, raw }) {
     const positionals = args.slice(1).filter(a => a !== '--raw');
     if (positionals.length !== 1) {
       error('Usage: config-save-defaults <settings-json>', ERROR_REASON.USAGE);
     }
-    config.cmdConfigSaveDefaults(positionals[0], raw);
+    config.cmdConfigSaveDefaults(cwd, positionals[0], raw);
   }
 
   function routeConfigPath({ cwd, raw, workstreamContext }) {
